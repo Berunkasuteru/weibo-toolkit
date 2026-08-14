@@ -39,6 +39,8 @@ If Weibo replaces the page body and the button becomes unavailable, Friend Radar
 
 Node regression tests in the workspace are developer checks and are not userscripts. Do not install them in Tampermonkey or Violentmonkey.
 
+Historical clarification: the v0.2.0 browser-verification expectation of three userscript commands was superseded by v0.3.0, which has exactly four **Weibo Toolkit** menu commands.
+
 ## Known limitations
 
 - The fixed launcher is an enhancement. If it is unavailable after a host page-body replacement, use the three userscript commands.

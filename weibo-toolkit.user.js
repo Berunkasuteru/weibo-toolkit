@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.2.0
+// @version      0.3.0
 // @description  Manual Friend Radar with an independent Weibo Toolkit launcher.
 // @match        https://weibo.com/*
 // @grant        GM_registerMenuCommand
@@ -17,9 +17,13 @@
 
   const ENDPOINT = "/ajax/friendships/friends";
   const REQUEST_DELAY_MS = 750;
+  const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 30;
+  const APP_VERSION = "0.3.0";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
+  const BACKUP_FORMAT = "weibo-toolkit.friend-radar";
+  const BACKUP_VERSION = 1;
 
   const EVENT = Object.freeze({
     VISIBLE_FOLLOWING_ADDED: "VISIBLE_FOLLOWING_ADDED",
@@ -30,33 +34,30 @@
   });
 
   const EVENT_LABELS = Object.freeze({
-    [EVENT.VISIBLE_FOLLOWING_ADDED]:
-      "出现在你的可见关注列表 / Appeared in your visible following list",
-    [EVENT.VISIBLE_FOLLOWING_DISAPPEARED]:
-      "从你的可见关注列表消失 / Disappeared from your visible following list",
-    [EVENT.FOLLOW_ME_GAINED]: "开始关注你 / Started following you",
-    [EVENT.FOLLOW_ME_LOST]: "停止关注你 / Stopped following you",
-    [EVENT.SCREEN_NAME_CHANGED]: "昵称已更改 / Screen name changed",
+    [EVENT.VISIBLE_FOLLOWING_ADDED]: "出现在你的可见关注列表",
+    [EVENT.VISIBLE_FOLLOWING_DISAPPEARED]: "从你的可见关注列表消失",
+    [EVENT.FOLLOW_ME_GAINED]: "开始关注你",
+    [EVENT.FOLLOW_ME_LOST]: "停止关注你",
+    [EVENT.SCREEN_NAME_CHANGED]: "昵称已更改",
   });
 
   const FAILURE_LABELS = Object.freeze({
-    UID_UNAVAILABLE: "无法可靠识别当前登录账号 / UID unavailable",
-    ACCOUNT_CHANGED_DURING_SCAN:
-      "扫描期间登录账号发生变化 / Logged-in account changed during scan",
-    STALE_SCAN: "扫描结果早于当前已保存快照 / Scan result is older than the stored snapshot",
-    LOGIN_REQUIRED: "登录已失效，请重新登录 / Login required",
-    HTTP_ERROR: "接口返回 HTTP 错误 / HTTP error",
-    CHALLENGE_OR_UNEXPECTED_RESPONSE:
-      "收到验证页面或意外 HTML / Challenge or unexpected HTML",
-    NON_JSON_RESPONSE: "接口未返回有效 JSON / Non-JSON response",
-    UNEXPECTED_CONTENT_TYPE: "接口响应类型异常 / Unexpected content type",
-    UNEXPECTED_SCHEMA: "接口数据结构异常 / Unexpected schema",
-    PAGINATION_FAILURE: "分页链不可信 / Pagination failure",
-    NETWORK_ERROR: "网络请求失败 / Network error",
-    PERSISTENCE_ERROR: "本地保存失败 / Persistence error",
-    STORAGE_ERROR: "本地状态无法读取 / Local storage error",
-    UPDATE_ALREADY_RUNNING: "更新正在进行 / Update already running",
-    UNKNOWN_FAILURE: "未知失败 / Unknown failure",
+    UID_UNAVAILABLE: "无法可靠识别当前登录账号",
+    ACCOUNT_CHANGED_DURING_SCAN: "扫描期间登录账号发生变化",
+    STALE_SCAN: "扫描结果早于当前已保存快照",
+    LOGIN_REQUIRED: "登录已失效，请重新登录",
+    HTTP_ERROR: "接口返回 HTTP 错误",
+    CHALLENGE_OR_UNEXPECTED_RESPONSE: "收到验证页面或意外 HTML",
+    NON_JSON_RESPONSE: "接口未返回有效 JSON",
+    UNEXPECTED_CONTENT_TYPE: "接口响应类型异常",
+    UNEXPECTED_SCHEMA: "接口数据结构异常",
+    PAGINATION_FAILURE: "分页链不可信",
+    NETWORK_ERROR: "网络请求失败",
+    PERSISTENCE_ERROR: "本地保存失败",
+    STORAGE_ERROR: "本地状态无法读取",
+    BACKUP_EXPORT_ERROR: "备份导出失败",
+    UPDATE_ALREADY_RUNNING: "更新正在进行",
+    UNKNOWN_FAILURE: "未知失败",
   });
 
   const hasOwn = (value, key) =>
@@ -788,17 +789,24 @@
     panelRoot = null;
   }
 
-  function showPanel(title) {
+  function showPanel(title, withBack = false) {
     closePanel();
     const root = createElement("div", null, "wfr-overlay");
     const panel = createElement("section", null, "wfr-panel");
     const header = createElement("header", null, "wfr-header");
     const heading = createElement("h2", title);
-    const closeButton = createElement("button", "关闭 / Close", "wfr-button");
+    const closeButton = createElement("button", "关闭", "wfr-button");
     closeButton.type = "button";
     closeButton.addEventListener("click", closePanel);
     const body = createElement("div", null, "wfr-body");
-    header.append(heading, closeButton);
+    if (withBack) {
+      const backButton = createElement("button", "← 返回", "wfr-button");
+      backButton.type = "button";
+      backButton.addEventListener("click", showToolkitHome);
+      header.append(backButton, heading, closeButton);
+    } else {
+      header.append(heading, closeButton);
+    }
     panel.append(header, body);
     root.append(panel);
     document.body.append(root);
@@ -815,37 +823,64 @@
   }
 
   function failureText(result) {
+    if (
+      result.failureKind === "PAGINATION_FAILURE" &&
+      result.reason === "HARD_REQUEST_CEILING_REACHED"
+    ) {
+      return "本次扫描达到安全请求上限，未保存扫描结果。";
+    }
     const label = FAILURE_LABELS[result.failureKind] || FAILURE_LABELS.UNKNOWN_FAILURE;
     return result.reason ? `${label} (${result.reason})` : label;
   }
 
-  function showFailure(title, result) {
-    const body = showPanel(title);
+  function showFailure(title, result, withBack = true) {
+    const body = showPanel(title, withBack);
     body.append(createElement("p", failureText(result), "wfr-error"));
+    if (result.failureKind === "BACKUP_EXPORT_ERROR") {
+      body.append(
+        createElement(
+          "p",
+          "备份未能完成。关系雷达本地数据未被修改。",
+          "wfr-muted"
+        )
+      );
+      addLine(body, "失败阶段", result.backupStage);
+      addLine(body, "错误类型", result.errorName);
+      if (["CREATE_WRITABLE", "WRITE_FILE", "CLOSE_FILE"].includes(result.backupStage)) {
+        body.append(
+          createElement(
+            "p",
+            "目标位置可能存在未完成的备份文件。",
+            "wfr-muted"
+          )
+        );
+      }
+      return;
+    }
     if (typeof result.failedPage === "number") {
-      addLine(body, "停止页 / Failed page", result.failedPage);
+      addLine(body, "停止页", result.failedPage);
     }
     if (typeof result.requestsMade === "number") {
-      addLine(body, "已发请求 / Requests made", result.requestsMade);
+      addLine(body, "已发请求", result.requestsMade);
     }
     let stateMessage;
     let stateMessageClass = "wfr-muted";
     if (result.failureKind === "UNKNOWN_FAILURE") {
       stateMessage =
-        "更新结果无法完全确认。重试前请先查看“关系雷达状态”。 / The update outcome could not be fully confirmed. Check Friend Radar: View Status before retrying.";
+        "更新结果无法完全确认。重试前请先查看“关系雷达状态”。";
       stateMessageClass = "wfr-error";
     } else if (result.failureKind === "PERSISTENCE_ERROR") {
       if (result.rollbackSucceeded === true) {
         stateMessage =
-          "保存失败，但上一次本地状态已恢复。 / Persistence failed, but the previous local state was restored.";
+          "保存失败，但上一次本地状态已恢复。";
       } else {
         stateMessage =
-          "保存和恢复均未能确认成功。本地状态可能不确定或损坏，在检查或重新创建基线前请勿信任。 / Persistence and rollback could not be confirmed. Local state may be uncertain or corrupted; do not trust it until inspected or the baseline is recreated.";
+          "保存和恢复均未能确认成功。本地状态可能不确定或损坏，在检查或重新创建基线前请勿信任。";
         stateMessageClass = "wfr-error";
       }
     } else {
       stateMessage =
-        "本次失败发生在保存之前，本地快照和事件记录未被更改。 / This failure occurred before persistence; the stored snapshot and event history were not changed.";
+        "本次失败发生在保存之前，本地快照和事件记录未被更改。";
     }
     body.append(
       createElement(
@@ -863,20 +898,20 @@
   }
 
   function showUpdateSuccess(result) {
-    const body = showPanel("关系雷达更新 / Friend Radar Update");
+    const body = showPanel("关系雷达更新", true);
     const message = result.baselineCreated
-      ? `基线已创建，记录了 ${result.snapshot.visibleCount} 个可见关注。 / Baseline created. ${result.snapshot.visibleCount} visible followings recorded.`
-      : `更新完成，发现 ${result.newEvents.length} 个新事件。 / Update complete. ${result.newEvents.length} new events.`;
+      ? `基线已创建，记录了 ${result.snapshot.visibleCount} 个可见关注。`
+      : `更新完成，发现 ${result.newEvents.length} 个新事件。`;
     body.append(createElement("p", message, "wfr-success"));
-    addLine(body, "可见关注 / Visible followings", result.snapshot.visibleCount);
-    addLine(body, "接口总数 / Reported total", result.snapshot.reportedTotal);
+    addLine(body, "可见关注", result.snapshot.visibleCount);
+    addLine(body, "接口总数", result.snapshot.reportedTotal);
     addLine(
       body,
-      "未解析关系差值 / Unresolved relation count",
+      "未解析关系差值",
       result.snapshot.unresolvedRelationCount
     );
-    addLine(body, "请求数 / Requests", result.requestsMade);
-    addLine(body, "新事件 / New events", result.newEvents.length);
+    addLine(body, "请求数", result.requestsMade);
+    addLine(body, "新事件", result.newEvents.length);
 
     const counts = countEventTypes(result.newEvents);
     for (const type of Object.values(EVENT)) {
@@ -886,16 +921,16 @@
 
   async function updateNow() {
     if (updateRunning) {
-      showFailure("关系雷达更新 / Friend Radar Update", {
+      showFailure("关系雷达更新", {
         failureKind: "UPDATE_ALREADY_RUNNING",
       });
       return;
     }
-    const progress = showPanel("关系雷达更新 / Friend Radar Update");
+    const progress = showPanel("关系雷达更新");
     progress.append(
       createElement(
         "p",
-        "正在按顺序读取可见关注，请保持页面打开。 / Reading visible followings sequentially; keep this page open."
+        "正在按顺序读取可见关注，请保持页面打开。"
       )
     );
     updateRunning = true;
@@ -912,7 +947,7 @@
       updateRunning = false;
     }
     if (result.ok) showUpdateSuccess(result);
-    else showFailure("关系雷达更新失败 / Friend Radar Update Failed", result);
+    else showFailure("关系雷达更新失败", result);
   }
 
   function formatTime(value) {
@@ -928,42 +963,42 @@
   }
 
   function renderEvents(ownerUid, state, notice) {
-    const body = showPanel("关系事件 / Friend Radar Events");
+    const body = showPanel("关系事件", true);
     if (notice) body.append(createElement("p", notice, "wfr-success"));
     const unread = state.events.filter((event) => !event.read).length;
-    addLine(body, "事件总数 / Total events", state.events.length);
-    addLine(body, "未读 / Unread", unread);
+    addLine(body, "事件总数", state.events.length);
+    addLine(body, "未读", unread);
 
     if (unread > 0) {
-      const markButton = createElement("button", "全部标为已读 / Mark all as read", "wfr-button wfr-primary");
+      const markButton = createElement("button", "全部标为已读", "wfr-button wfr-primary");
       markButton.type = "button";
       markButton.addEventListener("click", async () => {
         markButton.disabled = true;
         const currentUid = determineCurrentUid();
         if (!currentUid.ok || currentUid.uid !== ownerUid) {
-          showFailure("标记失败 / Mark Read Failed", {
+          showFailure("标记失败", {
             failureKind: "UID_UNAVAILABLE",
           });
           return;
         }
         const fresh = loadState(ownerUid);
         if (!fresh.ok) {
-          showFailure("标记失败 / Mark Read Failed", fresh);
+          showFailure("标记失败", fresh);
           return;
         }
         const nextState = markAllEventsRead(fresh.state);
         const saved = persistState(ownerUid, nextState, fresh.raw);
         if (!saved.ok) {
-          showFailure("标记失败 / Mark Read Failed", saved);
+          showFailure("标记失败", saved);
           return;
         }
-        renderEvents(ownerUid, nextState, "全部事件已标为已读。 / All events marked as read.");
+        renderEvents(ownerUid, nextState, "全部事件已标为已读。");
       });
       body.append(markButton);
     }
 
     if (state.events.length === 0) {
-      body.append(createElement("p", "暂无事件。 / No events yet.", "wfr-muted"));
+      body.append(createElement("p", "暂无事件", "wfr-muted"));
       return;
     }
 
@@ -978,10 +1013,10 @@
         `${event.read ? "已读" : "未读"} · ${EVENT_LABELS[event.type] || event.type}`
       );
       item.append(title);
-      addLine(item, "时间 / Time", formatTime(event.detectedAt));
-      addLine(item, "名称 / Name", event.displayName);
+      addLine(item, "时间", formatTime(event.detectedAt));
+      addLine(item, "名称", event.displayName);
       if (event.type === EVENT.SCREEN_NAME_CHANGED) {
-        addLine(item, "变化 / Change", describeEvent(event));
+        addLine(item, "变化", describeEvent(event));
       }
       list.append(item);
     }
@@ -991,12 +1026,12 @@
   function viewEvents() {
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
-      showFailure("关系事件 / Friend Radar Events", uidResult);
+      showFailure("关系事件", uidResult);
       return;
     }
     const loaded = loadState(uidResult.uid);
     if (!loaded.ok) {
-      showFailure("关系事件 / Friend Radar Events", loaded);
+      showFailure("关系事件", loaded);
       return;
     }
     renderEvents(uidResult.uid, loaded.state, null);
@@ -1005,71 +1040,255 @@
   function viewStatus() {
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
-      showFailure("关系雷达状态 / Friend Radar Status", uidResult);
+      showFailure("关系雷达状态", uidResult);
       return;
     }
     const loaded = loadState(uidResult.uid);
     if (!loaded.ok) {
-      showFailure("关系雷达状态 / Friend Radar Status", loaded);
+      showFailure("关系雷达状态", loaded);
       return;
     }
 
-    const body = showPanel("关系雷达状态 / Friend Radar Status");
+    const body = showPanel("关系雷达状态", true);
     const snapshot = loaded.state.latestSnapshot;
     const unread = loaded.state.events.filter((event) => !event.read).length;
-    addLine(body, "已有基线 / Baseline exists", snapshot ? "是 / Yes" : "否 / No");
+    addLine(body, "已有基线", snapshot ? "是" : "否");
     if (snapshot) {
-      addLine(body, "上次成功快照 / Last successful snapshot", formatTime(snapshot.capturedAt));
-      addLine(body, "可见关注 / Visible followings", snapshot.visibleCount);
-      addLine(body, "接口总数 / Reported total", snapshot.reportedTotal);
+      addLine(body, "上次成功更新", formatTime(snapshot.capturedAt));
+      addLine(body, "可见关注", snapshot.visibleCount);
+      addLine(body, "接口总数", snapshot.reportedTotal);
       addLine(
         body,
-        "未解析关系差值 / Unresolved relation count",
+        "未解析关系差值",
         snapshot.unresolvedRelationCount
       );
     }
-    addLine(body, "事件总数 / Total events", loaded.state.events.length);
-    addLine(body, "未读事件 / Unread events", unread);
+    addLine(body, "事件总数", loaded.state.events.length);
+    addLine(body, "未读事件", unread);
+  }
+
+  function backupFilename(ownerUid, exportedAt) {
+    const timestamp = exportedAt
+      .toISOString()
+      .replace(/[-:]/g, "")
+      .replace("T", "-")
+      .replace(/\.\d{3}Z$/, "");
+    return `weibo-toolkit-friend-radar-${ownerUid}-${timestamp}.json`;
+  }
+
+  function createBackup(ownerUid, state, exportedAt) {
+    if (state.ownerUid !== ownerUid) {
+      throw new Error("Backup owner UID mismatch");
+    }
+    return {
+      backupFormat: BACKUP_FORMAT,
+      backupVersion: BACKUP_VERSION,
+      exportedAt: exportedAt.toISOString(),
+      appVersion: APP_VERSION,
+      ownerUid,
+      state,
+    };
+  }
+
+  function serializeBackup(backup) {
+    return `${JSON.stringify(backup, null, 2)}\n`;
+  }
+
+  function backupExportError(backupStage, error) {
+    const tagged = new Error("Backup export failed");
+    tagged.name = error && error.name ? String(error.name) : "Error";
+    tagged.backupStage = backupStage;
+    return tagged;
+  }
+
+  function downloadBackup(json, filename) {
+    let blob;
+    try {
+      blob = new Blob([json], { type: "application/json;charset=utf-8" });
+    } catch (error) {
+      throw backupExportError("FALLBACK_CREATE_BLOB", error);
+    }
+    let objectUrl;
+    try {
+      objectUrl = URL.createObjectURL(blob);
+    } catch (error) {
+      throw backupExportError("FALLBACK_CREATE_URL", error);
+    }
+    try {
+      const link = createElement("a");
+      link.href = objectUrl;
+      link.download = filename;
+      link.hidden = true;
+      document.body.append(link);
+      try {
+        link.click();
+      } finally {
+        if (link.parentNode) link.parentNode.removeChild(link);
+        setTimeout(
+          () => URL.revokeObjectURL(objectUrl),
+          OBJECT_URL_REVOKE_DELAY_MS
+        );
+      }
+    } catch (error) {
+      throw backupExportError("FALLBACK_TRIGGER_DOWNLOAD", error);
+    }
+  }
+
+  async function saveBackup(json, filename) {
+    if (
+      typeof unsafeWindow !== "undefined" &&
+      typeof unsafeWindow.showSaveFilePicker === "function"
+    ) {
+      let fileHandle;
+      try {
+        fileHandle = await unsafeWindow.showSaveFilePicker.call(
+          unsafeWindow,
+          {
+            suggestedName: filename,
+            types: [
+              {
+                description: "JSON backup",
+                accept: { "application/json": [".json"] },
+              },
+            ],
+          }
+        );
+      } catch (error) {
+        const errorName = error && error.name ? String(error.name) : "Error";
+        if (errorName === "AbortError") return { cancelled: true };
+        if (errorName !== "NotAllowedError" && errorName !== "SecurityError") {
+          throw backupExportError("PICKER_OPEN", error);
+        }
+        downloadBackup(json, filename);
+        return { method: "browser-download", filename };
+      }
+
+      let writable;
+      try {
+        writable = await fileHandle.createWritable();
+      } catch (error) {
+        throw backupExportError("CREATE_WRITABLE", error);
+      }
+      try {
+        await writable.write(json);
+      } catch (error) {
+        throw backupExportError("WRITE_FILE", error);
+      }
+      try {
+        await writable.close();
+      } catch (error) {
+        throw backupExportError("CLOSE_FILE", error);
+      }
+      return {
+        method: "save-picker",
+        filename:
+          typeof fileHandle.name === "string" && fileHandle.name.length > 0
+            ? fileHandle.name
+            : filename,
+      };
+    }
+
+    downloadBackup(json, filename);
+    return { method: "browser-download", filename };
+  }
+
+  async function exportBackup() {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showFailure("导出备份", uidResult);
+      return;
+    }
+    const loaded = loadState(uidResult.uid);
+    if (!loaded.ok) {
+      showFailure("导出备份", loaded);
+      return;
+    }
+
+    const exportedAt = new Date();
+    const filename = backupFilename(uidResult.uid, exportedAt);
+    let saveResult;
+    try {
+      const backup = createBackup(uidResult.uid, loaded.state, exportedAt);
+      const json = serializeBackup(backup);
+      saveResult = await saveBackup(json, filename);
+    } catch (error) {
+      showFailure("导出备份", {
+        failureKind: "BACKUP_EXPORT_ERROR",
+        backupStage: error && error.backupStage ? String(error.backupStage) : "PREPARE_BACKUP",
+        errorName: error && error.name ? String(error.name) : "Error",
+      });
+      return;
+    }
+
+    if (saveResult.cancelled) {
+      const body = showPanel("导出已取消", true);
+      body.append(createElement("p", "导出已取消", "wfr-muted"));
+      return;
+    }
+
+    const nativeSave = saveResult.method === "save-picker";
+    const body = showPanel(
+      nativeSave ? "备份已保存" : "已请求浏览器下载备份",
+      true
+    );
+    if (!nativeSave) {
+      body.append(
+        createElement(
+          "p",
+          "备份已交给浏览器下载，保存位置及最终文件名由浏览器下载设置决定。",
+          "wfr-success"
+        )
+      );
+    }
+    addLine(body, "账号 UID", uidResult.uid);
+    addLine(
+      body,
+      "已有快照",
+      loaded.state.latestSnapshot ? "是" : "否"
+    );
+    addLine(body, "事件数", loaded.state.events.length);
+    addLine(body, nativeSave ? "文件名" : "建议文件名", saveResult.filename);
   }
 
   function showToolkitHome() {
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
-      showFailure("微博工具箱 / Weibo Toolkit", uidResult);
+      showFailure("Weibo Toolkit", uidResult, false);
       return;
     }
     const loaded = loadState(uidResult.uid);
     if (!loaded.ok) {
-      showFailure("微博工具箱 / Weibo Toolkit", loaded);
+      showFailure("Weibo Toolkit", loaded, false);
       return;
     }
 
-    const body = showPanel("微博工具箱 / Weibo Toolkit");
+    const body = showPanel("Weibo Toolkit");
     const snapshot = loaded.state.latestSnapshot;
     const unread = loaded.state.events.filter((event) => !event.read).length;
-    addLine(body, "关系雷达基线 / Friend Radar baseline", snapshot ? "已有 / Yes" : "暂无 / No");
+    const moduleTitle = createElement("p", null, "wfr-row");
+    moduleTitle.append(createElement("strong", "关系雷达"));
+    body.append(moduleTitle);
     addLine(
       body,
-      "上次成功更新 / Last successful update",
+      "上次成功更新",
       snapshot ? formatTime(snapshot.capturedAt) : "—"
     );
-    addLine(body, "可见关注 / Visible followings", snapshot ? snapshot.visibleCount : "—");
-    addLine(
-      body,
-      "未解析关系差值 / Unresolved relation count",
-      snapshot ? snapshot.unresolvedRelationCount : "—"
-    );
-    addLine(body, "未读事件 / Unread events", unread);
+    addLine(body, "可见关注", snapshot ? snapshot.visibleCount : "—");
+    addLine(body, "未读事件", unread);
 
     const actions = createElement("div", null, "wfr-actions");
-    const updateButton = createElement("button", "立即更新 / Update Now", "wfr-button wfr-primary");
-    const eventsButton = createElement("button", "查看事件 / View Events", "wfr-button");
-    const statusButton = createElement("button", "查看状态 / View Status", "wfr-button");
-    for (const button of [updateButton, eventsButton, statusButton]) button.type = "button";
+    const updateButton = createElement("button", "立即更新", "wfr-button wfr-primary");
+    const eventsButton = createElement("button", "查看事件", "wfr-button");
+    const statusButton = createElement("button", "查看状态", "wfr-button");
+    const exportButton = createElement("button", "导出备份", "wfr-button");
+    for (const button of [updateButton, eventsButton, statusButton, exportButton]) {
+      button.type = "button";
+    }
     updateButton.addEventListener("click", () => void updateNow());
     eventsButton.addEventListener("click", viewEvents);
     statusButton.addEventListener("click", viewStatus);
-    actions.append(updateButton, eventsButton, statusButton);
+    exportButton.addEventListener("click", exportBackup);
+    actions.append(updateButton, eventsButton, statusButton, exportButton);
     body.append(actions);
   }
 
@@ -1077,7 +1296,7 @@
     if (!document.body) return;
     const button = createElement("button", "Weibo Toolkit", "wfr-button wfr-toolkit-launcher");
     button.type = "button";
-    button.setAttribute("aria-label", "微博工具箱 / Weibo Toolkit");
+    button.setAttribute("aria-label", "Weibo Toolkit");
     button.addEventListener("click", showToolkitHome);
     document.body.append(button);
   }
@@ -1110,9 +1329,10 @@
 
   function registerMenuCommands() {
     if (typeof GM_registerMenuCommand !== "function") return;
-    GM_registerMenuCommand("Friend Radar: Update Now", () => void updateNow());
-    GM_registerMenuCommand("Friend Radar: View Events", viewEvents);
-    GM_registerMenuCommand("Friend Radar: View Status", viewStatus);
+    GM_registerMenuCommand("Weibo Toolkit：立即更新", () => void updateNow());
+    GM_registerMenuCommand("Weibo Toolkit：查看事件", viewEvents);
+    GM_registerMenuCommand("Weibo Toolkit：查看状态", viewStatus);
+    GM_registerMenuCommand("Weibo Toolkit：导出备份", exportBackup);
   }
 
   installStyles();
