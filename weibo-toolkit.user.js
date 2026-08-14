@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.3.0
+// @version      0.3.1
 // @description  Manual Friend Radar with an independent Weibo Toolkit launcher.
 // @match        https://weibo.com/*
+// @license      MPL-2.0
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -19,7 +20,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 30;
-  const APP_VERSION = "0.3.0";
+  const APP_VERSION = "0.3.1";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const BACKUP_FORMAT = "weibo-toolkit.friend-radar";
