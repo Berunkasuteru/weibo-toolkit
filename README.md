@@ -52,8 +52,5 @@ Friend Radar can manually export the current account's complete validated state 
 
 ## Status
 
-v0.3.0 — development candidate
+v0.3.0 — stable release
 
-## Project Philosophy
-
-See [ENGINEERING_PHILOSOPHY.md](ENGINEERING_PHILOSOPHY.md) for the project's engineering principles.
