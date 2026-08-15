@@ -48,7 +48,7 @@ Friend Radar can manually export the current account's complete validated state 
 - Simultaneous updates from multiple tabs are unsupported.
 - Reload Weibo after switching accounts.
 - Local data is browser-local; backup export is available, but Import/Restore is not yet implemented.
-- A single scan stops at a 30-request safety ceiling and saves no scan result when that ceiling is reached. At 20 records per page this is roughly 600 visible records in typical responses, not a guaranteed exact account limit.
+- A single scan stops at a 100-request safety ceiling and saves no scan result when that ceiling is reached. At 20 records per page this is roughly 2,000 visible records in typical responses, not a guaranteed exact account limit.
 
 ## Status
 

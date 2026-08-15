@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.3.1
+// @version      0.3.2
 // @description  Manual Friend Radar with an independent Weibo Toolkit launcher.
 // @match        https://weibo.com/*
 // @license      MPL-2.0
@@ -19,8 +19,8 @@
   const ENDPOINT = "/ajax/friendships/friends";
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
-  const MAX_REQUESTS = 30;
-  const APP_VERSION = "0.3.1";
+  const MAX_REQUESTS = 100;
+  const APP_VERSION = "0.3.2";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const BACKUP_FORMAT = "weibo-toolkit.friend-radar";
@@ -423,6 +423,8 @@
       failureKind: "PAGINATION_FAILURE",
       reason: "HARD_REQUEST_CEILING_REACHED",
       requestsMade,
+      visibleRecordsCollected: recordsByUid.size,
+      reportedTotal,
     };
   }
 
@@ -828,7 +830,7 @@
       result.failureKind === "PAGINATION_FAILURE" &&
       result.reason === "HARD_REQUEST_CEILING_REACHED"
     ) {
-      return "本次扫描达到安全请求上限，未保存扫描结果。";
+      return "本次扫描达到本工具设定的单次请求上限，未保存扫描结果。";
     }
     const label = FAILURE_LABELS[result.failureKind] || FAILURE_LABELS.UNKNOWN_FAILURE;
     return result.reason ? `${label} (${result.reason})` : label;
@@ -858,10 +860,26 @@
       }
       return;
     }
+    if (
+      result.failureKind === "PAGINATION_FAILURE" &&
+      result.reason === "HARD_REQUEST_CEILING_REACHED"
+    ) {
+      addLine(body, "已请求", result.requestsMade);
+      addLine(body, "已读取", result.visibleRecordsCollected);
+      if (typeof result.reportedTotal === "number") {
+        addLine(body, "接口报告总数", result.reportedTotal);
+      }
+    }
     if (typeof result.failedPage === "number") {
       addLine(body, "停止页", result.failedPage);
     }
-    if (typeof result.requestsMade === "number") {
+    if (
+      typeof result.requestsMade === "number" &&
+      !(
+        result.failureKind === "PAGINATION_FAILURE" &&
+        result.reason === "HARD_REQUEST_CEILING_REACHED"
+      )
+    ) {
       addLine(body, "已发请求", result.requestsMade);
     }
     let stateMessage;
