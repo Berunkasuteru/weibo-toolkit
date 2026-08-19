@@ -38,7 +38,7 @@ The lower-right launcher shows a small unread-event badge when stored events rem
 
 Stored relationship events can be exported as UTF-8 CSV or Markdown for spreadsheet analysis, archival, or AI-assisted analysis. These exports contain only events Weibo Toolkit actually observed and stored; JSON backup remains the recovery format.
 
-Toolkit-owned UI now follows the browser/system `prefers-color-scheme` preference for dark mode.
+Toolkit-owned UI provides **跟随系统 / 浅色 / 深色** appearance options. The default follows the browser/system `prefers-color-scheme` preference, while explicit light or dark mode affects only Weibo Toolkit and does not modify Weibo's own theme.
 
 ## Installation
 
@@ -84,7 +84,7 @@ Friend Radar can export the current account's complete validated state as a loca
 
 Restore accepts a Friend Radar backup JSON file, validates it before writing, requires the backup owner UID to match the current authenticated account, and shows a preview before confirmation. A confirmed restore completely replaces the current account's local Friend Radar snapshot and event history; it does not merge data. Export the current data first if you may need it later.
 
-Existing v0.2.0-v0.4.0 state remains compatible with normal in-place upgrades, so a backup is not required merely to upgrade.
+Existing v0.2.0-v0.5.1 state remains compatible with normal in-place upgrades, so a backup is not required merely to upgrade.
 
 ### Optional automatic updates
 
@@ -105,4 +105,4 @@ Automatic update is optional and defaults to **关闭**. Available intervals are
 
 ## Status
 
-v0.5.1 — current release. Adds an unread-event badge, relationship overview, CSV/Markdown event export, a larger launcher, a simplified single userscript-menu entry, and automatic dark-mode styling for Toolkit-owned UI. Friend Radar storage schema and backup format remain unchanged; no migration is involved.
+v0.5.2 — current release. Adds explicit Follow system / Light / Dark appearance controls, fixes launcher readability in light mode, and moves appearance controls into the combined automatic-update and appearance settings page. Friend Radar storage schema and backup format remain unchanged; no migration is involved.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.5.1
+// @version      0.5.2
 // @description  Local Friend Radar with backup restore and opt-in automatic updates.
 // @match        https://weibo.com/*
 // @license      MPL-2.0
@@ -20,7 +20,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.5.1";
+  const APP_VERSION = "0.5.2";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const BACKUP_FORMAT = "weibo-toolkit.friend-radar";
@@ -33,6 +33,16 @@
   const AUTO_STATUS_DURATION_MS = 5000;
   const AUTO_INTERVAL_HOURS = Object.freeze([0, 24, 48, 72, 168, 360]);
   const LAUNCHER_LABEL = "Weibo Toolkit";
+  // Toolkit-level appearance preference, deliberately outside the versioned
+  // Friend Radar state and outside backup v1.
+  const THEME_KEY = "weiboToolkit.theme.v1";
+  const DEFAULT_THEME = "system";
+  const THEME_VALUES = Object.freeze(["system", "light", "dark"]);
+  const THEME_CHOICES = Object.freeze([
+    ["system", "跟随系统"],
+    ["light", "浅色"],
+    ["dark", "深色"],
+  ]);
 
   const EVENT = Object.freeze({
     VISIBLE_FOLLOWING_ADDED: "VISIBLE_FOLLOWING_ADDED",
@@ -82,6 +92,7 @@
   let launcherLabel = null;
   let launcherBadge = null;
   let launcherStatusTimer = null;
+  let currentTheme = DEFAULT_THEME;
 
   function normalizeStableUid(value) {
     if (typeof value === "number") {
@@ -866,6 +877,52 @@
     return element;
   }
 
+  function normalizeTheme(value) {
+    return THEME_VALUES.includes(value) ? value : DEFAULT_THEME;
+  }
+
+  function loadTheme() {
+    try {
+      return normalizeTheme(GM_getValue(THEME_KEY, DEFAULT_THEME));
+    } catch (_) {
+      // Appearance is cosmetic: an unreadable preference must never block the UI.
+      return DEFAULT_THEME;
+    }
+  }
+
+  function saveTheme(theme) {
+    try {
+      GM_setValue(THEME_KEY, theme);
+      if (GM_getValue(THEME_KEY, null) !== theme) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  // Each Toolkit root (the launcher and the open overlay) carries the theme marker
+  // itself, so no Weibo-owned node is ever touched.
+  function applyThemeToRoot(node) {
+    if (!node) return;
+    const classNames = String(node.className)
+      .split(/\s+/)
+      .filter((name) => name.length > 0 && !name.startsWith("wfr-theme-"));
+    classNames.push(`wfr-theme-${currentTheme}`);
+    node.className = classNames.join(" ");
+  }
+
+  function applyTheme() {
+    applyThemeToRoot(launcherButton);
+    applyThemeToRoot(panelRoot);
+  }
+
   function closePanel() {
     if (panelRoot && panelRoot.parentNode) panelRoot.parentNode.removeChild(panelRoot);
     panelRoot = null;
@@ -873,7 +930,8 @@
 
   function showPanel(title, withBack = false) {
     closePanel();
-    const root = createElement("div", null, "wfr-overlay");
+    const root = createElement("div", null, "wfr-overlay wfr-root");
+    applyThemeToRoot(root);
     const panel = createElement("section", null, "wfr-panel");
     const header = createElement("header", null, "wfr-header");
     const heading = createElement("h2", title);
@@ -2390,8 +2448,9 @@
       return;
     }
 
-    const body = showPanel("自动更新设置", true);
+    const body = showPanel("自动更新与外观", true);
     if (notice) body.append(createElement("p", notice, "wfr-success"));
+    body.append(createElement("h3", "自动更新"));
     body.append(
       createElement(
         "p",
@@ -2459,6 +2518,16 @@
       showAutoUpdateSettings("自动更新设置已保存。");
     });
     body.append(saveButton);
+
+    body.append(createElement("h3", "外观"));
+    body.append(buildAppearanceControl());
+    body.append(
+      createElement(
+        "p",
+        "外观仅影响 Weibo Toolkit 自己的界面，不会更改微博页面的主题，也不会跟随微博的主题设置。",
+        "wfr-muted"
+      )
+    );
   }
 
   function showToolkitHome() {
@@ -2497,7 +2566,7 @@
     const restoreButton = createElement("button", "恢复备份", "wfr-button");
     const autoSettingsButton = createElement(
       "button",
-      "自动更新设置",
+      "自动更新与外观",
       "wfr-button"
     );
     for (const button of [
@@ -2530,11 +2599,42 @@
     body.append(actions);
   }
 
+  // Toolkit-only appearance preference: it changes nothing but Toolkit styling.
+  function buildAppearanceControl() {
+    const row = createElement("label", "外观：", "wfr-row");
+    const select = createElement("select", null, "wfr-select");
+    select.setAttribute("aria-label", "外观");
+    for (const [value, text] of THEME_CHOICES) {
+      const option = createElement("option", text);
+      option.value = value;
+      option.selected = value === currentTheme;
+      select.append(option);
+    }
+    select.value = currentTheme;
+    select.addEventListener("change", () => {
+      const chosen = normalizeTheme(select.value);
+      const saved = saveTheme(chosen);
+      if (!saved.ok) {
+        showFailure("外观设置", saved);
+        return;
+      }
+      currentTheme = chosen;
+      applyTheme();
+    });
+    row.append(select);
+    return row;
+  }
+
   function installToolkitLauncher() {
     if (!document.body) return;
-    const button = createElement("button", null, "wfr-button wfr-toolkit-launcher");
+    const button = createElement(
+      "button",
+      null,
+      "wfr-button wfr-toolkit-launcher wfr-root"
+    );
     button.type = "button";
     button.setAttribute("aria-label", LAUNCHER_LABEL);
+    applyThemeToRoot(button);
     launcherLabel = createElement("span", LAUNCHER_LABEL, "wfr-launcher-label");
     launcherBadge = createElement("span", "", "wfr-launcher-badge");
     launcherBadge.hidden = true;
@@ -2545,51 +2645,47 @@
     refreshUnreadBadge();
   }
 
+  // Every Toolkit colour is a custom property carried by the Toolkit roots, so a
+  // theme is selected purely by which token block wins on `.wfr-root`.
+  const LIGHT_THEME_TOKENS =
+    "--wfr-overlay-bg: rgba(0,0,0,.45); --wfr-panel-bg: #fff; --wfr-panel-text: #222; --wfr-panel-shadow: 0 12px 36px rgba(0,0,0,.25); --wfr-border: #ddd; --wfr-control-border: #bbb; --wfr-button-bg: #fff; --wfr-button-text: #222; --wfr-primary-bg: #1677ff; --wfr-primary-text: #fff; --wfr-success: #176b2c; --wfr-error: #a11919; --wfr-muted: #666; --wfr-field-bg: #fff; --wfr-field-text: #222; --wfr-card-bg: transparent; --wfr-launcher-bg: rgba(255,255,255,.9); --wfr-launcher-text: #1f2328; --wfr-launcher-border: rgba(0,0,0,.18); --wfr-launcher-hover-bg: #fff; --wfr-launcher-hover-border: rgba(0,0,0,.32); --wfr-badge-bg: #d4380d; --wfr-badge-text: #fff;";
+
+  const DARK_THEME_TOKENS =
+    "--wfr-overlay-bg: rgba(0,0,0,.6); --wfr-panel-bg: #1f2126; --wfr-panel-text: #e8e8ea; --wfr-panel-shadow: 0 12px 36px rgba(0,0,0,.55); --wfr-border: #3a3d44; --wfr-control-border: #4a4e56; --wfr-button-bg: #2a2d33; --wfr-button-text: #e8e8ea; --wfr-primary-bg: #2d7ff9; --wfr-primary-text: #fff; --wfr-success: #6bd18c; --wfr-error: #ff8f8f; --wfr-muted: #a6aab3; --wfr-field-bg: #2a2d33; --wfr-field-text: #e8e8ea; --wfr-card-bg: #24272d; --wfr-launcher-bg: rgba(33,35,40,.92); --wfr-launcher-text: #e8e8ea; --wfr-launcher-border: rgba(255,255,255,.22); --wfr-launcher-hover-bg: rgba(45,48,55,.96); --wfr-launcher-hover-border: rgba(255,255,255,.38); --wfr-badge-bg: #ff6b5e; --wfr-badge-text: #26100c;";
+
   function installStyles() {
     const style = createElement("style");
     style.textContent = `
-      .wfr-overlay { position: fixed; inset: 0; z-index: 2147483647; background: rgba(0,0,0,.45); padding: 28px; overflow: auto; box-sizing: border-box; }
-      .wfr-panel { max-width: 720px; margin: 0 auto; background: #fff; color: #222; border-radius: 8px; box-shadow: 0 12px 36px rgba(0,0,0,.25); font: 14px/1.5 system-ui, sans-serif; }
-      .wfr-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 20px; border-bottom: 1px solid #ddd; }
+      .wfr-root { ${LIGHT_THEME_TOKENS} }
+      .wfr-root.wfr-theme-dark { ${DARK_THEME_TOKENS} }
+      @media (prefers-color-scheme: dark) {
+        .wfr-root.wfr-theme-system { ${DARK_THEME_TOKENS} }
+      }
+      .wfr-overlay { position: fixed; inset: 0; z-index: 2147483647; background: var(--wfr-overlay-bg); padding: 28px; overflow: auto; box-sizing: border-box; }
+      .wfr-panel { max-width: 720px; margin: 0 auto; background: var(--wfr-panel-bg); color: var(--wfr-panel-text); border-radius: 8px; box-shadow: var(--wfr-panel-shadow); font: 14px/1.5 system-ui, sans-serif; }
+      .wfr-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 20px; border-bottom: 1px solid var(--wfr-border); }
       .wfr-header h2 { margin: 0; font-size: 18px; }
       .wfr-body { padding: 18px 20px 22px; }
       .wfr-row { margin: 7px 0; overflow-wrap: anywhere; }
-      .wfr-button { border: 1px solid #bbb; border-radius: 5px; background: #fff; color: #222; padding: 6px 10px; cursor: pointer; }
+      .wfr-button { border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-button-bg); color: var(--wfr-button-text); padding: 6px 10px; cursor: pointer; }
       .wfr-button:disabled { opacity: .55; cursor: default; }
-      .wfr-primary { margin: 10px 0 14px; background: #1677ff; border-color: #1677ff; color: #fff; }
-      .wfr-success { color: #176b2c; font-weight: 600; }
-      .wfr-error { color: #a11919; font-weight: 600; }
-      .wfr-muted { color: #666; }
-      .wfr-search { width: 100%; box-sizing: border-box; margin-top: 12px; padding: 6px 9px; border: 1px solid #bbb; border-radius: 5px; background: #fff; color: #222; font: inherit; }
-      .wfr-select { margin-left: 8px; padding: 5px 8px; border: 1px solid #bbb; border-radius: 5px; background: #fff; color: #222; font: inherit; }
+      .wfr-primary { margin: 10px 0 14px; background: var(--wfr-primary-bg); border-color: var(--wfr-primary-bg); color: var(--wfr-primary-text); }
+      .wfr-success { color: var(--wfr-success); font-weight: 600; }
+      .wfr-error { color: var(--wfr-error); font-weight: 600; }
+      .wfr-muted { color: var(--wfr-muted); }
+      .wfr-search { width: 100%; box-sizing: border-box; margin-top: 12px; padding: 6px 9px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-select { margin-left: 8px; padding: 5px 8px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
       .wfr-event-list { display: grid; gap: 10px; margin-top: 14px; }
-      .wfr-event { border: 1px solid #ddd; border-radius: 6px; padding: 10px 12px; }
+      .wfr-event { border: 1px solid var(--wfr-border); border-radius: 6px; padding: 10px 12px; background: var(--wfr-card-bg); }
       .wfr-event h3 { margin: 0 0 6px; font-size: 14px; }
       .wfr-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
       .wfr-actions .wfr-primary { margin: 0; }
       .wfr-body h3 { margin: 18px 0 6px; font-size: 15px; }
       .wfr-body h3:first-child { margin-top: 0; }
-      .wfr-toolkit-launcher { position: fixed; right: 18px; bottom: 18px; z-index: 2147483000; display: inline-flex; align-items: center; gap: 7px; padding: 8px 14px; border: 1px solid rgba(127,127,127,.22); border-radius: 999px; background: rgba(127,127,127,.12); color: inherit; box-shadow: none; font: inherit; font-size: 13px; line-height: 1.35; opacity: .72; transition: opacity 100ms ease, background-color 100ms ease, border-color 100ms ease; }
-      .wfr-toolkit-launcher:hover, .wfr-toolkit-launcher:focus-visible { border-color: rgba(127,127,127,.34); background: rgba(127,127,127,.2); opacity: .98; }
-      .wfr-launcher-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 19px; height: 19px; padding: 0 6px; box-sizing: border-box; border-radius: 999px; background: #d4380d; color: #fff; font-size: 11px; font-weight: 700; line-height: 1; }
+      .wfr-toolkit-launcher { position: fixed; right: 18px; bottom: 18px; z-index: 2147483000; display: inline-flex; align-items: center; gap: 7px; padding: 8px 14px; border: 1px solid var(--wfr-launcher-border); border-radius: 999px; background: var(--wfr-launcher-bg); color: var(--wfr-launcher-text); box-shadow: none; font: 13px/1.35 system-ui, sans-serif; opacity: .9; transition: opacity 100ms ease, background-color 100ms ease, border-color 100ms ease; }
+      .wfr-toolkit-launcher:hover, .wfr-toolkit-launcher:focus-visible { border-color: var(--wfr-launcher-hover-border); background: var(--wfr-launcher-hover-bg); opacity: 1; }
+      .wfr-launcher-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 19px; height: 19px; padding: 0 6px; box-sizing: border-box; border-radius: 999px; background: var(--wfr-badge-bg); color: var(--wfr-badge-text); font-size: 11px; font-weight: 700; line-height: 1; }
       .wfr-launcher-badge[hidden] { display: none; }
-      @media (prefers-color-scheme: dark) {
-        .wfr-overlay { background: rgba(0,0,0,.6); }
-        .wfr-panel { background: #1f2126; color: #e8e8ea; box-shadow: 0 12px 36px rgba(0,0,0,.55); }
-        .wfr-header { border-bottom-color: #3a3d44; }
-        .wfr-button { border-color: #4a4e56; background: #2a2d33; color: #e8e8ea; }
-        .wfr-primary { background: #2d7ff9; border-color: #2d7ff9; color: #fff; }
-        .wfr-success { color: #6bd18c; }
-        .wfr-error { color: #ff8f8f; }
-        .wfr-muted { color: #a6aab3; }
-        .wfr-search, .wfr-select { border-color: #4a4e56; background: #2a2d33; color: #e8e8ea; }
-        .wfr-event { border-color: #3a3d44; background: #24272d; }
-        /* The launcher sits on host pixels, so only its own translucent surfaces are
-           adjusted and its text keeps inheriting the host's readable color. */
-        .wfr-toolkit-launcher { border-color: rgba(160,160,160,.3); background: rgba(160,160,160,.16); }
-        .wfr-toolkit-launcher:hover, .wfr-toolkit-launcher:focus-visible { border-color: rgba(190,190,190,.45); background: rgba(180,180,180,.26); }
-        .wfr-launcher-badge { background: #ff6b5e; color: #26100c; }
-      }
     `;
     document.head.append(style);
   }
@@ -2600,6 +2696,7 @@
     GM_registerMenuCommand("Weibo Toolkit：打开工具箱", showToolkitHome);
   }
 
+  currentTheme = loadTheme();
   installStyles();
   registerMenuCommands();
   installToolkitLauncher();
