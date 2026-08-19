@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.4.0
-// @description  Manual Friend Radar with an independent Weibo Toolkit launcher.
+// @version      0.5.0
+// @description  Local Friend Radar with backup restore and opt-in automatic updates.
 // @match        https://weibo.com/*
 // @license      MPL-2.0
 // @grant        GM_registerMenuCommand
@@ -20,11 +20,17 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.4.0";
+  const APP_VERSION = "0.5.0";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const BACKUP_FORMAT = "weibo-toolkit.friend-radar";
   const BACKUP_VERSION = 1;
+  const AUTO_INTERVAL_PREFIX = "weiboToolkit.friendRadar.autoInterval.v1.";
+  const AUTO_ATTEMPT_PREFIX = "weiboToolkit.friendRadar.autoAttempt.v1.";
+  const AUTO_STARTUP_DELAY_MS = 5000;
+  const AUTO_ATTEMPT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+  const AUTO_STATUS_DURATION_MS = 5000;
+  const AUTO_INTERVAL_HOURS = Object.freeze([0, 24, 48, 72, 168, 360]);
 
   const EVENT = Object.freeze({
     VISIBLE_FOLLOWING_ADDED: "VISIBLE_FOLLOWING_ADDED",
@@ -59,6 +65,7 @@
       "检测到另一个微博标签页正在修改关系雷达数据，本次操作未保存。请在其中一个标签页重新操作。",
     STORAGE_ERROR: "本地状态无法读取",
     BACKUP_EXPORT_ERROR: "备份导出失败",
+    BACKUP_RESTORE_ERROR: "备份恢复失败",
     UPDATE_ALREADY_RUNNING: "更新正在进行",
     UNKNOWN_FAILURE: "未知失败",
   });
@@ -68,6 +75,8 @@
 
   let updateRunning = false;
   let panelRoot = null;
+  let launcherButton = null;
+  let launcherStatusTimer = null;
 
   function normalizeStableUid(value) {
     if (typeof value === "number") {
@@ -279,7 +288,7 @@
     }
   }
 
-  async function scanFollowing(ownerUid, onProgress) {
+  async function scanFollowing(ownerUid, onProgress, beforeFirstRequest) {
     const recordsByUid = new Map();
     const seenNextCursors = new Set();
     const seenPaginationStates = new Set();
@@ -288,6 +297,12 @@
     let requestsMade = 0;
 
     for (let page = 1; page <= MAX_REQUESTS; page += 1) {
+      if (requestsMade === 0 && typeof beforeFirstRequest === "function") {
+        const permission = beforeFirstRequest();
+        if (!permission.ok) {
+          return { ...permission, requestsMade: 0, failedPage: page };
+        }
+      }
       if (requestsMade > 0) await delay(REQUEST_DELAY_MS);
       requestsMade += 1;
 
@@ -748,11 +763,15 @@
     return { ok: true };
   }
 
-  async function performUpdate(onProgress) {
+  async function performUpdate(onProgress, beforeFirstRequest) {
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) return uidResult;
 
-    const scan = await scanFollowing(uidResult.uid, onProgress);
+    const scan = await scanFollowing(
+      uidResult.uid,
+      onProgress,
+      beforeFirstRequest
+    );
     if (!scan.ok) return scan;
 
     const currentUid = determineCurrentUid();
@@ -836,6 +855,20 @@
   }
 
   function failureText(result) {
+    if (result.failureKind === "BACKUP_RESTORE_ERROR") {
+      const restoreMessages = {
+        MALFORMED_JSON: "备份文件不是有效的 JSON。",
+        INVALID_TOP_LEVEL: "备份文件结构无效。",
+        WRONG_BACKUP_FORMAT: "备份格式不匹配。",
+        UNSUPPORTED_BACKUP_VERSION: "此备份版本不受支持。",
+        INVALID_OWNER_UID: "备份账号 UID 无效。",
+        OWNER_UID_MISMATCH: "备份不属于当前登录账号，未恢复。",
+        INVALID_EXPORTED_AT: "备份导出时间无效。",
+        INVALID_STATE: "备份中的关系雷达数据无效或不完整。",
+        FILE_READ_ERROR: "无法读取所选备份文件。",
+      };
+      return restoreMessages[result.reason] || FAILURE_LABELS.BACKUP_RESTORE_ERROR;
+    }
     if (
       result.failureKind === "PAGINATION_FAILURE" &&
       result.reason === "HARD_REQUEST_CEILING_REACHED"
@@ -1334,6 +1367,377 @@
     return `${JSON.stringify(backup, null, 2)}\n`;
   }
 
+  function loadAutoInterval(ownerUid) {
+    try {
+      const value = GM_getValue(`${AUTO_INTERVAL_PREFIX}${ownerUid}`, 0);
+      if (!AUTO_INTERVAL_HOURS.includes(value)) {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "AUTO_INTERVAL_INVALID",
+        };
+      }
+      return { ok: true, value };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function saveAutoInterval(ownerUid, value) {
+    const key = `${AUTO_INTERVAL_PREFIX}${ownerUid}`;
+    try {
+      GM_setValue(key, value);
+      if (GM_getValue(key, null) !== value) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  function loadLastAutomaticAttempt(ownerUid) {
+    try {
+      const value = GM_getValue(`${AUTO_ATTEMPT_PREFIX}${ownerUid}`, null);
+      if (value === null || typeof value === "undefined") {
+        return { ok: true, value: null };
+      }
+      if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "AUTO_ATTEMPT_INVALID",
+        };
+      }
+      return { ok: true, value };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function saveLastAutomaticAttempt(ownerUid, attemptedAt) {
+    const key = `${AUTO_ATTEMPT_PREFIX}${ownerUid}`;
+    try {
+      GM_setValue(key, attemptedAt);
+      if (GM_getValue(key, null) !== attemptedAt) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  function evaluateAutomaticUpdateEligibility(ownerUid, nowMilliseconds) {
+    const interval = loadAutoInterval(ownerUid);
+    if (!interval.ok) return interval;
+    if (interval.value === 0) {
+      return { ok: true, eligible: false, reason: "DISABLED" };
+    }
+
+    const loaded = loadState(ownerUid);
+    if (!loaded.ok) return loaded;
+    if (loaded.state.latestSnapshot === null) {
+      return { ok: true, eligible: false, reason: "NO_SUCCESSFUL_BASELINE" };
+    }
+    const successfulAt = Date.parse(loaded.state.latestSnapshot.capturedAt);
+    const thresholdMilliseconds = interval.value * 60 * 60 * 1000;
+    if (nowMilliseconds - successfulAt < thresholdMilliseconds) {
+      return { ok: true, eligible: false, reason: "THRESHOLD_NOT_REACHED" };
+    }
+
+    const lastAttempt = loadLastAutomaticAttempt(ownerUid);
+    if (!lastAttempt.ok) return lastAttempt;
+    if (
+      lastAttempt.value !== null &&
+      nowMilliseconds - Date.parse(lastAttempt.value) <
+        AUTO_ATTEMPT_COOLDOWN_MS
+    ) {
+      return { ok: true, eligible: false, reason: "ATTEMPT_COOLDOWN" };
+    }
+    return {
+      ok: true,
+      eligible: true,
+      intervalHours: interval.value,
+      lastSuccessfulAt: loaded.state.latestSnapshot.capturedAt,
+    };
+  }
+
+  function validateBackupText(text, currentOwnerUid) {
+    let backup;
+    try {
+      backup = JSON.parse(text);
+    } catch (_) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "MALFORMED_JSON",
+      };
+    }
+
+    if (!isPlainObject(backup)) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "INVALID_TOP_LEVEL",
+      };
+    }
+    if (backup.backupFormat !== BACKUP_FORMAT) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "WRONG_BACKUP_FORMAT",
+      };
+    }
+    if (backup.backupVersion !== BACKUP_VERSION) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "UNSUPPORTED_BACKUP_VERSION",
+      };
+    }
+    if (
+      typeof backup.ownerUid !== "string" ||
+      normalizeStableUid(backup.ownerUid) !== backup.ownerUid
+    ) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "INVALID_OWNER_UID",
+      };
+    }
+    if (backup.ownerUid !== currentOwnerUid) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "OWNER_UID_MISMATCH",
+      };
+    }
+    if (
+      hasOwn(backup, "exportedAt") &&
+      (typeof backup.exportedAt !== "string" ||
+        !Number.isFinite(Date.parse(backup.exportedAt)))
+    ) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "INVALID_EXPORTED_AT",
+      };
+    }
+    if (!isValidStoredState(backup.state, backup.ownerUid)) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "INVALID_STATE",
+      };
+    }
+
+    return {
+      ok: true,
+      ownerUid: backup.ownerUid,
+      exportedAt: hasOwn(backup, "exportedAt") ? backup.exportedAt : null,
+      state: backup.state,
+      stateSerialized: JSON.stringify(backup.state),
+    };
+  }
+
+  function selectBackupFile() {
+    return new Promise((resolve, reject) => {
+      const input = createElement("input");
+      input.type = "file";
+      input.accept = "application/json,.json";
+      input.hidden = true;
+      let settled = false;
+
+      function finish(file) {
+        if (settled) return;
+        settled = true;
+        if (input.parentNode) input.parentNode.removeChild(input);
+        resolve(file || null);
+      }
+
+      input.addEventListener("change", () => {
+        finish(input.files && input.files.length > 0 ? input.files[0] : null);
+      });
+      input.addEventListener("cancel", () => finish(null));
+      document.body.append(input);
+      try {
+        input.click();
+      } catch (error) {
+        if (input.parentNode) input.parentNode.removeChild(input);
+        reject(error);
+      }
+    });
+  }
+
+  function restoreValidatedBackup(validated, expectedCurrentRaw) {
+    const currentUid = determineCurrentUid();
+    if (!currentUid.ok || currentUid.uid !== validated.ownerUid) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "OWNER_UID_MISMATCH",
+      };
+    }
+
+    const fresh = loadState(validated.ownerUid);
+    if (!fresh.ok) return fresh;
+    if (fresh.raw !== expectedCurrentRaw) {
+      return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+    }
+
+    const persisted = persistState(validated.ownerUid, validated.state);
+    if (!persisted.ok) return persisted;
+
+    const reloaded = loadState(validated.ownerUid);
+    if (!reloaded.ok) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: "RestoreVerificationError",
+        rollbackSucceeded: false,
+      };
+    }
+    if (reloaded.raw !== validated.stateSerialized) {
+      return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+    }
+    return { ok: true, state: reloaded.state };
+  }
+
+  function snapshotRecordCount(state) {
+    return state.latestSnapshot ? state.latestSnapshot.records.length : 0;
+  }
+
+  function showRestorePreview(validated, currentLoaded) {
+    const body = showPanel("恢复备份", true);
+    body.append(
+      createElement(
+        "p",
+        "恢复后，当前账号的关系雷达本地数据将被此备份完整替换。",
+        "wfr-error"
+      )
+    );
+    body.append(
+      createElement(
+        "p",
+        "建议先导出当前数据作为备份。",
+        "wfr-muted"
+      )
+    );
+    addLine(body, "备份账号 UID", validated.ownerUid);
+    if (validated.exportedAt !== null) {
+      addLine(body, "备份导出时间", formatTime(validated.exportedAt));
+    }
+    addLine(body, "当前事件数", currentLoaded.state.events.length);
+    addLine(body, "备份事件数", validated.state.events.length);
+    addLine(body, "当前快照记录数", snapshotRecordCount(currentLoaded.state));
+    addLine(body, "备份快照记录数", snapshotRecordCount(validated.state));
+
+    const actions = createElement("div", null, "wfr-actions");
+    const exportButton = createElement("button", "先备份当前数据", "wfr-button");
+    const confirmButton = createElement(
+      "button",
+      "确认完整替换",
+      "wfr-button wfr-primary"
+    );
+    exportButton.type = "button";
+    confirmButton.type = "button";
+    exportButton.addEventListener("click", () => void exportBackup());
+    confirmButton.addEventListener("click", () => {
+      exportButton.disabled = true;
+      confirmButton.disabled = true;
+      if (updateRunning) {
+        showFailure("恢复备份失败", {
+          failureKind: "UPDATE_ALREADY_RUNNING",
+        });
+        return;
+      }
+      const restored = restoreValidatedBackup(validated, currentLoaded.raw);
+      if (!restored.ok) {
+        showFailure("恢复备份失败", restored);
+        return;
+      }
+      const success = showPanel("备份已恢复", true);
+      success.append(createElement("p", "备份已恢复。", "wfr-success"));
+      addLine(success, "事件数", restored.state.events.length);
+      addLine(success, "快照记录数", snapshotRecordCount(restored.state));
+    });
+    actions.append(exportButton, confirmButton);
+    body.append(actions);
+  }
+
+  async function restoreBackup() {
+    if (updateRunning) {
+      showFailure("恢复备份", {
+        failureKind: "UPDATE_ALREADY_RUNNING",
+      });
+      return;
+    }
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showFailure("恢复备份", uidResult);
+      return;
+    }
+    const currentLoaded = loadState(uidResult.uid);
+    if (!currentLoaded.ok) {
+      showFailure("恢复备份", currentLoaded);
+      return;
+    }
+
+    let file;
+    try {
+      file = await selectBackupFile();
+    } catch (error) {
+      showFailure("恢复备份", {
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "FILE_READ_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      });
+      return;
+    }
+    if (file === null) {
+      const cancelled = showPanel("恢复已取消", true);
+      cancelled.append(createElement("p", "恢复已取消。", "wfr-muted"));
+      return;
+    }
+
+    let text;
+    try {
+      text = await file.text();
+    } catch (error) {
+      showFailure("恢复备份", {
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "FILE_READ_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      });
+      return;
+    }
+    const validated = validateBackupText(text, uidResult.uid);
+    if (!validated.ok) {
+      showFailure("恢复备份", validated);
+      return;
+    }
+    showRestorePreview(validated, currentLoaded);
+  }
+
   function backupExportError(backupStage, error) {
     const tagged = new Error("Backup export failed");
     tagged.name = error && error.name ? String(error.name) : "Error";
@@ -1490,6 +1894,210 @@
     addLine(body, nativeSave ? "文件名" : "建议文件名", saveResult.filename);
   }
 
+  function setLauncherStatus(text, resetAfterMilliseconds) {
+    if (!launcherButton) return;
+    if (launcherStatusTimer !== null) {
+      clearTimeout(launcherStatusTimer);
+      launcherStatusTimer = null;
+    }
+    launcherButton.textContent = text;
+    launcherButton.setAttribute("aria-label", text);
+    if (typeof resetAfterMilliseconds === "number") {
+      launcherStatusTimer = setTimeout(() => {
+        launcherButton.textContent = "Weibo Toolkit";
+        launcherButton.setAttribute("aria-label", "Weibo Toolkit");
+        launcherStatusTimer = null;
+      }, resetAfterMilliseconds);
+    }
+  }
+
+  function pageLockManager() {
+    try {
+      if (
+        typeof unsafeWindow !== "undefined" &&
+        unsafeWindow.navigator &&
+        unsafeWindow.navigator.locks &&
+        typeof unsafeWindow.navigator.locks.request === "function"
+      ) {
+        return unsafeWindow.navigator.locks;
+      }
+    } catch (_) {
+      // Automatic scanning fails safe when the page-realm LockManager is unavailable.
+    }
+    return null;
+  }
+
+  async function checkAutomaticUpdate() {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) return uidResult;
+    const preliminary = evaluateAutomaticUpdateEligibility(
+      uidResult.uid,
+      Date.now()
+    );
+    if (!preliminary.ok || !preliminary.eligible) return preliminary;
+
+    const lockManager = pageLockManager();
+    if (lockManager === null) {
+      return { ok: true, eligible: false, reason: "LOCK_UNAVAILABLE" };
+    }
+
+    try {
+      return await lockManager.request.call(
+        lockManager,
+        `weibo-toolkit-friend-radar-auto-${uidResult.uid}`,
+        { mode: "exclusive", ifAvailable: true },
+        async (lock) => {
+          if (lock === null) {
+            return { ok: true, eligible: false, reason: "LOCK_NOT_ACQUIRED" };
+          }
+
+          const lockedEligibility = evaluateAutomaticUpdateEligibility(
+            uidResult.uid,
+            Date.now()
+          );
+          if (!lockedEligibility.ok || !lockedEligibility.eligible) {
+            return lockedEligibility;
+          }
+          if (updateRunning) {
+            return { ok: true, eligible: false, reason: "UPDATE_ALREADY_RUNNING" };
+          }
+          const currentUid = determineCurrentUid();
+          if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
+            return {
+              ok: false,
+              failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+            };
+          }
+
+          updateRunning = true;
+          setLauncherStatus("关系雷达正在自动更新…");
+          let result;
+          try {
+            result = await performUpdate(null, () =>
+              saveLastAutomaticAttempt(
+                uidResult.uid,
+                new Date().toISOString()
+              )
+            );
+          } catch (error) {
+            result = {
+              ok: false,
+              failureKind: "UNKNOWN_FAILURE",
+              errorName: error && error.name ? String(error.name) : "Error",
+            };
+          } finally {
+            updateRunning = false;
+          }
+          setLauncherStatus(
+            result.ok ? "关系雷达自动更新完成" : "关系雷达自动更新失败",
+            AUTO_STATUS_DURATION_MS
+          );
+          return result;
+        }
+      );
+    } catch (error) {
+      return {
+        ok: true,
+        eligible: false,
+        reason: "LOCK_REQUEST_FAILED",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function showAutoUpdateSettings(notice) {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showFailure("自动更新设置", uidResult);
+      return;
+    }
+    const interval = loadAutoInterval(uidResult.uid);
+    if (!interval.ok) {
+      showFailure("自动更新设置", interval);
+      return;
+    }
+    const loaded = loadState(uidResult.uid);
+    if (!loaded.ok) {
+      showFailure("自动更新设置", loaded);
+      return;
+    }
+    const lastAttempt = loadLastAutomaticAttempt(uidResult.uid);
+    if (!lastAttempt.ok) {
+      showFailure("自动更新设置", lastAttempt);
+      return;
+    }
+
+    const body = showPanel("自动更新设置", true);
+    if (notice) body.append(createElement("p", notice, "wfr-success"));
+    body.append(
+      createElement(
+        "p",
+        "仅在打开网页版微博时检查，不会在浏览器后台定时运行。",
+        "wfr-muted"
+      )
+    );
+    if (loaded.state.latestSnapshot === null) {
+      body.append(
+        createElement(
+          "p",
+          "请先手动完成一次关系雷达更新，自动更新不会创建首个基线。",
+          "wfr-muted"
+        )
+      );
+    }
+    const label = createElement("label", "自动更新：", "wfr-row");
+    const select = createElement("select", null, "wfr-select");
+    const choices = [
+      [0, "关闭"],
+      [24, "每 24 小时"],
+      [48, "每 48 小时"],
+      [72, "每 72 小时"],
+      [168, "每 7 天"],
+      [360, "每 15 天"],
+    ];
+    for (const [hours, text] of choices) {
+      const option = createElement("option", text);
+      option.value = String(hours);
+      option.selected = hours === interval.value;
+      select.append(option);
+    }
+    select.value = String(interval.value);
+    label.append(select);
+    body.append(label);
+    addLine(
+      body,
+      "上次自动尝试",
+      lastAttempt.value === null ? "—" : formatTime(lastAttempt.value)
+    );
+
+    const saveButton = createElement("button", "保存设置", "wfr-button wfr-primary");
+    saveButton.type = "button";
+    saveButton.addEventListener("click", () => {
+      const currentUid = determineCurrentUid();
+      if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
+        showFailure("自动更新设置", {
+          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+        });
+        return;
+      }
+      const value = Number(select.value);
+      if (!AUTO_INTERVAL_HOURS.includes(value)) {
+        showFailure("自动更新设置", {
+          failureKind: "STORAGE_ERROR",
+          reason: "AUTO_INTERVAL_INVALID",
+        });
+        return;
+      }
+      const saved = saveAutoInterval(uidResult.uid, value);
+      if (!saved.ok) {
+        showFailure("自动更新设置", saved);
+        return;
+      }
+      showAutoUpdateSettings("自动更新设置已保存。");
+    });
+    body.append(saveButton);
+  }
+
   function showToolkitHome() {
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
@@ -1521,14 +2129,36 @@
     const eventsButton = createElement("button", "查看事件", "wfr-button");
     const statusButton = createElement("button", "查看状态", "wfr-button");
     const exportButton = createElement("button", "导出备份", "wfr-button");
-    for (const button of [updateButton, eventsButton, statusButton, exportButton]) {
+    const restoreButton = createElement("button", "恢复备份", "wfr-button");
+    const autoSettingsButton = createElement(
+      "button",
+      "自动更新设置",
+      "wfr-button"
+    );
+    for (const button of [
+      updateButton,
+      eventsButton,
+      statusButton,
+      exportButton,
+      restoreButton,
+      autoSettingsButton,
+    ]) {
       button.type = "button";
     }
     updateButton.addEventListener("click", () => void updateNow());
     eventsButton.addEventListener("click", viewEvents);
     statusButton.addEventListener("click", viewStatus);
     exportButton.addEventListener("click", exportBackup);
-    actions.append(updateButton, eventsButton, statusButton, exportButton);
+    restoreButton.addEventListener("click", () => void restoreBackup());
+    autoSettingsButton.addEventListener("click", showAutoUpdateSettings);
+    actions.append(
+      updateButton,
+      eventsButton,
+      statusButton,
+      exportButton,
+      restoreButton,
+      autoSettingsButton
+    );
     body.append(actions);
   }
 
@@ -1539,6 +2169,7 @@
     button.setAttribute("aria-label", "Weibo Toolkit");
     button.addEventListener("click", showToolkitHome);
     document.body.append(button);
+    launcherButton = button;
   }
 
   function installStyles() {
@@ -1557,6 +2188,7 @@
       .wfr-error { color: #a11919; font-weight: 600; }
       .wfr-muted { color: #666; }
       .wfr-search { width: 100%; box-sizing: border-box; margin-top: 12px; padding: 6px 9px; border: 1px solid #bbb; border-radius: 5px; background: #fff; color: #222; font: inherit; }
+      .wfr-select { margin-left: 8px; padding: 5px 8px; border: 1px solid #bbb; border-radius: 5px; background: #fff; color: #222; font: inherit; }
       .wfr-event-list { display: grid; gap: 10px; margin-top: 14px; }
       .wfr-event { border: 1px solid #ddd; border-radius: 6px; padding: 10px 12px; }
       .wfr-event h3 { margin: 0 0 6px; font-size: 14px; }
@@ -1579,4 +2211,5 @@
   installStyles();
   registerMenuCommands();
   installToolkitLauncher();
+  setTimeout(() => void checkAutomaticUpdate(), AUTO_STARTUP_DELAY_MS);
 })();

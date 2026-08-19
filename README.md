@@ -44,6 +44,12 @@ Install with [Tampermonkey](https://www.tampermonkey.net/) and Greasy Fork:
 
 Four concise **Weibo Toolkit** userscript menu commands remain available as fallback controls for update, events, status, and backup export.
 
+Tested with Tampermonkey on Chrome, Edge, Vivaldi, and Firefox. Violentmonkey is expected to be compatible but is not part of the current real-browser validation set.
+
+For Edge and other Chromium browsers, if userscripts do not run after installing Tampermonkey, open the browser's extension settings and ensure userscript execution is allowed. Depending on the browser and extension version, enabling developer mode may also be required.
+
+Install `.user.js` files through Tampermonkey, Violentmonkey, or Greasy Fork. Do not launch them by double-clicking in Windows Script Host.
+
 ### Manual source installation (developers / fallback)
 
 If you are working from source or Greasy Fork is unavailable, install manually with Tampermonkey or Violentmonkey:
@@ -52,19 +58,29 @@ If you are working from source or Greasy Fork is unavailable, install manually w
 2. Paste the complete contents of `weibo-toolkit.user.js`.
 3. Save, then open authenticated `https://weibo.com/` and reload.
 
-Manually installed copies do not receive automatic updates.
+Manually installed copies do not receive automatic userscript-version updates.
 
 ## Upgrade
 
 To upgrade, open the existing installed **Weibo Toolkit** userscript, replace its contents with the new `weibo-toolkit.user.js`, and save it in place. Do not delete the existing script first, and do not create a second installed copy as an upgrade procedure.
 
-Normal in-place upgrades preserve Friend Radar GM storage. Deleting or uninstalling the userscript may remove its storage or make that storage unavailable. Export a backup before uninstalling/reinstalling the userscript or moving to another browser or device.
+Normal in-place upgrades preserve Friend Radar GM storage. Deleting or uninstalling the userscript may remove its storage or make that storage unavailable. Export a backup before uninstalling/reinstalling the userscript or moving to another browser or device. Backup Restore is the supported migration/recovery path and requires signing in to the backup's matching Weibo account. Do not assume separately created userscript copies automatically share GM storage.
 
 ## Data and Privacy
 
-Data stays in userscript-local browser storage. There is no project server, telemetry, or automatic background scanning; updates are manual. Clearing browser or userscript storage deletes the local baseline and event history.
+Data stays in userscript-local browser storage. There is no project server, telemetry, or continuous background service. Updates are manual unless the user explicitly enables the page-open automatic-update option. Clearing browser or userscript storage deletes the local baseline and event history.
 
-Friend Radar can manually export the current account's complete validated state as an optional local JSON backup. Existing v0.2.0 data is preserved automatically when upgrading, so a backup is not required for normal upgrades. On supported browsers the export action may show a native Save As dialog; otherwise the backup is handed to the browser's normal download system. Import/Restore is not yet implemented.
+### Backup export and restore
+
+Friend Radar can export the current account's complete validated state as a local JSON backup. On supported browsers export may show a native Save As dialog; otherwise the backup is handed to the browser's normal download system.
+
+Restore accepts a Friend Radar backup JSON file, validates it before writing, requires the backup owner UID to match the current authenticated account, and shows a preview before confirmation. A confirmed restore completely replaces the current account's local Friend Radar snapshot and event history; it does not merge data. Export the current data first if you may need it later.
+
+Existing v0.2.0-v0.4.0 state remains compatible with normal in-place upgrades, so a backup is not required merely to upgrade.
+
+### Optional automatic updates
+
+Automatic update is optional and defaults to **关闭**. Available intervals are 24 hours, 48 hours, 72 hours, 7 days, and 15 days. Eligibility is checked once after web Weibo is opened or reloaded; Friend Radar does not poll continuously in the browser background. The first baseline must still be established manually, manual update remains available, and a failed automatic attempt does not enter a continuous retry loop.
 
 ## Known Limitations
 
@@ -73,12 +89,12 @@ Friend Radar can manually export the current account's complete validated state 
 - The reason an account disappeared cannot be determined.
 - Relationship timelines cover only events Weibo Toolkit observed and stored, not the complete real-world history.
 - A relationship change during a multi-page scan can theoretically create a transient observation.
-- Simultaneous operations from multiple Weibo tabs are unsupported. Cross-tab writes are not fully serialized: a conflicting write is detected and reported rather than silently overwriting, but last-writer-wins races remain possible. Use one Weibo tab at a time.
+- Automatic scans use narrow owner-scoped mutual exclusion; if reliable locking is unavailable, automatic scanning skips rather than racing.
+- Manual operations from multiple Weibo tabs are not fully serialized. Detected conflicting writes fail safely, but last-writer-wins races remain possible; use one tab for manual updates, restore, and event changes.
 - Reload Weibo after switching accounts.
-- Local data is browser-local; backup export is available, but Import/Restore is not yet implemented.
+- Local data is browser-local. Use backup export and matching-account restore for migration or recovery.
 - A single scan stops at a 100-request safety ceiling and saves no scan result when that ceiling is reached. At 20 records per page this is roughly 2,000 visible records in typical responses, not a guaranteed exact account limit.
 
 ## Status
 
-v0.4.0 — current release. Adds live scan progress, event detail views, per-person relationship timelines, and nickname/UID search. Storage schema, storage keys, and backup format are unchanged from v0.1.0; no migration is involved.
-
+v0.5.0 — release candidate. Adds complete backup restore/import and opt-in page-open automatic updates. Tested Tampermonkey coverage now includes Chrome, Edge, Vivaldi, and Firefox. Friend Radar storage schema and backup format remain unchanged; no migration is involved.
