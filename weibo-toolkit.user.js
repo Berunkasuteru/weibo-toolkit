@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.5.0
+// @version      0.5.1
 // @description  Local Friend Radar with backup restore and opt-in automatic updates.
 // @match        https://weibo.com/*
 // @license      MPL-2.0
@@ -20,17 +20,19 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.5.0";
+  const APP_VERSION = "0.5.1";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const BACKUP_FORMAT = "weibo-toolkit.friend-radar";
   const BACKUP_VERSION = 1;
+  const BACKUP_MIME = "application/json;charset=utf-8";
   const AUTO_INTERVAL_PREFIX = "weiboToolkit.friendRadar.autoInterval.v1.";
   const AUTO_ATTEMPT_PREFIX = "weiboToolkit.friendRadar.autoAttempt.v1.";
   const AUTO_STARTUP_DELAY_MS = 5000;
   const AUTO_ATTEMPT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
   const AUTO_STATUS_DURATION_MS = 5000;
   const AUTO_INTERVAL_HOURS = Object.freeze([0, 24, 48, 72, 168, 360]);
+  const LAUNCHER_LABEL = "Weibo Toolkit";
 
   const EVENT = Object.freeze({
     VISIBLE_FOLLOWING_ADDED: "VISIBLE_FOLLOWING_ADDED",
@@ -66,6 +68,7 @@
     STORAGE_ERROR: "本地状态无法读取",
     BACKUP_EXPORT_ERROR: "备份导出失败",
     BACKUP_RESTORE_ERROR: "备份恢复失败",
+    EVENT_EXPORT_ERROR: "事件导出失败",
     UPDATE_ALREADY_RUNNING: "更新正在进行",
     UNKNOWN_FAILURE: "未知失败",
   });
@@ -76,6 +79,8 @@
   let updateRunning = false;
   let panelRoot = null;
   let launcherButton = null;
+  let launcherLabel = null;
+  let launcherBadge = null;
   let launcherStatusTimer = null;
 
   function normalizeStableUid(value) {
@@ -746,6 +751,54 @@
     };
   }
 
+  // Unread is derived from events[].read on demand. No unread counter is persisted,
+  // and nothing here may change read state.
+  function countUnreadEvents(events) {
+    return events.filter((event) => !event.read).length;
+  }
+
+  function formatUnreadBadge(unreadEventCount) {
+    if (!Number.isSafeInteger(unreadEventCount) || unreadEventCount <= 0) {
+      return null;
+    }
+    return unreadEventCount > 99 ? "99+" : String(unreadEventCount);
+  }
+
+  // Read-only derivation over the already validated snapshot and stored events.
+  // Current counts describe the latest snapshot; historical counts are event
+  // occurrences, so one UID can contribute several times to the same type.
+  function deriveRelationshipOverview(state) {
+    const historicalEventCounts = {};
+    for (const type of Object.values(EVENT)) historicalEventCounts[type] = 0;
+    for (const event of state.events) {
+      if (hasOwn(historicalEventCounts, event.type)) {
+        historicalEventCounts[event.type] += 1;
+      }
+    }
+
+    const snapshot = state.latestSnapshot;
+    let current = null;
+    if (snapshot !== null) {
+      // Every snapshot record is an account the user follows, so "one-way" is
+      // exactly the visible records not observed as following back.
+      const mutual = snapshot.records.filter((record) => record.followsMe).length;
+      current = {
+        capturedAt: snapshot.capturedAt,
+        visibleFollowing: snapshot.visibleCount,
+        mutual,
+        oneWay: snapshot.visibleCount - mutual,
+      };
+    }
+
+    return {
+      hasBaseline: snapshot !== null,
+      current,
+      totalEvents: state.events.length,
+      unreadEvents: countUnreadEvents(state.events),
+      historicalEventCounts,
+    };
+  }
+
   function checkScanFreshness(state, snapshot) {
     if (state.latestSnapshot === null) return { ok: true };
     const storedTime = Date.parse(state.latestSnapshot.capturedAt);
@@ -903,6 +956,18 @@
       }
       return;
     }
+    if (result.failureKind === "EVENT_EXPORT_ERROR") {
+      body.append(
+        createElement(
+          "p",
+          "导出未能完成。关系雷达本地数据未被修改。",
+          "wfr-muted"
+        )
+      );
+      addLine(body, "失败阶段", result.exportStage);
+      addLine(body, "错误类型", result.errorName);
+      return;
+    }
     if (result.failureKind === "CONCURRENT_MODIFICATION") return;
     if (
       result.failureKind === "PAGINATION_FAILURE" &&
@@ -1033,6 +1098,7 @@
     } finally {
       updateRunning = false;
     }
+    refreshUnreadBadge();
     if (result.ok) showUpdateSuccess(result);
     else showFailure("关系雷达更新失败", result);
   }
@@ -1133,7 +1199,9 @@
   function renderEvents(ownerUid, state, notice) {
     const body = showPanel("关系事件", true);
     if (notice) body.append(createElement("p", notice, "wfr-success"));
-    const unread = state.events.filter((event) => !event.read).length;
+    // Opening the list only reflects read state; it never changes it.
+    const unread = countUnreadEvents(state.events);
+    showUnreadBadge(unread);
     addLine(body, "事件总数", state.events.length);
     addLine(body, "未读", unread);
 
@@ -1169,6 +1237,25 @@
       body.append(createElement("p", "暂无事件", "wfr-muted"));
       return;
     }
+
+    const exportActions = createElement("div", null, "wfr-actions");
+    for (const [format, text] of [
+      ["csv", "导出 CSV"],
+      ["markdown", "导出 Markdown"],
+    ]) {
+      const button = createElement("button", text, "wfr-button");
+      button.type = "button";
+      button.addEventListener("click", () => exportEvents(ownerUid, state, format));
+      exportActions.append(button);
+    }
+    body.append(exportActions);
+    body.append(
+      createElement(
+        "p",
+        "CSV / Markdown 为已观察事件的导出，恢复数据请使用 JSON 备份。",
+        "wfr-muted"
+      )
+    );
 
     const search = createElement("input", null, "wfr-search");
     search.type = "search";
@@ -1324,7 +1411,8 @@
 
     const body = showPanel("关系雷达状态", true);
     const snapshot = loaded.state.latestSnapshot;
-    const unread = loaded.state.events.filter((event) => !event.read).length;
+    const unread = countUnreadEvents(loaded.state.events);
+    showUnreadBadge(unread);
     addLine(body, "已有基线", snapshot ? "是" : "否");
     if (snapshot) {
       addLine(body, "上次成功更新", formatTime(snapshot.capturedAt));
@@ -1340,13 +1428,24 @@
     addLine(body, "未读事件", unread);
   }
 
-  function backupFilename(ownerUid, exportedAt) {
-    const timestamp = exportedAt
+  function exportTimestamp(exportedAt) {
+    return exportedAt
       .toISOString()
       .replace(/[-:]/g, "")
       .replace("T", "-")
       .replace(/\.\d{3}Z$/, "");
-    return `weibo-toolkit-friend-radar-${ownerUid}-${timestamp}.json`;
+  }
+
+  function backupFilename(ownerUid, exportedAt) {
+    return `weibo-toolkit-friend-radar-${ownerUid}-${exportTimestamp(
+      exportedAt
+    )}.json`;
+  }
+
+  function eventExportFilename(ownerUid, exportedAt, extension) {
+    return `weibo-toolkit-friend-radar-events-${ownerUid}-${exportTimestamp(
+      exportedAt
+    )}.${extension}`;
   }
 
   function createBackup(ownerUid, state, exportedAt) {
@@ -1366,6 +1465,112 @@
   function serializeBackup(backup) {
     return `${JSON.stringify(backup, null, 2)}\n`;
   }
+
+  // CSV and Markdown are human/analysis exports of observed event history.
+  // The JSON backup above remains the only recovery format.
+  const UTF8_BOM = String.fromCharCode(0xfeff);
+  const EVENT_EXPORT_COLUMNS = Object.freeze([
+    "检测时间",
+    "事件类型",
+    "事件说明",
+    "UID",
+    "记录昵称",
+    "变化前",
+    "变化后",
+    "状态",
+  ]);
+
+  const EXPORT_SCOPE_NOTES = Object.freeze([
+    "本文件仅包含 Weibo Toolkit 实际观察并保存的关系事件，不是微博上的完整真实关系历史。",
+    "关系雷达只读取接口可见的关注列表，不会抓取完整粉丝列表，因此“开始关注你 / 停止关注你”只覆盖它能观察到的账号。",
+    "“从你的可见关注列表消失”只表示该账号不再出现在可见关注列表中，本工具无法判断原因。",
+  ]);
+
+  function eventExportRow(event) {
+    const transition = eventTransition(event);
+    return [
+      event.detectedAt,
+      event.type,
+      EVENT_LABELS[event.type] || event.type,
+      event.subjectUid,
+      event.displayName,
+      transition ? transition.previous : "",
+      transition ? transition.current : "",
+      event.read ? "已读" : "未读",
+    ];
+  }
+
+  // A stored nickname beginning with =, +, - or @ would be evaluated as a formula
+  // by Excel/WPS, so exported cells starting that way are kept as literal text.
+  function neutralizeSpreadsheetFormula(text) {
+    return /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+  }
+
+  function csvField(value) {
+    return `"${neutralizeSpreadsheetFormula(String(value)).replace(/"/g, '""')}"`;
+  }
+
+  function buildEventCsv(events) {
+    const rows = [
+      EVENT_EXPORT_COLUMNS,
+      ...sortEventsNewestFirst(events).map(eventExportRow),
+    ];
+    // The BOM stops Excel/WPS from guessing a legacy codepage; CRLF follows RFC 4180.
+    const body = rows.map((row) => row.map(csvField).join(",")).join("\r\n");
+    return `${UTF8_BOM}${body}\r\n`;
+  }
+
+  function markdownCell(value) {
+    return String(value)
+      .replace(/\\/g, "\\\\")
+      .replace(/\|/g, "\\|")
+      .replace(/\r?\n/g, " ");
+  }
+
+  function buildEventMarkdown(ownerUid, events, exportedAt) {
+    const ordered = sortEventsNewestFirst(events);
+    const lines = [
+      "# Weibo Toolkit 关系事件导出",
+      "",
+      `- 账号 UID：${ownerUid}`,
+      `- 导出时间：${exportedAt.toISOString()}`,
+      `- 已存事件数：${ordered.length}`,
+      `- Weibo Toolkit 版本：${APP_VERSION}`,
+      "",
+      EXPORT_SCOPE_NOTES.map((note) => `> ${note}`).join("\n>\n"),
+      "",
+      "## 已观察事件（按检测时间从新到旧）",
+      "",
+    ];
+    if (ordered.length === 0) {
+      lines.push("暂无已存事件。", "");
+      return lines.join("\n");
+    }
+    lines.push(
+      `| ${EVENT_EXPORT_COLUMNS.join(" | ")} |`,
+      `| ${EVENT_EXPORT_COLUMNS.map(() => "---").join(" | ")} |`
+    );
+    for (const event of ordered) {
+      lines.push(`| ${eventExportRow(event).map(markdownCell).join(" | ")} |`);
+    }
+    lines.push("");
+    return lines.join("\n");
+  }
+
+  const EVENT_EXPORT_FORMATS = Object.freeze({
+    csv: {
+      label: "CSV",
+      extension: "csv",
+      mimeType: "text/csv;charset=utf-8",
+      build: (ownerUid, events) => buildEventCsv(events),
+    },
+    markdown: {
+      label: "Markdown",
+      extension: "md",
+      mimeType: "text/markdown;charset=utf-8",
+      build: buildEventMarkdown,
+    },
+  });
 
   function loadAutoInterval(ownerUid) {
     try {
@@ -1675,6 +1880,7 @@
         showFailure("恢复备份失败", restored);
         return;
       }
+      showUnreadBadgeForState(restored.state);
       const success = showPanel("备份已恢复", true);
       success.append(createElement("p", "备份已恢复。", "wfr-success"));
       addLine(success, "事件数", restored.state.events.length);
@@ -1745,10 +1951,12 @@
     return tagged;
   }
 
-  function downloadBackup(json, filename) {
+  // Browser-managed Blob download, shared by the backup and event exports.
+  // Failures reuse the export stage names so the failure UI stays consistent.
+  function downloadFile(content, filename, mimeType) {
     let blob;
     try {
-      blob = new Blob([json], { type: "application/json;charset=utf-8" });
+      blob = new Blob([content], { type: mimeType });
     } catch (error) {
       throw backupExportError("FALLBACK_CREATE_BLOB", error);
     }
@@ -1803,7 +2011,7 @@
         if (errorName !== "NotAllowedError" && errorName !== "SecurityError") {
           throw backupExportError("PICKER_OPEN", error);
         }
-        downloadBackup(json, filename);
+        downloadFile(json, filename, BACKUP_MIME);
         return { method: "browser-download", filename };
       }
 
@@ -1832,7 +2040,7 @@
       };
     }
 
-    downloadBackup(json, filename);
+    downloadFile(json, filename, BACKUP_MIME);
     return { method: "browser-download", filename };
   }
 
@@ -1894,21 +2102,175 @@
     addLine(body, nativeSave ? "文件名" : "建议文件名", saveResult.filename);
   }
 
+  // Read-only: builds a document from the already loaded state and hands it to the
+  // browser download path. Friend Radar storage is never touched.
+  function exportEvents(ownerUid, state, format) {
+    const spec = EVENT_EXPORT_FORMATS[format];
+    const exportedAt = new Date();
+    const filename = eventExportFilename(ownerUid, exportedAt, spec.extension);
+    const backToEvents = () => renderEvents(ownerUid, state, null);
+    try {
+      downloadFile(
+        spec.build(ownerUid, state.events, exportedAt),
+        filename,
+        spec.mimeType
+      );
+    } catch (error) {
+      showFailure(
+        "导出事件",
+        {
+          failureKind: "EVENT_EXPORT_ERROR",
+          exportStage: error && error.backupStage ? String(error.backupStage) : "PREPARE_EXPORT",
+          errorName: error && error.name ? String(error.name) : "Error",
+        },
+        backToEvents
+      );
+      return;
+    }
+
+    const body = showPanel("已请求浏览器下载事件", backToEvents);
+    body.append(
+      createElement(
+        "p",
+        "事件文件已交给浏览器下载，保存位置及最终文件名由浏览器下载设置决定。",
+        "wfr-success"
+      )
+    );
+    addLine(body, "格式", spec.label);
+    addLine(body, "建议文件名", filename);
+    addLine(body, "已导出事件数", state.events.length);
+    body.append(
+      createElement(
+        "p",
+        "导出内容仅为 Weibo Toolkit 已观察并保存的事件，本地数据未被修改。",
+        "wfr-muted"
+      )
+    );
+  }
+
+  function showRelationshipOverview() {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showFailure("关系概览", uidResult);
+      return;
+    }
+    const loaded = loadState(uidResult.uid);
+    if (!loaded.ok) {
+      showFailure("关系概览", loaded);
+      return;
+    }
+    showUnreadBadgeForState(loaded.state);
+
+    const overview = deriveRelationshipOverview(loaded.state);
+    const body = showPanel("关系概览", true);
+
+    body.append(createElement("h3", "当前状态"));
+    if (overview.current === null) {
+      body.append(
+        createElement(
+          "p",
+          "尚未成功建立基线，暂无当前关系状态可显示。请先完成一次关系雷达更新。",
+          "wfr-muted"
+        )
+      );
+    } else {
+      addLine(body, "快照时间", formatTime(overview.current.capturedAt));
+      addLine(body, "可见关注", overview.current.visibleFollowing);
+      addLine(body, "互相关注", overview.current.mutual);
+      addLine(body, "单向关注", overview.current.oneWay);
+      body.append(
+        createElement(
+          "p",
+          "“单向关注”指你关注了对方，但在最近一次快照中未观察到对方关注你。",
+          "wfr-muted"
+        )
+      );
+      body.append(
+        createElement(
+          "p",
+          "以上数字只覆盖接口可见的关注列表，不代表微博上的完整关注或粉丝情况。",
+          "wfr-muted"
+        )
+      );
+    }
+
+    body.append(createElement("h3", "历史事件次数"));
+    addLine(body, "事件总数", overview.totalEvents);
+    addLine(body, "未读事件", overview.unreadEvents);
+    for (const type of Object.values(EVENT)) {
+      addLine(body, EVENT_LABELS[type], overview.historicalEventCounts[type]);
+    }
+    body.append(
+      createElement(
+        "p",
+        "历史数字统计的是事件发生次数，不是人数：同一个账号反复变化会被多次计入。",
+        "wfr-muted"
+      )
+    );
+    body.append(
+      createElement(
+        "p",
+        "以上仅为 Weibo Toolkit 实际观察并保存的事件，不是微博上的完整真实关系历史。",
+        "wfr-muted"
+      )
+    );
+  }
+
+  // The button carries an explicit accessible name, so it has to be recomposed
+  // whenever either the label or the badge changes.
+  function syncLauncherAccessibleName() {
+    if (!launcherButton || !launcherLabel || !launcherBadge) return;
+    const unread = launcherBadge.hidden
+      ? ""
+      : `，${launcherBadge.textContent} 条未读事件`;
+    launcherButton.setAttribute(
+      "aria-label",
+      `${launcherLabel.textContent}${unread}`
+    );
+  }
+
+  function setLauncherLabel(text) {
+    if (!launcherLabel) return;
+    launcherLabel.textContent = text;
+    syncLauncherAccessibleName();
+  }
+
   function setLauncherStatus(text, resetAfterMilliseconds) {
     if (!launcherButton) return;
     if (launcherStatusTimer !== null) {
       clearTimeout(launcherStatusTimer);
       launcherStatusTimer = null;
     }
-    launcherButton.textContent = text;
-    launcherButton.setAttribute("aria-label", text);
+    setLauncherLabel(text);
     if (typeof resetAfterMilliseconds === "number") {
       launcherStatusTimer = setTimeout(() => {
-        launcherButton.textContent = "Weibo Toolkit";
-        launcherButton.setAttribute("aria-label", "Weibo Toolkit");
+        setLauncherLabel(LAUNCHER_LABEL);
         launcherStatusTimer = null;
       }, resetAfterMilliseconds);
     }
+  }
+
+  // Purely visual: the badge reads stored state and never writes it or fetches.
+  function showUnreadBadge(unreadEventCount) {
+    if (!launcherBadge) return;
+    const badgeText = formatUnreadBadge(unreadEventCount);
+    launcherBadge.textContent = badgeText === null ? "" : badgeText;
+    launcherBadge.hidden = badgeText === null;
+    syncLauncherAccessibleName();
+  }
+
+  function showUnreadBadgeForState(state) {
+    showUnreadBadge(countUnreadEvents(state.events));
+  }
+
+  function refreshUnreadBadge() {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showUnreadBadge(0);
+      return;
+    }
+    const loaded = loadState(uidResult.uid);
+    showUnreadBadge(loaded.ok ? countUnreadEvents(loaded.state.events) : 0);
   }
 
   function pageLockManager() {
@@ -1992,6 +2354,7 @@
             result.ok ? "关系雷达自动更新完成" : "关系雷达自动更新失败",
             AUTO_STATUS_DURATION_MS
           );
+          refreshUnreadBadge();
           return result;
         }
       );
@@ -2112,7 +2475,8 @@
 
     const body = showPanel("Weibo Toolkit");
     const snapshot = loaded.state.latestSnapshot;
-    const unread = loaded.state.events.filter((event) => !event.read).length;
+    const unread = countUnreadEvents(loaded.state.events);
+    showUnreadBadge(unread);
     const moduleTitle = createElement("p", null, "wfr-row");
     moduleTitle.append(createElement("strong", "关系雷达"));
     body.append(moduleTitle);
@@ -2127,6 +2491,7 @@
     const actions = createElement("div", null, "wfr-actions");
     const updateButton = createElement("button", "立即更新", "wfr-button wfr-primary");
     const eventsButton = createElement("button", "查看事件", "wfr-button");
+    const overviewButton = createElement("button", "关系概览", "wfr-button");
     const statusButton = createElement("button", "查看状态", "wfr-button");
     const exportButton = createElement("button", "导出备份", "wfr-button");
     const restoreButton = createElement("button", "恢复备份", "wfr-button");
@@ -2138,6 +2503,7 @@
     for (const button of [
       updateButton,
       eventsButton,
+      overviewButton,
       statusButton,
       exportButton,
       restoreButton,
@@ -2147,6 +2513,7 @@
     }
     updateButton.addEventListener("click", () => void updateNow());
     eventsButton.addEventListener("click", viewEvents);
+    overviewButton.addEventListener("click", showRelationshipOverview);
     statusButton.addEventListener("click", viewStatus);
     exportButton.addEventListener("click", exportBackup);
     restoreButton.addEventListener("click", () => void restoreBackup());
@@ -2154,6 +2521,7 @@
     actions.append(
       updateButton,
       eventsButton,
+      overviewButton,
       statusButton,
       exportButton,
       restoreButton,
@@ -2164,12 +2532,17 @@
 
   function installToolkitLauncher() {
     if (!document.body) return;
-    const button = createElement("button", "Weibo Toolkit", "wfr-button wfr-toolkit-launcher");
+    const button = createElement("button", null, "wfr-button wfr-toolkit-launcher");
     button.type = "button";
-    button.setAttribute("aria-label", "Weibo Toolkit");
+    button.setAttribute("aria-label", LAUNCHER_LABEL);
+    launcherLabel = createElement("span", LAUNCHER_LABEL, "wfr-launcher-label");
+    launcherBadge = createElement("span", "", "wfr-launcher-badge");
+    launcherBadge.hidden = true;
+    button.append(launcherLabel, launcherBadge);
     button.addEventListener("click", showToolkitHome);
     document.body.append(button);
     launcherButton = button;
+    refreshUnreadBadge();
   }
 
   function installStyles() {
@@ -2194,18 +2567,37 @@
       .wfr-event h3 { margin: 0 0 6px; font-size: 14px; }
       .wfr-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
       .wfr-actions .wfr-primary { margin: 0; }
-      .wfr-toolkit-launcher { position: fixed; right: 18px; bottom: 18px; z-index: 2147483000; padding: 4px 9px; border: 1px solid rgba(127,127,127,.18); border-radius: 999px; background: rgba(127,127,127,.1); color: inherit; box-shadow: none; font: inherit; font-size: 12px; line-height: 1.4; opacity: .62; transition: opacity 100ms ease, background-color 100ms ease, border-color 100ms ease; }
-      .wfr-toolkit-launcher:hover, .wfr-toolkit-launcher:focus-visible { border-color: rgba(127,127,127,.3); background: rgba(127,127,127,.18); opacity: .96; }
+      .wfr-body h3 { margin: 18px 0 6px; font-size: 15px; }
+      .wfr-body h3:first-child { margin-top: 0; }
+      .wfr-toolkit-launcher { position: fixed; right: 18px; bottom: 18px; z-index: 2147483000; display: inline-flex; align-items: center; gap: 7px; padding: 8px 14px; border: 1px solid rgba(127,127,127,.22); border-radius: 999px; background: rgba(127,127,127,.12); color: inherit; box-shadow: none; font: inherit; font-size: 13px; line-height: 1.35; opacity: .72; transition: opacity 100ms ease, background-color 100ms ease, border-color 100ms ease; }
+      .wfr-toolkit-launcher:hover, .wfr-toolkit-launcher:focus-visible { border-color: rgba(127,127,127,.34); background: rgba(127,127,127,.2); opacity: .98; }
+      .wfr-launcher-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 19px; height: 19px; padding: 0 6px; box-sizing: border-box; border-radius: 999px; background: #d4380d; color: #fff; font-size: 11px; font-weight: 700; line-height: 1; }
+      .wfr-launcher-badge[hidden] { display: none; }
+      @media (prefers-color-scheme: dark) {
+        .wfr-overlay { background: rgba(0,0,0,.6); }
+        .wfr-panel { background: #1f2126; color: #e8e8ea; box-shadow: 0 12px 36px rgba(0,0,0,.55); }
+        .wfr-header { border-bottom-color: #3a3d44; }
+        .wfr-button { border-color: #4a4e56; background: #2a2d33; color: #e8e8ea; }
+        .wfr-primary { background: #2d7ff9; border-color: #2d7ff9; color: #fff; }
+        .wfr-success { color: #6bd18c; }
+        .wfr-error { color: #ff8f8f; }
+        .wfr-muted { color: #a6aab3; }
+        .wfr-search, .wfr-select { border-color: #4a4e56; background: #2a2d33; color: #e8e8ea; }
+        .wfr-event { border-color: #3a3d44; background: #24272d; }
+        /* The launcher sits on host pixels, so only its own translucent surfaces are
+           adjusted and its text keeps inheriting the host's readable color. */
+        .wfr-toolkit-launcher { border-color: rgba(160,160,160,.3); background: rgba(160,160,160,.16); }
+        .wfr-toolkit-launcher:hover, .wfr-toolkit-launcher:focus-visible { border-color: rgba(190,190,190,.45); background: rgba(180,180,180,.26); }
+        .wfr-launcher-badge { background: #ff6b5e; color: #26100c; }
+      }
     `;
     document.head.append(style);
   }
 
   function registerMenuCommands() {
     if (typeof GM_registerMenuCommand !== "function") return;
-    GM_registerMenuCommand("Weibo Toolkit：立即更新", () => void updateNow());
-    GM_registerMenuCommand("Weibo Toolkit：查看事件", viewEvents);
-    GM_registerMenuCommand("Weibo Toolkit：查看状态", viewStatus);
-    GM_registerMenuCommand("Weibo Toolkit：导出备份", exportBackup);
+    // Single fallback entry: everything else lives in the Toolkit UI itself.
+    GM_registerMenuCommand("Weibo Toolkit：打开工具箱", showToolkitHome);
   }
 
   installStyles();

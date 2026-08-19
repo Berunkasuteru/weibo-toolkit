@@ -32,6 +32,14 @@ Each stored event opens a detail view showing its type, the stored display name,
 
 A timeline shows only events Weibo Toolkit actually observed and stored. It is not the complete real-world relationship history.
 
+### Relationship overview and event exports
+
+The lower-right launcher shows a small unread-event badge when stored events remain unread. **关系概览** separates the current visible-following state from historical event-occurrence counts, so current account counts are not confused with the number of past changes.
+
+Stored relationship events can be exported as UTF-8 CSV or Markdown for spreadsheet analysis, archival, or AI-assisted analysis. These exports contain only events Weibo Toolkit actually observed and stored; JSON backup remains the recovery format.
+
+Toolkit-owned UI now follows the browser/system `prefers-color-scheme` preference for dark mode.
+
 ## Installation
 
 Install with [Tampermonkey](https://www.tampermonkey.net/) and Greasy Fork:
@@ -42,7 +50,7 @@ Install with [Tampermonkey](https://www.tampermonkey.net/) and Greasy Fork:
 4. Reload the page.
 5. Use the lower-right **Weibo Toolkit** launcher.
 
-Four concise **Weibo Toolkit** userscript menu commands remain available as fallback controls for update, events, status, and backup export.
+A single **Weibo Toolkit：打开工具箱** userscript menu command remains available as a fallback entry; individual functions are accessed from the Toolkit UI.
 
 Tested with Tampermonkey on Chrome, Edge, Vivaldi, and Firefox. Violentmonkey is expected to be compatible but is not part of the current real-browser validation set.
 
@@ -97,4 +105,4 @@ Automatic update is optional and defaults to **关闭**. Available intervals are
 
 ## Status
 
-v0.5.0 — release candidate. Adds complete backup restore/import and opt-in page-open automatic updates. Tested Tampermonkey coverage now includes Chrome, Edge, Vivaldi, and Firefox. Friend Radar storage schema and backup format remain unchanged; no migration is involved.
+v0.5.1 — current release. Adds an unread-event badge, relationship overview, CSV/Markdown event export, a larger launcher, a simplified single userscript-menu entry, and automatic dark-mode styling for Toolkit-owned UI. Friend Radar storage schema and backup format remain unchanged; no migration is involved.
