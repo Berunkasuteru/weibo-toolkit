@@ -119,4 +119,4 @@ Automatic update is optional and defaults to **关闭**. Available intervals are
 
 ## Status
 
-v0.6.0 — release candidate. Adds current-conversation private-message Markdown export with an AI-friendly compact A/B format, sequential long-history reading, progress, cancellation, and fail-closed pagination validation. Friend Radar storage schema and backup format remain unchanged; no migration is involved.
+v0.6.0 — current release. Adds current-conversation private-message Markdown export with an AI-friendly compact A/B format, sequential long-history reading, progress, cancellation, and fail-closed pagination validation. Friend Radar storage schema and backup format remain unchanged; no migration is involved.
