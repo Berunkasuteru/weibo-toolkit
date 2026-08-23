@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.5.2
-// @description  Local Friend Radar with backup restore and opt-in automatic updates.
+// @version      0.6.0
+// @description  Local Friend Radar and current-conversation PM Markdown export.
 // @match        https://weibo.com/*
+// @match        https://api.weibo.com/chat*
 // @license      MPL-2.0
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -16,11 +17,810 @@
 (function () {
   "use strict";
 
+  if (isPrivateMessageSurface()) {
+    installPrivateMessageExportModule();
+    return;
+  }
+
+  function isPrivateMessageSurface() {
+    return (
+      typeof location !== "undefined" &&
+      location.origin === "https://api.weibo.com" &&
+      typeof location.pathname === "string" &&
+      location.pathname.startsWith("/chat")
+    );
+  }
+
+  function normalizePrivateMessageId(value) {
+    if (typeof value === "number") {
+      return Number.isSafeInteger(value) && value > 0 ? String(value) : null;
+    }
+    if (typeof value === "string") {
+      const candidate = value.trim();
+      return /^[1-9]\d*$/.test(candidate) ? candidate : null;
+    }
+    return null;
+  }
+
+  function comparePrivateMessageIds(left, right) {
+    return left.length === right.length
+      ? left.localeCompare(right)
+      : left.length - right.length;
+  }
+
+  function decrementPrivateMessageId(value) {
+    try {
+      const result = BigInt(value) - 1n;
+      return result > 0n ? result.toString() : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function registerPrivateMessageCursor(seenCursors, cursor) {
+    if (seenCursors.has(cursor)) throw new Error("REPEATED_CURSOR");
+    seenCursors.add(cursor);
+  }
+
+  function privateMessageParticipantChanged(expectedUid, currentUid) {
+    const expected = normalizePrivateMessageId(expectedUid);
+    const current = normalizePrivateMessageId(currentUid);
+    return !expected || !current || expected !== current;
+  }
+
+  function privateMessageLongRunBoundary(
+    successfulPages,
+    restInterval = 100,
+    emergencyFuse = 5000
+  ) {
+    if (
+      !Number.isSafeInteger(successfulPages) ||
+      successfulPages <= 0
+    ) {
+      return null;
+    }
+    if (successfulPages >= emergencyFuse) return "SAFETY_FUSE";
+    if (successfulPages % restInterval === 0) return "AUTO_REST";
+    return null;
+  }
+
+  function privateMessageSafetyFuseTermination(kind, action) {
+    if (action === "cancel") return "CANCELLED";
+    if (action === "export" && kind === "SAFETY_FUSE") return "SAFETY_FUSE";
+    return "INVALID";
+  }
+
+  function classifyPrivateMessageSender(senderId, ownerUid, participantUid) {
+    const sender = normalizePrivateMessageId(senderId);
+    if (!sender) return null;
+    if (sender === ownerUid) return "A";
+    if (sender === participantUid) return "B";
+    return null;
+  }
+
+  function normalizePrivateMessageText(value) {
+    if (typeof value !== "string" || value.length === 0) return "";
+    const template = document.createElement("template");
+    template.innerHTML = value.replace(/<br\s*\/?>/gi, "\n");
+    return (template.content.textContent || "").replace(/\r\n?/g, "\n");
+  }
+
+  function escapePrivateMessageLineField(value) {
+    let escaped = "";
+    for (const character of String(value).replace(/\r\n?/g, "\n")) {
+      const code = character.codePointAt(0);
+      if (character === "\\") escaped += "\\\\";
+      else if (character === "\t") escaped += "\\t";
+      else if (character === "\n") escaped += "\\n";
+      else if (code < 0x20 || code === 0x7f) {
+        escaped += `\\x${code.toString(16).toUpperCase().padStart(2, "0")}`;
+      } else escaped += character;
+    }
+    return escaped;
+  }
+
+  function safePrivateMessageTypeCode(value) {
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
+      return value.trim();
+    }
+    return "未知";
+  }
+
+  function privateMessageCompactMarkers(message) {
+    const markers = [];
+    if (Array.isArray(message.pic_infos) && message.pic_infos.length > 0) {
+      markers.push(`I${message.pic_infos.length}`);
+    }
+    if (Array.isArray(message.url_objects) && message.url_objects.length > 0) {
+      markers.push("L");
+    }
+    if (
+      Array.isArray(message.additional_messages) &&
+      message.additional_messages.length > 0
+    ) {
+      markers.push("X:add");
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(message, "recall_status") &&
+      message.recall_status !== null &&
+      String(message.recall_status) !== "0"
+    ) {
+      markers.push("X:recall");
+    }
+
+    const dmType = safePrivateMessageTypeCode(message.dm_type);
+    const subType = safePrivateMessageTypeCode(message.sub_type);
+    const mediaType = safePrivateMessageTypeCode(message.media_type);
+    if (dmType !== "1") {
+      markers.push(`X:dm=${dmType}`);
+    }
+    if (subType !== "0") {
+      markers.push(`X:sub=${subType}`);
+    }
+    if (!["0", "1"].includes(mediaType)) {
+      markers.push(`X:media=${mediaType}`);
+    } else if (mediaType === "1" && !markers.some((marker) => /^I\d+$/.test(marker))) {
+      markers.push("X:media=1");
+    }
+    return [...new Set(markers)];
+  }
+
+  function parsePrivateMessageTimestamp(value) {
+    if (
+      !(
+        (typeof value === "string" && value.trim()) ||
+        (typeof value === "number" && Number.isFinite(value))
+      )
+    ) {
+      return { source: "时间不可用", compact: false };
+    }
+    const source = String(value).replace(/[\r\n]+/g, " ").trim();
+    const months = {
+      Jan: "01", Feb: "02", Mar: "03", Apr: "04", May: "05", Jun: "06",
+      Jul: "07", Aug: "08", Sep: "09", Oct: "10", Nov: "11", Dec: "12",
+    };
+    const weibo = source.match(
+      /^(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+[+-]\d{4}\s+(\d{4})$/
+    );
+    if (weibo) {
+      return {
+        source,
+        compact: true,
+        date: `${weibo[6]}-${months[weibo[1]]}-${weibo[2].padStart(2, "0")}`,
+        minute: `${weibo[3]}:${weibo[4]}`,
+        second: `${weibo[3]}:${weibo[4]}:${weibo[5]}`,
+      };
+    }
+    const iso = source.match(
+      /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/
+    );
+    if (iso) {
+      return {
+        source,
+        compact: true,
+        date: `${iso[1]}-${iso[2]}-${iso[3]}`,
+        minute: `${iso[4]}:${iso[5]}`,
+        second: `${iso[4]}:${iso[5]}:${iso[6] || "00"}`,
+      };
+    }
+    return { source, compact: false };
+  }
+
+  function normalizePrivateMessageRecord(message, ownerUid, participantUid) {
+    const direction = classifyPrivateMessageSender(
+      message.sender_id,
+      ownerUid,
+      participantUid
+    );
+    if (!direction) throw new Error("UNEXPECTED_SENDER");
+    const body = normalizePrivateMessageText(message.text);
+    const markers = privateMessageCompactMarkers(message);
+    return {
+      speaker: direction,
+      timestamp: parsePrivateMessageTimestamp(message.created_at),
+      body,
+      markers,
+    };
+  }
+
+  function privateMessageFilename(exportedAt) {
+    const timestamp = exportedAt
+      .toISOString()
+      .replace(/[-:]/g, "")
+      .replace("T", "-")
+      .replace(/\.\d{3}Z$/, "");
+    return `微博私信_${timestamp}.md`;
+  }
+
+  function validatePrivateMessagePage(data, expectedCursor, seenIds) {
+    if (!data || typeof data !== "object" || !Array.isArray(data.direct_messages)) {
+      throw new Error("UNEXPECTED_SCHEMA");
+    }
+    const messages = data.direct_messages;
+    if (messages.length === 0) {
+      return { messages, nextCursor: null, naturalEnd: true };
+    }
+    const ids = [];
+    const withinPage = new Set();
+    for (const message of messages) {
+      if (!message || typeof message !== "object" || Array.isArray(message)) {
+        throw new Error("UNEXPECTED_SCHEMA");
+      }
+      const id = normalizePrivateMessageId(message.id);
+      const sender = normalizePrivateMessageId(message.sender_id);
+      if (!id || !sender) throw new Error("UNEXPECTED_SCHEMA");
+      if (
+        Object.prototype.hasOwnProperty.call(message, "mid") &&
+        !normalizePrivateMessageId(message.mid)
+      ) {
+        throw new Error("UNEXPECTED_SCHEMA");
+      }
+      if (withinPage.has(id) || seenIds.has(id)) throw new Error("DUPLICATE_MESSAGE");
+      if (expectedCursor !== "0" && comparePrivateMessageIds(id, expectedCursor) > 0) {
+        throw new Error("PAGINATION_NOT_OLDER");
+      }
+      withinPage.add(id);
+      ids.push(id);
+    }
+    for (let index = 1; index < ids.length; index += 1) {
+      if (comparePrivateMessageIds(ids[index], ids[index - 1]) >= 0) {
+        throw new Error("MESSAGE_ORDER_UNEXPECTED");
+      }
+    }
+    const oldest = ids[ids.length - 1];
+    const nextCursor = decrementPrivateMessageId(oldest);
+    if (!nextCursor) throw new Error("PAGINATION_CURSOR_INVALID");
+    if (
+      expectedCursor !== "0" &&
+      comparePrivateMessageIds(nextCursor, expectedCursor) >= 0
+    ) {
+      throw new Error("PAGINATION_NOT_PROGRESSING");
+    }
+    return { messages, ids, nextCursor, naturalEnd: false };
+  }
+
+  function privateMessageAi3TimeToken(record, useSeconds, context) {
+    if (!record.timestamp.compact) {
+      context.date = null;
+      context.hour = null;
+      context.minute = null;
+      return `@T:${escapePrivateMessageLineField(record.timestamp.source)}`;
+    }
+    const exactTime = useSeconds
+      ? record.timestamp.second
+      : record.timestamp.minute;
+    const [hour, minute, second] = exactTime.split(":");
+    let token;
+    if (context.date !== record.timestamp.date) {
+      token = `@${record.timestamp.date} ${exactTime}`;
+    } else if (context.hour !== hour) {
+      token = `@${exactTime}`;
+    } else if (context.minute !== minute) {
+      token = exactTime.slice(3);
+    } else if (useSeconds) {
+      token = `:${second}`;
+    } else {
+      // A second record in the same minute would have made `useSeconds` true
+      // for both. Keep this branch explicit rather than relying on that global
+      // counting invariant for parseability.
+      token = minute;
+    }
+    context.date = record.timestamp.date;
+    context.hour = hour;
+    context.minute = minute;
+    return token;
+  }
+
+  function renderPrivateMessageAi3Record(record, timeToken) {
+    const speakerAndFlags = [record.speaker, ...record.markers].join("|");
+    return `${timeToken}\t${speakerAndFlags}\t${escapePrivateMessageLineField(record.body)}`;
+  }
+
+  function buildPrivateMessageMarkdown(records, termination) {
+    const compactDates = records
+      .map((record) => record.timestamp)
+      .filter((timestamp) => timestamp.compact)
+      .map((timestamp) => timestamp.date);
+    const allDatesKnown = compactDates.length === records.length;
+    const range =
+      records.length > 0 && allDatesKnown
+        ? `${compactDates[0]}~${compactDates[compactDates.length - 1]}`
+        : "未知";
+    const minuteCounts = new Map();
+    for (const record of records) {
+      if (!record.timestamp.compact) continue;
+      const key = `${record.timestamp.date}|${record.timestamp.minute}`;
+      minuteCounts.set(key, (minuteCounts.get(key) || 0) + 1);
+    }
+    const blocks = [
+      "# 微博私信｜AI分析版",
+      "FORMAT=WEIBO_PM_AI_3",
+      "P=A,B",
+      "IDENTITY_MAPPING=OMITTED",
+      "T=@date/time anchor;MM[:SS]=same hour;:SS=same minute",
+      "C=I<n>:图片数;L:链接/卡片;X:特殊或未支持消息",
+      `N=${records.length}`,
+      `RANGE=${range}`,
+      `END=${termination}`,
+      "SCOPE=仅包含本次导出时微博当前接口可访问并返回的该会话消息；已删除、撤回、不可访问或未被接口返回的内容可能缺失。",
+      "",
+    ];
+    const timeContext = { date: null, hour: null, minute: null };
+    for (const record of records) {
+      const minuteKey = record.timestamp.compact
+        ? `${record.timestamp.date}|${record.timestamp.minute}`
+        : "";
+      const useSeconds =
+        record.timestamp.compact && minuteCounts.get(minuteKey) > 1;
+      blocks.push(
+        renderPrivateMessageAi3Record(
+          record,
+          privateMessageAi3TimeToken(record, useSeconds, timeContext)
+        )
+      );
+    }
+    return `${blocks.join("\n").trimEnd()}\n`;
+  }
+
+  function privateMessageConversationChanged(expectedParticipantUid) {
+    const current = privateMessageConversationContext();
+    return (
+      !current.ok ||
+      privateMessageParticipantChanged(
+        expectedParticipantUid,
+        current.participantUid
+      )
+    );
+  }
+
+  function privateMessageConversationContext() {
+    const selected = document.querySelector(".sessionlist.active");
+    const ownerUid = normalizePrivateMessageId(
+      document.querySelector(".user .left .hidden, .user .hidden")?.textContent || ""
+    );
+    const participantUid = normalizePrivateMessageId(
+      selected?.querySelector(".hidden")?.textContent || ""
+    );
+    const participantName = selected?.querySelector(".username")?.textContent?.trim() || "";
+    const ordinaryAvatar = selected?.querySelector(".avatar.radius-c");
+    const messageSurface = document.querySelector(".right-container .message");
+    const composer = document.querySelector(".right-container textarea");
+    if (
+      !selected ||
+      !ownerUid ||
+      !participantUid ||
+      ownerUid === participantUid ||
+      !participantName ||
+      !ordinaryAvatar ||
+      !messageSurface ||
+      !composer
+    ) {
+      return { ok: false, reason: "UNSUPPORTED_CONVERSATION" };
+    }
+    return {
+      ok: true,
+      ownerUid,
+      participantUid,
+      participantName: participantName.replace(/[\r\n]+/g, " ").trim(),
+      messageSurface,
+    };
+  }
+
+  function installPrivateMessageExportModule() {
+    const ENDPOINT = "/webim/2/direct_messages/conversation.json";
+    const PAGE_SIZE = 100;
+    const REQUEST_DELAY_MS = 750;
+    const AUTO_REST_PAGES = 100;
+    const AUTO_REST_MS = 5000;
+    // Final pathological-loop fuse: 5,000 proven 15-message pages is a
+    // theoretical 75,000 records, not a supported-history guarantee.
+    const MAX_PM_HISTORY_REQUESTS = 5000;
+    const SOURCE = "209678993";
+    const ROOT_ID = "wfr-pm-export-root";
+    let generation = 0;
+    let task = null;
+    let root = null;
+    let scheduled = false;
+    let controlParticipantUid = null;
+
+    function setUi(mode, text) {
+      if (!root) return;
+      const button = root.querySelector("button");
+      const status = root.querySelector("span");
+      const checkpoint = root.querySelector(".wfr-pm-export-checkpoint");
+      if (!button || !status || !checkpoint) return;
+      const disabled = mode === "disabled";
+      const buttonText = mode === "running" ? "取消" : "导出 Markdown";
+      const statusText = text || "";
+      if (button.disabled !== disabled) button.disabled = disabled;
+      if (button.textContent !== buttonText) button.textContent = buttonText;
+      if (button.hidden !== (mode === "checkpoint")) {
+        button.hidden = mode === "checkpoint";
+      }
+      if (checkpoint.hidden !== (mode !== "checkpoint")) {
+        checkpoint.hidden = mode !== "checkpoint";
+      }
+      if (status.textContent !== statusText) status.textContent = statusText;
+      if (root.dataset.mode !== mode) root.dataset.mode = mode;
+    }
+
+    function ensureControl() {
+      scheduled = false;
+      const context = privateMessageConversationContext();
+      const messageSurface = document.querySelector(".right-container .message");
+      if (!messageSurface) {
+        root = null;
+        controlParticipantUid = null;
+        return;
+      }
+      const existing = document.getElementById(ROOT_ID);
+      if (existing && existing.parentNode !== messageSurface) existing.remove();
+      root = document.getElementById(ROOT_ID);
+      if (!root) {
+        root = document.createElement("div");
+        root.id = ROOT_ID;
+        root.className = "wfr-pm-export-root";
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "wfr-pm-export-button";
+        const status = document.createElement("span");
+        status.className = "wfr-pm-export-status";
+        const checkpoint = document.createElement("div");
+        checkpoint.className = "wfr-pm-export-checkpoint";
+        checkpoint.hidden = true;
+        for (const [action, text] of [
+          ["export", "导出当前已读取"],
+          ["cancel", "取消"],
+        ]) {
+          const choice = document.createElement("button");
+          choice.type = "button";
+          choice.className = "wfr-pm-export-choice";
+          choice.dataset.action = action;
+          choice.textContent = text;
+          choice.addEventListener("click", () => handleCheckpointAction(action));
+          checkpoint.append(choice);
+        }
+        button.addEventListener("click", () => {
+          if (task) cancelExport();
+          else void startExport();
+        });
+        root.append(button, status, checkpoint);
+        messageSurface.append(root);
+      }
+      if (task?.cancelled) setUi("disabled", "正在取消…");
+      else if (task?.checkpoint) setUi("checkpoint", task.progress);
+      else if (task) setUi("running", task.progress);
+      else if (context.ok) {
+        const status =
+          controlParticipantUid === context.participantUid
+            ? root.querySelector("span")?.textContent || ""
+            : "";
+        controlParticipantUid = context.participantUid;
+        setUi("idle", status);
+      } else {
+        controlParticipantUid = null;
+        setUi("disabled", "仅支持当前普通单聊");
+      }
+    }
+
+    function scheduleEnsure() {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(ensureControl);
+    }
+
+    function requestUrl(participantUid, cursor) {
+      const url = new URL(ENDPOINT, location.origin);
+      url.searchParams.set("convert_emoji", "1");
+      url.searchParams.set("count", String(PAGE_SIZE));
+      url.searchParams.set("max_id", cursor);
+      url.searchParams.set("uid", participantUid);
+      url.searchParams.set("is_include_group", "0");
+      url.searchParams.set("from_contacts", "1");
+      url.searchParams.set("source", SOURCE);
+      url.searchParams.set("t", String(Date.now()));
+      return url;
+    }
+
+    async function requestPage(session, cursor, controller) {
+      const response = await fetch(requestUrl(session.participantUid, cursor).href, {
+        method: "GET",
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+        redirect: "follow",
+        signal: controller.signal,
+      });
+      const contentType = response.headers.get("content-type") || "";
+      const body = await response.text();
+      if (!response.ok) throw new Error(response.status === 401 ? "LOGIN_REQUIRED" : "HTTP_ERROR");
+      if (!/(?:application|text)\/[^;]*json/i.test(contentType)) {
+        throw new Error("UNEXPECTED_CONTENT_TYPE");
+      }
+      let data;
+      try {
+        data = JSON.parse(body);
+      } catch (_) {
+        throw new Error("NON_JSON_RESPONSE");
+      }
+      if (String(data?.error_code || "") === "21301") {
+        throw new Error("LOGIN_REQUIRED");
+      }
+      return data;
+    }
+
+    function throwIfStale(session, token) {
+      if (!task || task.token !== token || generation !== token) {
+        throw new Error("USER_CANCELLED");
+      }
+      if (privateMessageConversationChanged(session.participantUid)) {
+        throw new Error("CONVERSATION_CHANGED");
+      }
+      const owner = normalizePrivateMessageId(
+        document.querySelector(".user .left .hidden, .user .hidden")?.textContent || ""
+      );
+      if (owner !== session.ownerUid) throw new Error("ACCOUNT_CHANGED");
+    }
+
+    function waitForSafetyFuse() {
+      return new Promise((resolve) => {
+        task.controller = null;
+        task.checkpoint = { kind: "SAFETY_FUSE", resolve };
+        task.progress = `已读取 ${task.recordsRead} 条 · 达到绝对安全上限`;
+        setUi("checkpoint", task.progress);
+      });
+    }
+
+    function waitForAutomaticRest(session, token, delayMs = AUTO_REST_MS) {
+      throwIfStale(session, token);
+      const activeTask = task;
+      activeTask.controller = null;
+      activeTask.resting = true;
+      activeTask.progress = `已读取 ${activeTask.recordsRead} 条 · 长对话短暂休息中…`;
+      setUi("running", activeTask.progress);
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          activeTask.restCancel = null;
+          activeTask.resting = false;
+          try {
+            throwIfStale(session, token);
+            activeTask.progress = `正在读取：${activeTask.recordsRead} 条 · ${activeTask.pagesRead} 页`;
+            setUi("running", activeTask.progress);
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        }, delayMs);
+        activeTask.restCancel = () => {
+          clearTimeout(timeout);
+          activeTask.restCancel = null;
+          activeTask.resting = false;
+          reject(new Error("USER_CANCELLED"));
+        };
+      });
+    }
+
+    function handleCheckpointAction(action) {
+      const checkpoint = task?.checkpoint;
+      if (!checkpoint) return;
+      const outcome = privateMessageSafetyFuseTermination(
+        checkpoint.kind,
+        action
+      );
+      if (outcome === "INVALID") return;
+      task.checkpoint = null;
+      if (outcome === "CANCELLED") {
+        generation += 1;
+        task.cancelled = true;
+        setUi("disabled", "正在取消…");
+      } else {
+        setUi("disabled", "正在生成 Markdown…");
+      }
+      checkpoint.resolve(outcome);
+    }
+
+    async function collectHistory(session, token) {
+      const seenIds = new Set();
+      const seenCursors = new Set(["0"]);
+      const newestToOldest = [];
+      let cursor = "0";
+      for (
+        let requestNumber = 1;
+        requestNumber <= MAX_PM_HISTORY_REQUESTS;
+        requestNumber += 1
+      ) {
+        throwIfStale(session, token);
+        if (requestNumber > 1) {
+          await new Promise((resolve) => setTimeout(resolve, REQUEST_DELAY_MS));
+          throwIfStale(session, token);
+        }
+        const controller = new AbortController();
+        task.controller = controller;
+        const data = await requestPage(session, cursor, controller);
+        throwIfStale(session, token);
+        const page = validatePrivateMessagePage(data, cursor, seenIds);
+        if (page.naturalEnd) {
+          return {
+            records: newestToOldest.reverse(),
+            termination: "NATURAL_END",
+          };
+        }
+        for (let index = 0; index < page.messages.length; index += 1) {
+          const message = page.messages[index];
+          const id = page.ids[index];
+          const record = normalizePrivateMessageRecord(
+            message,
+            session.ownerUid,
+            session.participantUid
+          );
+          seenIds.add(id);
+          newestToOldest.push(record);
+        }
+        registerPrivateMessageCursor(seenCursors, page.nextCursor);
+        cursor = page.nextCursor;
+        task.pagesRead = requestNumber;
+        task.recordsRead = newestToOldest.length;
+        task.progress = `正在读取：${newestToOldest.length} 条 · ${requestNumber} 页`;
+        setUi("running", task.progress);
+        const boundary = privateMessageLongRunBoundary(
+          requestNumber,
+          AUTO_REST_PAGES,
+          MAX_PM_HISTORY_REQUESTS
+        );
+        if (boundary === "AUTO_REST") {
+          await waitForAutomaticRest(session, token);
+          throwIfStale(session, token);
+        } else if (boundary === "SAFETY_FUSE") {
+          const outcome = await waitForSafetyFuse();
+          if (outcome === "CANCELLED") throw new Error("USER_CANCELLED");
+          if (outcome === "SAFETY_FUSE") {
+            return {
+              records: newestToOldest.reverse(),
+              termination: outcome,
+            };
+          }
+        }
+      }
+      throw new Error("REQUEST_CEILING");
+    }
+
+    function downloadMarkdown(markdown, filename) {
+      const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = filename;
+      link.hidden = true;
+      document.body.append(link);
+      try {
+        link.click();
+      } finally {
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      }
+    }
+
+    function failureText(code) {
+      const messages = {
+        LOGIN_REQUIRED: "登录状态异常",
+        HTTP_ERROR: "读取失败，未生成文件",
+        UNEXPECTED_CONTENT_TYPE: "返回类型发生变化",
+        NON_JSON_RESPONSE: "返回内容不是有效 JSON",
+        UNEXPECTED_SCHEMA: "返回结构发生变化",
+        DUPLICATE_MESSAGE: "检测到重复消息，已停止",
+        MESSAGE_ORDER_UNEXPECTED: "消息顺序无法可靠确认",
+        PAGINATION_CURSOR_INVALID: "分页游标无效",
+        PAGINATION_NOT_PROGRESSING: "分页未继续向更早历史移动",
+        PAGINATION_NOT_OLDER: "分页返回了超出历史边界的消息",
+        REPEATED_CURSOR: "检测到重复分页状态",
+        UNEXPECTED_SENDER: "消息发送者不属于当前单聊双方",
+        CONVERSATION_CHANGED: "当前会话已切换，导出已停止",
+        ACCOUNT_CHANGED: "登录账号发生变化，导出已停止",
+        REQUEST_CEILING: "达到安全请求上限，未生成文件",
+        USER_CANCELLED: "已取消",
+        AbortError: "已取消",
+      };
+      return messages[code] || "导出失败，未生成文件";
+    }
+
+    async function startExport() {
+      const context = privateMessageConversationContext();
+      if (!context.ok) {
+        setUi("disabled", "仅支持当前普通单聊");
+        return;
+      }
+      const token = ++generation;
+      const session = {
+        ownerUid: context.ownerUid,
+        participantUid: context.participantUid,
+        participantName: context.participantName,
+        startedAt: new Date(),
+      };
+      task = {
+        token,
+        controller: null,
+        checkpoint: null,
+        resting: false,
+        restCancel: null,
+        pagesRead: 0,
+        recordsRead: 0,
+        progress: "正在读取：0 条 · 0 页",
+      };
+      setUi("running", task.progress);
+      try {
+        const result = await collectHistory(session, token);
+        throwIfStale(session, token);
+        const markdown = buildPrivateMessageMarkdown(
+          result.records,
+          result.termination
+        );
+        downloadMarkdown(
+          markdown,
+          privateMessageFilename(session.startedAt)
+        );
+        const characterCount = [...markdown].length;
+        const bytes = new Blob([markdown]).size;
+        const size =
+          bytes >= 1024 * 1024
+            ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+            : `${Math.ceil(bytes / 1024)} KB`;
+        setUi(
+          "idle",
+          `${result.termination === "NATURAL_END" ? "已导出" : "已导出当前已读取"} ${result.records.length.toLocaleString()} 条 · ${characterCount.toLocaleString()} 字符 · ${size}`
+        );
+      } catch (error) {
+        const code =
+          error?.name === "AbortError"
+            ? "AbortError"
+            : error?.message || error?.name;
+        if (task?.token === token) {
+          const visible = privateMessageConversationContext();
+          if (visible.ok) controlParticipantUid = visible.participantUid;
+          setUi("idle", failureText(code));
+        }
+      } finally {
+        if (task?.token === token) task = null;
+        scheduleEnsure();
+      }
+    }
+
+    function cancelExport() {
+      if (!task) return;
+      if (task.checkpoint) {
+        handleCheckpointAction("cancel");
+        return;
+      }
+      generation += 1;
+      task.cancelled = true;
+      task.restCancel?.();
+      task.controller?.abort();
+      setUi("disabled", "正在取消…");
+    }
+
+    const style = document.createElement("style");
+    style.id = "wfr-pm-export-style";
+    style.textContent = `
+      .wfr-pm-export-root { position: absolute; top: 10px; right: 58px; z-index: 20; display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; max-width: 520px; font: 12px/1.3 system-ui, sans-serif; }
+      .wfr-pm-export-button { padding: 5px 9px; border: 1px solid #d9d9d9; border-radius: 5px; background: #fff; color: #333; cursor: pointer; }
+      .wfr-pm-export-button:hover:not(:disabled) { border-color: #ff8200; color: #ff8200; }
+      .wfr-pm-export-button:disabled { opacity: .55; cursor: default; }
+      .wfr-pm-export-status { max-width: 260px; color: #777; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .wfr-pm-export-checkpoint { display: inline-flex; align-items: center; gap: 5px; }
+      .wfr-pm-export-checkpoint[hidden] { display: none; }
+      .wfr-pm-export-choice { padding: 4px 7px; border: 1px solid #d9d9d9; border-radius: 5px; background: #fff; color: #333; cursor: pointer; }
+    `;
+    document.head.append(style);
+    ensureControl();
+    const observer = new MutationObserver(scheduleEnsure);
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
   const ENDPOINT = "/ajax/friendships/friends";
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.5.2";
+  const APP_VERSION = "0.6.0";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const BACKUP_FORMAT = "weibo-toolkit.friend-radar";

@@ -1,6 +1,6 @@
 # Weibo Toolkit
 
-A local-first userscript toolkit for Weibo. The current module is Friend Radar.
+A local-first userscript toolkit for Weibo. It currently includes Friend Radar and current-conversation private-message Markdown export.
 
 The visible product brand is **Weibo Toolkit**. The current product UI is Chinese-focused and does not yet provide a full internationalized interface or language selector.
 
@@ -40,6 +40,18 @@ Stored relationship events can be exported as UTF-8 CSV or Markdown for spreadsh
 
 Toolkit-owned UI provides **跟随系统 / 浅色 / 深色** appearance options. The default follows the browser/system `prefers-color-scheme` preference, while explicit light or dark mode affects only Weibo Toolkit and does not modify Weibo's own theme.
 
+## 私信 Markdown 导出
+
+在微博网页版私信中手动打开一个普通一对一会话后，点击会话界面中的 **导出 Markdown**。Weibo Toolkit 会按顺序读取该会话当前接口可访问的历史消息，并在本地生成一个 `.md` 文件。
+
+导出格式 `WEIBO_PM_AI_3` 使用紧凑的 A/B 对话记录，减少重复结构，同时保留消息顺序、正文、源时间语义以及图片、链接和未支持消息标记，便于交给支持 Markdown 或长文本的 AI 分析。Weibo Toolkit 本身不调用 AI API。
+
+导出范围仅限用户当前手动选择的普通一对一会话。它不支持群聊、服务/公共消息文件夹、自动遍历全部会话、媒体文件下载、私信恢复或后台同步。文件只包含导出时微博接口实际可访问并返回的消息；已删除、撤回、不可访问或接口未返回的内容可能缺失。
+
+私信历史通过同源 GET 请求读取。Toolkit 不发送、删除或撤回消息，不主动修改未读状态，不建立私信数据库，也不上传导出内容。
+
+导出文件是本地明文。文件省略 A/B 与真实账号的身份映射，也不将 UID 或昵称写入导出元数据，但消息正文保持原样，正文自身仍可能包含个人或身份信息。用户之后如将文件提交给第三方 AI 服务，其数据处理属于用户与该服务之间的独立隐私边界。
+
 ## Installation
 
 Install with [Tampermonkey](https://www.tampermonkey.net/) and Greasy Fork:
@@ -49,6 +61,7 @@ Install with [Tampermonkey](https://www.tampermonkey.net/) and Greasy Fork:
 3. Open authenticated `https://weibo.com/`.
 4. Reload the page.
 5. Use the lower-right **Weibo Toolkit** launcher.
+6. For PM export, open Weibo's web private-message page, select an ordinary one-to-one conversation, and use **导出 Markdown** in that conversation.
 
 A single **Weibo Toolkit：打开工具箱** userscript menu command remains available as a fallback entry; individual functions are accessed from the Toolkit UI.
 
@@ -84,7 +97,7 @@ Friend Radar can export the current account's complete validated state as a loca
 
 Restore accepts a Friend Radar backup JSON file, validates it before writing, requires the backup owner UID to match the current authenticated account, and shows a preview before confirmation. A confirmed restore completely replaces the current account's local Friend Radar snapshot and event history; it does not merge data. Export the current data first if you may need it later.
 
-Existing v0.2.0-v0.5.1 state remains compatible with normal in-place upgrades, so a backup is not required merely to upgrade.
+Existing v0.2.0-v0.5.2 state remains compatible with normal in-place upgrades, so a backup is not required merely to upgrade.
 
 ### Optional automatic updates
 
@@ -102,7 +115,8 @@ Automatic update is optional and defaults to **关闭**. Available intervals are
 - Reload Weibo after switching accounts.
 - Local data is browser-local. Use backup export and matching-account restore for migration or recovery.
 - A single scan stops at a 100-request safety ceiling and saves no scan result when that ceiling is reached. At 20 records per page this is roughly 2,000 visible records in typical responses, not a guaranteed exact account limit.
+- 私信导出只代表导出当时当前会话接口实际返回的可访问历史，不是完整账号私信备份；不支持群聊、服务/公共文件夹或媒体文件下载。
 
 ## Status
 
-v0.5.2 — current release. Adds explicit Follow system / Light / Dark appearance controls, fixes launcher readability in light mode, and moves appearance controls into the combined automatic-update and appearance settings page. Friend Radar storage schema and backup format remain unchanged; no migration is involved.
+v0.6.0 — release candidate. Adds current-conversation private-message Markdown export with an AI-friendly compact A/B format, sequential long-history reading, progress, cancellation, and fail-closed pagination validation. Friend Radar storage schema and backup format remain unchanged; no migration is involved.
