@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.7.0
+// @version      0.7.1
 // @description  Local Friend Radar and current-conversation PM Markdown export.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -922,7 +922,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.7.0";
+  const APP_VERSION = "0.7.1";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -964,10 +964,13 @@
   const BACKUP_MIME = "application/json;charset=utf-8";
   const AUTO_INTERVAL_PREFIX = "weiboToolkit.friendRadar.autoInterval.v1.";
   const AUTO_ATTEMPT_PREFIX = "weiboToolkit.friendRadar.autoAttempt.v1.";
+  const AUTO_OUTCOME_PREFIX = "weiboToolkit.friendRadar.autoOutcome.v1.";
   const FOLLOWER_AUTO_INTERVAL_PREFIX =
     "weiboToolkit.followerSnapshot.autoInterval.v1.";
   const FOLLOWER_AUTO_ATTEMPT_PREFIX =
     "weiboToolkit.followerSnapshot.autoAttempt.v1.";
+  const FOLLOWER_AUTO_OUTCOME_PREFIX =
+    "weiboToolkit.followerSnapshot.autoOutcome.v1.";
   const AUTO_STARTUP_DELAY_MS = 5000;
   const AUTO_ATTEMPT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
   const AUTO_STATUS_DURATION_MS = 5000;
@@ -2227,26 +2230,6 @@
         "display_total_number"
       );
       observeFollowerTotal(followersCount, request.data, "followers_count");
-
-      if (page === 1 && options.automatic === true) {
-        const visibleEstimate =
-          normalizeNonNegativeInteger(request.data.display_total_number) ??
-          normalizeNonNegativeInteger(request.data.total_number);
-        if (
-          visibleEstimate !== null &&
-          Math.ceil(visibleEstimate / FOLLOWER_PAGE_SIZE) >
-            FOLLOWER_MAX_DATA_PAGES
-        ) {
-          return {
-            ok: false,
-            failureKind: "FOLLOWER_AUTO_CAPACITY_EXCEEDED",
-            requestsMade,
-            estimatedDataPages: Math.ceil(
-              visibleEstimate / FOLLOWER_PAGE_SIZE
-            ),
-          };
-        }
-      }
 
       if (request.data.users.length === 0) {
         terminalVerificationRequests += 1;
@@ -3796,13 +3779,14 @@
   }
 
   function normalizeHygieneFilters(raw) {
+    const statusesMax = normalizeHygieneThreshold(raw.statusesMax);
     const followersMax = normalizeHygieneThreshold(raw.followersMax);
     const friendsMax = normalizeHygieneThreshold(raw.friendsMax);
     const createdAfter = normalizeHygieneDate(raw.createdAfter);
     const filters = {
       mode: raw.mode === "ANY" ? "ANY" : "ALL",
       ownerNotFollowing: raw.ownerNotFollowing === true,
-      zeroStatuses: raw.zeroStatuses === true,
+      statusesMax,
       followersMax,
       friendsMax,
       createdAfter,
@@ -3814,7 +3798,7 @@
     };
     filters.activeCount =
       Number(filters.ownerNotFollowing) +
-      Number(filters.zeroStatuses) +
+      Number(filters.statusesMax !== null) +
       Number(filters.followersMax !== null) +
       Number(filters.friendsMax !== null) +
       Number(filters.createdAfter !== null) +
@@ -3835,8 +3819,12 @@
     if (filters.ownerNotFollowing && record.ownerFollowing === false) {
       reasons.push("未关注 TA");
     }
-    if (filters.zeroStatuses && record.statusesCount === 0) {
-      reasons.push("API显示公开微博数为 0");
+    if (
+      filters.statusesMax !== null &&
+      record.statusesCount !== null &&
+      record.statusesCount <= filters.statusesMax
+    ) {
+      reasons.push("API显示公开微博数 ≤ " + String(filters.statusesMax));
     }
     if (
       filters.followersMax !== null &&
@@ -4734,29 +4722,30 @@
     controls.append(modeLabel);
 
     const ownerNotFollowing = buildHygieneCheckbox("未关注 TA");
-    const zeroStatuses = buildHygieneCheckbox("API显示公开微博数为 0");
     const unverified = buildHygieneCheckbox("未认证");
-    controls.append(
-      ownerNotFollowing.label,
-      zeroStatuses.label,
-      unverified.label
-    );
+    controls.append(ownerNotFollowing.label, unverified.label);
 
+    const statusesMax = buildHygieneValueInput(
+      "公开微博数上限",
+      "number",
+      "未启用"
+    );
     const followersMax = buildHygieneValueInput(
-      "粉丝数 ≤",
+      "粉丝数上限",
       "number",
       "未启用"
     );
     const friendsMax = buildHygieneValueInput(
-      "关注数 ≤",
+      "关注数上限",
       "number",
       "未启用"
     );
     const createdAfter = buildHygieneValueInput(
-      "注册时间晚于",
+      "注册日期晚于",
       "date"
     );
     controls.append(
+      statusesMax.label,
       followersMax.label,
       friendsMax.label,
       createdAfter.label
@@ -4871,7 +4860,7 @@
       return {
         mode: mode.value,
         ownerNotFollowing: ownerNotFollowing.input.checked,
-        zeroStatuses: zeroStatuses.input.checked,
+        statusesMax: statusesMax.input.value,
         followersMax: followersMax.input.value,
         friendsMax: friendsMax.input.value,
         createdAfter: createdAfter.input.value,
@@ -4887,7 +4876,9 @@
     function describeActiveFilters(filters) {
       const parts = [];
       if (filters.ownerNotFollowing) parts.push("未关注 TA");
-      if (filters.zeroStatuses) parts.push("公开微博=0");
+      if (filters.statusesMax !== null) {
+        parts.push("公开微博≤" + String(filters.statusesMax));
+      }
       if (filters.followersMax !== null) {
         parts.push("粉丝≤" + String(filters.followersMax));
       }
@@ -5330,8 +5321,8 @@
     filterInputs = [
       mode,
       ownerNotFollowing.input,
-      zeroStatuses.input,
       unverified.input,
+      statusesMax.input,
       followersMax.input,
       friendsMax.input,
       createdAfter.input,
@@ -5912,6 +5903,120 @@
         rollbackSucceeded: false,
       };
     }
+  }
+
+  const AUTOMATIC_OUTCOME_VALUES = Object.freeze([
+    "SUCCESS",
+    "FAILURE",
+    "SKIPPED",
+  ]);
+  const AUTOMATIC_SKIP_FAILURE_KINDS = Object.freeze([
+    "STALE_SCAN",
+  ]);
+  const AUTOMATIC_OUTCOME_REASON_LABELS = Object.freeze({
+    STALE_SCAN: "已有更新的快照",
+    NETWORK_ERROR: "网络请求失败",
+    HTTP_ERROR: "接口请求失败",
+    LOGIN_REQUIRED: "登录状态失效",
+    CHALLENGE_OR_UNEXPECTED_RESPONSE: "遇到验证页面或异常响应",
+    NON_JSON_RESPONSE: "接口响应异常",
+    UNEXPECTED_CONTENT_TYPE: "接口响应类型异常",
+    UNEXPECTED_SCHEMA: "接口数据校验失败",
+    PAGINATION_FAILURE: "分页完整性校验失败",
+    MAX_REQUESTS_REACHED: "达到请求安全上限",
+    FOLLOWER_REQUEST_CEILING_REACHED: "达到请求安全上限",
+    ACCOUNT_CHANGED_DURING_SCAN: "扫描期间账号发生变化",
+    STORAGE_ERROR: "本地数据读取失败",
+    PERSISTENCE_ERROR: "本地保存失败",
+    CONCURRENT_MODIFICATION: "检测到并发修改",
+    LOCK_UNAVAILABLE: "浏览器锁不可用",
+    LOCK_REQUEST_FAILED: "浏览器锁请求失败",
+    UNKNOWN_FAILURE: "未能确认原因",
+  });
+
+  function sanitizedAutomaticOutcomeCode(value) {
+    return typeof value === "string" &&
+      value.length <= 64 &&
+      /^[A-Z0-9_]+$/.test(value)
+      ? value
+      : null;
+  }
+
+  function automaticOutcomeFromResult(attemptedAt, result) {
+    const failureKind = sanitizedAutomaticOutcomeCode(result.failureKind);
+    const reason = sanitizedAutomaticOutcomeCode(result.reason);
+    return {
+      attemptedAt,
+      outcome: result.ok
+        ? "SUCCESS"
+        : AUTOMATIC_SKIP_FAILURE_KINDS.includes(failureKind)
+          ? "SKIPPED"
+          : "FAILURE",
+      ...(failureKind === null ? {} : { failureKind }),
+      ...(reason === null ? {} : { reason }),
+    };
+  }
+
+  function loadAutomaticOutcome(prefix, ownerUid) {
+    try {
+      const value = GM_getValue(prefix + ownerUid, null);
+      if (value === null || typeof value === "undefined") {
+        return { ok: true, value: null };
+      }
+      if (
+        !isPlainObject(value) ||
+        typeof value.attemptedAt !== "string" ||
+        !Number.isFinite(Date.parse(value.attemptedAt)) ||
+        !AUTOMATIC_OUTCOME_VALUES.includes(value.outcome) ||
+        (hasOwn(value, "failureKind") &&
+          sanitizedAutomaticOutcomeCode(value.failureKind) === null) ||
+        (hasOwn(value, "reason") &&
+          sanitizedAutomaticOutcomeCode(value.reason) === null)
+      ) {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "AUTO_OUTCOME_INVALID",
+        };
+      }
+      return { ok: true, value };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function saveAutomaticOutcome(prefix, ownerUid, attemptedAt, result) {
+    const key = prefix + ownerUid;
+    const value = automaticOutcomeFromResult(attemptedAt, result);
+    try {
+      GM_setValue(key, value);
+      if (JSON.stringify(GM_getValue(key, null)) !== JSON.stringify(value)) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  function describeAutomaticOutcome(value) {
+    if (value === null) return "—";
+    if (value.outcome === "SUCCESS") return "成功";
+    const code = value.failureKind || value.reason || null;
+    const detail =
+      AUTOMATIC_OUTCOME_REASON_LABELS[code] || "原因未能确认";
+    return value.outcome === "SKIPPED"
+      ? "已跳过（" + detail + "）"
+      : "失败（" + detail + "）";
   }
 
   function evaluateAutomaticUpdateEligibility(ownerUid, nowMilliseconds) {
@@ -6896,13 +7001,12 @@
           updateRunning = true;
           setLauncherStatus("关系雷达正在自动更新…");
           let result;
+          let attemptedAt = null;
           try {
-            result = await performUpdate(null, () =>
-              saveLastAutomaticAttempt(
-                uidResult.uid,
-                new Date().toISOString()
-              )
-            );
+            result = await performUpdate(null, () => {
+              attemptedAt = new Date().toISOString();
+              return saveLastAutomaticAttempt(uidResult.uid, attemptedAt);
+            });
           } catch (error) {
             result = {
               ok: false,
@@ -6911,6 +7015,14 @@
             };
           } finally {
             updateRunning = false;
+          }
+          if (attemptedAt !== null) {
+            saveAutomaticOutcome(
+              AUTO_OUTCOME_PREFIX,
+              uidResult.uid,
+              attemptedAt,
+              result
+            );
           }
           setLauncherStatus(
             result.ok ? "关系雷达自动更新完成" : "关系雷达自动更新失败",
@@ -7003,22 +7115,18 @@
           } finally {
             followerUpdateRunning = false;
           }
-          if (
-            !result.ok &&
-            result.failureKind === "FOLLOWER_AUTO_CAPACITY_EXCEEDED"
-          ) {
-            setLauncherStatus(
-              "粉丝数量超过当前自动更新安全范围，已跳过本次自动更新。",
-              AUTO_STATUS_DURATION_MS
-            );
-          } else {
-            setLauncherStatus(
-              result.ok
-                ? "粉丝快照自动更新完成"
-                : "粉丝快照自动更新失败",
-              AUTO_STATUS_DURATION_MS
-            );
-          }
+          saveAutomaticOutcome(
+            FOLLOWER_AUTO_OUTCOME_PREFIX,
+            uidResult.uid,
+            attemptedAt,
+            result
+          );
+          setLauncherStatus(
+            result.ok
+              ? "粉丝快照自动更新完成"
+              : "粉丝快照自动更新失败",
+            AUTO_STATUS_DURATION_MS
+          );
           return result;
         }
       );
@@ -7059,6 +7167,14 @@
       showFailure("自动更新设置", lastAttempt);
       return;
     }
+    const lastOutcome = loadAutomaticOutcome(
+      AUTO_OUTCOME_PREFIX,
+      uidResult.uid
+    );
+    if (!lastOutcome.ok) {
+      showFailure("自动更新设置", lastOutcome);
+      return;
+    }
     const followerInterval = loadFollowerAutoInterval(uidResult.uid);
     if (!followerInterval.ok) {
       showFailure("自动更新设置", followerInterval);
@@ -7074,6 +7190,14 @@
     );
     if (!followerLastAttempt.ok) {
       showFailure("自动更新设置", followerLastAttempt);
+      return;
+    }
+    const followerLastOutcome = loadAutomaticOutcome(
+      FOLLOWER_AUTO_OUTCOME_PREFIX,
+      uidResult.uid
+    );
+    if (!followerLastOutcome.ok) {
+      showFailure("自动更新设置", followerLastOutcome);
       return;
     }
 
@@ -7117,9 +7241,10 @@
     body.append(label);
     addLine(
       body,
-      "关系雷达上次自动尝试",
+      "上次自动尝试",
       lastAttempt.value === null ? "—" : formatTime(lastAttempt.value)
     );
+    addLine(body, "上次自动结果", describeAutomaticOutcome(lastOutcome.value));
 
     const saveButton = createElement("button", "保存设置", "wfr-button wfr-primary");
     saveButton.type = "button";
@@ -7192,10 +7317,15 @@
     body.append(followerIntervalLabel);
     addLine(
       body,
-      "粉丝快照上次自动尝试",
+      "上次自动尝试",
       followerLastAttempt.value === null
         ? "—"
         : formatTime(followerLastAttempt.value)
+    );
+    addLine(
+      body,
+      "上次自动结果",
+      describeAutomaticOutcome(followerLastOutcome.value)
     );
     body.append(
       createElement(
@@ -7474,8 +7604,9 @@
       .wfr-hygiene-bar .wfr-actions { margin-top: 0; }
       .wfr-hygiene-filter-summary { flex: 1 1 220px; overflow-wrap: anywhere; }
       .wfr-hygiene-summary { margin: 8px 0 2px; }
-      .wfr-hygiene-control, .wfr-hygiene-check { display: flex; align-items: center; gap: 8px; }
-      .wfr-hygiene-input { width: 100%; max-width: 160px; padding: 5px 8px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-hygiene-control { display: flex; flex-direction: column; align-items: stretch; gap: 5px; }
+      .wfr-hygiene-check { display: flex; align-items: center; gap: 8px; }
+      .wfr-hygiene-input { width: 100%; max-width: none; box-sizing: border-box; padding: 5px 8px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
       .wfr-hygiene-reasons { margin: 6px 0 10px; padding-left: 22px; }
       .wfr-event-list .wfr-event { padding: 9px 11px; }
       .wfr-hygiene-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
