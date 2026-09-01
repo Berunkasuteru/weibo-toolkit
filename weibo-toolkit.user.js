@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.7.1
+// @version      0.8.0
 // @description  Local Friend Radar and current-conversation PM Markdown export.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -922,7 +922,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.7.1";
+  const APP_VERSION = "0.8.0";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -980,6 +980,15 @@
   // Friend Radar state and outside backup v1.
   const THEME_KEY = "weiboToolkit.theme.v1";
   const DEFAULT_THEME = "system";
+  const HIDE_HOT_SEARCH_KEY = "weiboToolkit.page.hideHotSearch.v1";
+  const HIDE_RIGHT_SIDEBAR_KEY = "weiboToolkit.page.hideRightSidebar.v1";
+  const HIDE_TOP_RECOMMEND_KEY = "weiboToolkit.page.hideTopRecommend.v1";
+  const HIDE_TOP_VIDEO_KEY = "weiboToolkit.page.hideTopVideo.v1";
+  const PREFER_LATEST_FEED_KEY = "weiboToolkit.page.preferLatestFeed.v1";
+  const LATEST_FEED_SESSION_MARKER =
+    "weiboToolkit.page.latestFeedNormalized.v1";
+  const PAGE_PREFERENCE_STYLE_ID = "wfr-page-preferences-style";
+  const WEIBO_MAIN_ORIGIN = "https://weibo.com";
   const THEME_VALUES = Object.freeze(["system", "light", "dark"]);
   const THEME_CHOICES = Object.freeze([
     ["system", "跟随系统"],
@@ -1041,6 +1050,12 @@
   let launcherBadge = null;
   let launcherStatusTimer = null;
   let currentTheme = DEFAULT_THEME;
+  let pageCleanupPreferences = null;
+  let pagePreferenceStyleNode = null;
+  let preferLatestFeed = false;
+  let latestFeedRouteHookInstalled = false;
+  let latestFeedRouteCheckScheduled = false;
+  let latestFeedNavigationPending = false;
 
   function normalizeStableUid(value) {
     if (typeof value === "number") {
@@ -2975,6 +2990,187 @@
         errorName: error && error.name ? String(error.name) : "Error",
         rollbackSucceeded: false,
       };
+    }
+  }
+
+  function loadPageCleanupPreference(key) {
+    try {
+      return GM_getValue(key, false) === true;
+    } catch (_) {
+      // A missing or unreadable page preference must preserve Weibo's own UI.
+      return false;
+    }
+  }
+
+  function loadPageCleanupPreferences() {
+    return {
+      hideHotSearch: loadPageCleanupPreference(HIDE_HOT_SEARCH_KEY),
+      hideRightSidebar: loadPageCleanupPreference(HIDE_RIGHT_SIDEBAR_KEY),
+      hideTopRecommend: loadPageCleanupPreference(HIDE_TOP_RECOMMEND_KEY),
+      hideTopVideo: loadPageCleanupPreference(HIDE_TOP_VIDEO_KEY),
+    };
+  }
+
+  function savePageCleanupPreference(key, value) {
+    try {
+      GM_setValue(key, value);
+      if (GM_getValue(key, null) !== value) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  function buildPageCleanupCss(preferences) {
+    const selectors = [];
+    if (preferences.hideHotSearch) selectors.push(".hotBand");
+    if (preferences.hideRightSidebar) selectors.push("#__sidebar");
+    if (preferences.hideTopRecommend) {
+      selectors.push('.woo-tab-nav > a[href="/hot"]');
+    }
+    if (preferences.hideTopVideo) {
+      selectors.push('.woo-tab-nav > a[href="/tv"]');
+    }
+    return selectors.length === 0
+      ? ""
+      : selectors.join(",\n") + " { display: none !important; }";
+  }
+
+  function applyPageCleanupStyles() {
+    const css = buildPageCleanupCss(pageCleanupPreferences);
+    if (css !== "") {
+      if (pagePreferenceStyleNode === null) {
+        const style = document.createElement("style");
+        style.id = PAGE_PREFERENCE_STYLE_ID;
+        document.head.append(style);
+        pagePreferenceStyleNode = style;
+      }
+      pagePreferenceStyleNode.textContent = css;
+      return;
+    }
+    if (pagePreferenceStyleNode && pagePreferenceStyleNode.parentNode) {
+      pagePreferenceStyleNode.parentNode.removeChild(pagePreferenceStyleNode);
+    }
+    pagePreferenceStyleNode = null;
+  }
+
+  function resolveLatestFeedUrl() {
+    const owner = determineCurrentUid();
+    if (!owner.ok) return null;
+    const uid = normalizeStableUid(owner.uid);
+    if (uid === null || uid !== owner.uid) return null;
+    const target = new URL("/mygroups", WEIBO_MAIN_ORIGIN);
+    target.searchParams.set("gid", "11000" + uid);
+    return target.href;
+  }
+
+  function isCanonicalWeiboHome() {
+    if (typeof location === "undefined") return false;
+    return (
+      location.origin === WEIBO_MAIN_ORIGIN &&
+      location.pathname === "/"
+    );
+  }
+
+  function latestFeedWasNormalizedInThisTab() {
+    try {
+      return (
+        typeof sessionStorage !== "undefined" &&
+        sessionStorage.getItem(LATEST_FEED_SESSION_MARKER) === "1"
+      );
+    } catch (_) {
+      // An unavailable session boundary must disable automatic navigation.
+      return true;
+    }
+  }
+
+  function markLatestFeedNormalizedInThisTab() {
+    try {
+      if (typeof sessionStorage === "undefined") return false;
+      sessionStorage.setItem(LATEST_FEED_SESSION_MARKER, "1");
+      return sessionStorage.getItem(LATEST_FEED_SESSION_MARKER) === "1";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function maybeNormalizeHomeToLatest() {
+    if (!isCanonicalWeiboHome()) {
+      latestFeedNavigationPending = false;
+      return false;
+    }
+    if (
+      !preferLatestFeed ||
+      latestFeedNavigationPending ||
+      latestFeedWasNormalizedInThisTab()
+    ) {
+      return false;
+    }
+    const target = resolveLatestFeedUrl();
+    if (target === null || typeof location.assign !== "function") return false;
+    const current =
+      typeof location.href === "string"
+        ? location.href
+        : location.origin + location.pathname;
+    if (current === target) return false;
+    if (!markLatestFeedNormalizedInThisTab()) return false;
+    latestFeedNavigationPending = true;
+    try {
+      location.assign(target);
+      return true;
+    } catch (_) {
+      latestFeedNavigationPending = false;
+      return false;
+    }
+  }
+
+  function scheduleLatestFeedRouteCheck() {
+    if (latestFeedRouteCheckScheduled) return;
+    latestFeedRouteCheckScheduled = true;
+    setTimeout(() => {
+      latestFeedRouteCheckScheduled = false;
+      maybeNormalizeHomeToLatest();
+    }, 0);
+  }
+
+  function installLatestFeedRouteHook() {
+    if (
+      latestFeedRouteHookInstalled ||
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN
+    ) {
+      return;
+    }
+    let routeWindow;
+    try {
+      routeWindow =
+        typeof unsafeWindow !== "undefined" && unsafeWindow
+          ? unsafeWindow
+          : window;
+    } catch (_) {
+      return;
+    }
+    const routeHistory = routeWindow && routeWindow.history;
+    if (!routeHistory) return;
+    latestFeedRouteHookInstalled = true;
+    for (const method of ["pushState", "replaceState"]) {
+      const original = routeHistory[method];
+      if (typeof original !== "function") continue;
+      routeHistory[method] = function (...args) {
+        const result = original.apply(this, args);
+        scheduleLatestFeedRouteCheck();
+        return result;
+      };
+    }
+    if (typeof routeWindow.addEventListener === "function") {
+      routeWindow.addEventListener("popstate", scheduleLatestFeedRouteCheck);
     }
   }
 
@@ -7379,6 +7575,110 @@
     );
   }
 
+  function showPageSettings() {
+    const body = showPanel("页面设置", true);
+    const status = createElement("p", "", "wfr-muted");
+
+    function appendToggle(labelText, key, property, description) {
+      const label = createElement("label", null, "wfr-toggle wfr-row");
+      const input = createElement("input");
+      input.type = "checkbox";
+      input.checked = pageCleanupPreferences[property];
+      input.setAttribute("aria-label", labelText);
+      label.append(input, createElement("span", labelText));
+      input.addEventListener("change", () => {
+        const previous = pageCleanupPreferences[property];
+        const next = input.checked === true;
+        const saved = savePageCleanupPreference(key, next);
+        if (!saved.ok) {
+          input.checked = previous;
+          status.textContent = "页面净化偏好未能保存，微博页面未改变。";
+          return;
+        }
+        pageCleanupPreferences[property] = next;
+        try {
+          applyPageCleanupStyles();
+        } catch (_) {
+          pageCleanupPreferences[property] = previous;
+          savePageCleanupPreference(key, previous);
+          input.checked = previous;
+          try {
+            applyPageCleanupStyles();
+          } catch (_) {
+            // Preferences remain fail-closed if presentation recovery also fails.
+          }
+          status.textContent = "页面净化偏好未能应用，微博页面未改变。";
+          return;
+        }
+        status.textContent = next ? "已隐藏所选页面组件。" : "已恢复所选页面组件。";
+      });
+      body.append(label);
+      if (description) body.append(createElement("p", description, "wfr-muted"));
+    }
+
+    body.append(createElement("h3", "时间线"));
+    const latestLabel = createElement("label", null, "wfr-toggle wfr-row");
+    const latestInput = createElement("input");
+    latestInput.type = "checkbox";
+    latestInput.checked = preferLatestFeed;
+    latestInput.setAttribute("aria-label", "首页优先进入最新微博");
+    latestLabel.append(latestInput, createElement("span", "首页优先进入最新微博"));
+    latestInput.addEventListener("change", () => {
+      const previous = preferLatestFeed;
+      const next = latestInput.checked === true;
+      const saved = savePageCleanupPreference(PREFER_LATEST_FEED_KEY, next);
+      if (!saved.ok) {
+        latestInput.checked = previous;
+        status.textContent = "页面设置未能保存。";
+        return;
+      }
+      preferLatestFeed = next;
+      if (!next) latestFeedNavigationPending = false;
+      status.textContent = next
+        ? "每个标签页首次进入微博首页时将打开最新微博。"
+        : "已停止自动进入最新微博。";
+    });
+    body.append(
+      latestLabel,
+      createElement(
+        "p",
+        "每个标签页首次打开微博首页时自动进入按时间排序的“最新微博”。",
+        "wfr-muted"
+      )
+    );
+
+    body.append(createElement("h3", "页面净化"));
+    body.append(createElement("h3", "侧栏"));
+    appendToggle(
+      "隐藏微博热搜",
+      HIDE_HOT_SEARCH_KEY,
+      "hideHotSearch",
+      "仅隐藏微博热搜模块，可随时恢复。"
+    );
+    appendToggle(
+      "隐藏整个右侧栏",
+      HIDE_RIGHT_SIDEBAR_KEY,
+      "hideRightSidebar",
+      "会同时隐藏热搜、推荐、创作者中心等全部右侧栏模块。"
+    );
+
+    body.append(createElement("h3", "顶部导航"));
+    appendToggle(
+      "隐藏顶部推荐入口",
+      HIDE_TOP_RECOMMEND_KEY,
+      "hideTopRecommend"
+    );
+    appendToggle("隐藏顶部视频入口", HIDE_TOP_VIDEO_KEY, "hideTopVideo");
+    body.append(
+      status,
+      createElement(
+        "p",
+        "仅隐藏明确列出的页面组件，不处理信息流内容。",
+        "wfr-muted"
+      )
+    );
+  }
+
   function showToolkitHome() {
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
@@ -7509,6 +7809,17 @@
       followerHygieneButton
     );
     followerSection.append(followerActions);
+
+    const cleanupSection = createElement("div", null, "wfr-module");
+    const cleanupTitle = createElement("p", null, "wfr-row");
+    cleanupTitle.append(createElement("strong", "页面设置"));
+    const cleanupActions = createElement("div", null, "wfr-actions");
+    const cleanupButton = createElement("button", "页面设置", "wfr-button");
+    cleanupButton.type = "button";
+    cleanupButton.addEventListener("click", showPageSettings);
+    cleanupActions.append(cleanupButton);
+    cleanupSection.append(cleanupTitle, cleanupActions);
+    body.append(cleanupSection);
   }
 
   // Toolkit-only appearance preference: it changes nothing but Toolkit styling.
@@ -7589,6 +7900,7 @@
       .wfr-muted { color: var(--wfr-muted); }
       .wfr-search { width: 100%; box-sizing: border-box; margin-top: 12px; padding: 6px 9px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
       .wfr-select { margin-left: 8px; padding: 5px 8px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-toggle { display: flex; align-items: center; gap: 8px; }
       .wfr-event-list { display: grid; gap: 10px; margin-top: 14px; }
       .wfr-event { border: 1px solid var(--wfr-border); border-radius: 6px; padding: 10px 12px; background: var(--wfr-card-bg); }
       .wfr-event h3 { margin: 0 0 6px; font-size: 14px; }
@@ -7647,9 +7959,14 @@
   }
 
   currentTheme = loadTheme();
+  pageCleanupPreferences = loadPageCleanupPreferences();
+  preferLatestFeed = loadPageCleanupPreference(PREFER_LATEST_FEED_KEY);
   installStyles();
+  applyPageCleanupStyles();
   registerMenuCommands();
   installToolkitLauncher();
+  installLatestFeedRouteHook();
+  maybeNormalizeHomeToLatest();
   setTimeout(
     () => void checkAutomaticUpdatesSequentially(),
     AUTO_STARTUP_DELAY_MS

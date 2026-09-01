@@ -40,6 +40,16 @@ Stored relationship events can be exported as UTF-8 CSV or Markdown for spreadsh
 
 Toolkit-owned UI provides **跟随系统 / 浅色 / 深色** appearance options. The default follows the browser/system `prefers-color-scheme` preference, while explicit light or dark mode affects only Weibo Toolkit and does not modify Weibo's own theme.
 
+## Page Settings
+
+**页面设置** contains optional, local preferences for Weibo's page UI. All five options default to **关闭**; a fresh install or normal upgrade leaves the page unchanged until you explicitly enable one.
+
+Under **时间线**, **首页优先进入最新微博** may send the first eligible Home visit in each browser tab/session to Weibo's native, time-ordered **最新微博** route. It is a preference, not a permanent lock: after that one automatic entry you can switch to Weibo's native **全部关注** and remain there. Profile, Hot, Video, post-detail, private-message, and other non-Home routes are not forcibly redirected.
+
+Under **页面净化**, you may independently enable **隐藏微博热搜**, **隐藏整个右侧栏**, **隐藏顶部推荐入口**, and **隐藏顶部视频入口**. Disabling an option restores normal page behavior immediately. **隐藏整个右侧栏** hides every sidebar module, including potentially useful content such as Creator Center and recommendations; it is not an advertisement-only filter.
+
+Page Settings are stored only in userscript-local browser storage, add no telemetry or background API requests, and are excluded from Backup v2. They handle only explicitly identified page components and do not identify feed advertisements or filter post text.
+
 ## Follower Snapshot and follower changes
 
 **更新粉丝快照** reads the follower result Weibo's API currently makes visible and stores it locally as a Follower Snapshot. A snapshot records **the API-visible follower result**, which is not necessarily the complete real follower relationship: Weibo's API may filter some followers, and the UI states this caveat.
@@ -148,7 +158,7 @@ Existing version 1 backups remain restorable. A v1 file contains Friend Radar da
 
 Restore validates the whole file before writing anything, requires the backup owner UID to match the current authenticated account, and shows a preview before confirmation. A confirmed restore completely replaces the covered modules for that account; it does not merge data. Export the current data first if you may need it later.
 
-Backups deliberately exclude environment-local and temporary information: automatic-update settings and their attempt/cooldown timestamps, the appearance preference, and the short-lived markers used to reconcile removals the Toolkit itself performed. Backups never contain login credentials or request authentication data.
+Backups deliberately exclude environment-local and temporary information: automatic-update settings and their attempt/cooldown timestamps, appearance and Page Settings preferences, and the short-lived markers used to reconcile removals the Toolkit itself performed. Backups never contain login credentials or request authentication data.
 
 Existing v0.2.0-v0.6.0 state remains compatible with normal in-place upgrades, so a backup is not required merely to upgrade.
 
@@ -177,6 +187,10 @@ Automatic update is optional and defaults to **关闭**. Available intervals are
 
 ## Status
 
-v0.7.0 — current release. Adds Follower Snapshot with neutral follower-change records, local Follower Hygiene filtering, and explicit single/batch follower removal bounded at 50 selected accounts per batch. Backups move to version 2 and now cover Friend Radar plus the Follower Snapshot and its change records, while existing version 1 backups remain restorable and never clear follower data. Private-message Markdown export keeps its `WEIBO_PM_AI_3` format and gains a save-location step on browsers that support it. Friend Radar behavior and its storage schema are unchanged; no migration is involved.
+v0.8.0 — current release. Adds local, default-off Page Settings: one per-tab preference for entering Weibo's native Latest Feed on the first eligible Home visit, plus reversible controls for hiding Hot Search, the whole right sidebar, and the top Recommendation or Video entries. These settings do not enter Backup v2 and do not add advertisement or post-content filtering.
+
+v0.7.1 — maintenance release for Follower Snapshot automatic updates, automatic-result visibility, and Follower Hygiene filtering/layout.
+
+v0.7.0 — added Follower Snapshot with neutral follower-change records, local Follower Hygiene filtering, and explicit single/batch follower removal bounded at 50 selected accounts per batch. Backups moved to version 2 and cover Friend Radar plus the Follower Snapshot and its change records, while existing version 1 backups remain restorable and never clear follower data. Private-message Markdown export kept its `WEIBO_PM_AI_3` format and gained a save-location step on browsers that support it. Friend Radar behavior and its storage schema were unchanged; no migration was involved.
 
 v0.6.0 — added current-conversation private-message Markdown export with an AI-friendly compact A/B format, sequential long-history reading, progress, cancellation, and fail-closed pagination validation.
