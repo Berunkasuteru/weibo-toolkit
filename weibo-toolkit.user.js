@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.8.0
+// @version      0.8.1
 // @description  Local Friend Radar and current-conversation PM Markdown export.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -922,7 +922,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.8.0";
+  const APP_VERSION = "0.8.1";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -985,10 +985,129 @@
   const HIDE_TOP_RECOMMEND_KEY = "weiboToolkit.page.hideTopRecommend.v1";
   const HIDE_TOP_VIDEO_KEY = "weiboToolkit.page.hideTopVideo.v1";
   const PREFER_LATEST_FEED_KEY = "weiboToolkit.page.preferLatestFeed.v1";
+  const HIDE_LATEST_RECOMMENDED_KEY =
+    "weiboToolkit.page.hideLatestRecommended.v1";
+  const SHOW_PROFILE_EXTRAS_KEY =
+    "weiboToolkit.page.showProfileExtras.v1";
+  const PROFILE_VISIT_STORAGE_PREFIX =
+    "weiboToolkit.profileVisits.v1.";
+  const CHANGELOG_SEEN_VERSION_KEY =
+    "weiboToolkit.ui.lastSeenChangelogVersion.v1";
+  const USAGE_ENABLED_KEY = "weiboToolkit.usage.enabled.v1";
+  const USAGE_CORNER_KEY = "weiboToolkit.usage.corner.v1";
+  const USAGE_STORAGE_PREFIX = "weiboToolkit.usage.v1.";
+  const USAGE_LOCK_PREFIX = "weibo-toolkit-usage-state-";
+  const USAGE_STATE_VERSION = 1;
+  const USAGE_INACTIVITY_MS = 60 * 1000;
+  const USAGE_HEARTBEAT_MS = 10 * 1000;
+  const USAGE_MAX_HEARTBEAT_GAP_MS = 15 * 1000;
+  const USAGE_FLUSH_MS = 20 * 1000;
+  const USAGE_POST_DWELL_MS = 800;
+  const USAGE_POST_VISIBILITY_RATIO = 0.5;
+  const USAGE_RETENTION_DAYS = 90;
+  const USAGE_CORNER_ID = "wfr-usage-corner";
   const LATEST_FEED_SESSION_MARKER =
     "weiboToolkit.page.latestFeedNormalized.v1";
   const PAGE_PREFERENCE_STYLE_ID = "wfr-page-preferences-style";
+  const LATEST_RECOMMENDED_HIDDEN_CLASS =
+    "wfr-latest-recommended-hidden";
+  const PROFILE_EXTRAS_ID = "wfr-profile-extras";
   const WEIBO_MAIN_ORIGIN = "https://weibo.com";
+  const AUTO_CHANGELOG_FROM_VERSION = "0.8.1";
+  const PROFILE_TAB_LABELS = Object.freeze([
+    "精选",
+    "微博",
+    "视频",
+    "音频",
+    "相册",
+  ]);
+  const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.8.1": Object.freeze({
+      added: Object.freeze([
+        "最新微博可隐藏明确标记为“荐读”的内容",
+        "个人主页可显示 Toolkit 本地小档案",
+        "新增“微博计步器”，可在本地查看网页版活跃时间和浏览数量",
+      ]),
+      improved: Object.freeze(["新增版本更新提示，可查看历史更新记录"]),
+    }),
+    "0.8.0": Object.freeze({
+      added: Object.freeze([
+        "新增默认关闭的“页面设置”",
+        "每个标签页可优先一次进入按时间排序的“最新微博”",
+        "可独立隐藏微博热搜、整个右侧栏、顶部推荐或顶部视频入口",
+      ]),
+    }),
+    "0.7.1": Object.freeze({
+      improved: Object.freeze([
+        "自动更新设置可显示最近一次自动尝试的成功、失败或安全跳过结果",
+        "粉丝体检筛选布局更清晰，并支持公开微博数上限",
+      ]),
+      fixed: Object.freeze([
+        "粉丝快照自动更新不再依据不可靠的接口总数提前放弃扫描",
+      ]),
+    }),
+    "0.7.0": Object.freeze({
+      added: Object.freeze([
+        "新增粉丝快照与中性的粉丝变化记录",
+        "新增本地粉丝体检筛选",
+        "支持逐个或最多 50 个一批、逐项确认并顺序执行的移除粉丝操作",
+        "备份升级为 v2，可包含粉丝快照和粉丝变化记录",
+        "私信 Markdown 导出可在支持的浏览器中先选择保存位置",
+      ]),
+    }),
+    "0.6.0": Object.freeze({
+      added: Object.freeze([
+        "可将当前普通一对一私信会话导出为紧凑的 Markdown 对话记录",
+        "支持顺序读取较长历史、进度显示、取消和分页完整性校验",
+      ]),
+    }),
+    "0.5.2": Object.freeze({
+      improved: Object.freeze([
+        "Toolkit 外观可选择跟随系统、浅色或深色",
+        "改善浅色模式下的启动器可读性，并集中显示自动更新与外观设置",
+      ]),
+    }),
+    "0.5.1": Object.freeze({
+      added: Object.freeze([
+        "启动器新增未读事件提示，并可查看关系概览",
+        "关系事件可导出为 CSV 或 Markdown",
+      ]),
+      improved: Object.freeze([
+        "用户脚本菜单简化为一个“打开工具箱”入口",
+        "Toolkit 自有界面支持跟随系统深色外观",
+      ]),
+    }),
+    "0.5.0": Object.freeze({
+      added: Object.freeze([
+        "新增备份恢复：验证账号和文件后预览并完整替换本地关系雷达状态",
+        "新增默认关闭的页面打开时自动更新，可选择多个固定间隔",
+      ]),
+    }),
+    "0.4.0": Object.freeze({
+      added: Object.freeze([
+        "立即更新时显示当前页、请求数和已验证记录数",
+        "新增事件详情和按 UID 归并的个人关系时间线",
+        "事件列表可按昵称或 UID 搜索",
+      ]),
+    }),
+    "0.3.2": Object.freeze({
+      improved: Object.freeze([
+        "单次关系雷达扫描请求上限从 30 提高到 100",
+        "达到请求上限时显示已请求、已读取和接口报告总数",
+      ]),
+    }),
+    "0.3.1": Object.freeze({
+      improved: Object.freeze(["在用户脚本元数据中明确标注 MPL-2.0 许可"]),
+    }),
+    "0.3.0": Object.freeze({
+      added: Object.freeze([
+        "关系雷达可按稳定 UID 保存可见关注快照并比较后续变化",
+        "记录新增、消失、关注你的状态变化和昵称变化",
+        "提供独立的 Weibo Toolkit 启动器和用户脚本菜单入口",
+        "可手动导出当前账号的本地 JSON 备份",
+      ]),
+    }),
+  });
   const THEME_VALUES = Object.freeze(["system", "light", "dark"]);
   const THEME_CHOICES = Object.freeze([
     ["system", "跟随系统"],
@@ -1056,6 +1175,40 @@
   let latestFeedRouteHookInstalled = false;
   let latestFeedRouteCheckScheduled = false;
   let latestFeedNavigationPending = false;
+  let latestRecommendedObserver = null;
+  let latestRecommendedRoot = null;
+  let latestRecommendedDiscoveryObserver = null;
+  let profileExtrasObserver = null;
+  let profileExtrasObservedMain = null;
+  let profileExtrasObservedHost = null;
+  let profileExtrasDiscoveryTimer = null;
+  let profileExtrasDiscoveryCount = 0;
+  let profileExtrasEnsureScheduled = false;
+  let activeProfileContext = null;
+  let activeProfileNicknamePopover = null;
+  let usageEnabledPreference = false;
+  let usageCornerPreference = false;
+  let usageRuntimeOwnerUid = null;
+  let usageState = null;
+  let usageSessionOwnerUid = null;
+  let usageSessionActiveSeconds = 0;
+  let usageSessionPostIds = new Set();
+  let usagePendingActiveSeconds = 0;
+  let usagePendingPostIds = new Set();
+  let usageLastActivityMonotonic = Number.NEGATIVE_INFINITY;
+  let usageLastHeartbeatMonotonic = null;
+  let usageHeartbeatTimer = null;
+  let usageFlushTimer = null;
+  let usageFlushInFlight = null;
+  let usageListenersInstalled = false;
+  let usageFeedRoot = null;
+  let usageFeedObserver = null;
+  let usageIntersectionObserver = null;
+  let usageFeedDiscoveryTimer = null;
+  let usageFeedDiscoveryCount = 0;
+  let usageCardStates = new Map();
+  let usageCornerButton = null;
+  let panelDismissHandler = null;
 
   function normalizeStableUid(value) {
     if (typeof value === "number") {
@@ -3008,6 +3161,10 @@
       hideRightSidebar: loadPageCleanupPreference(HIDE_RIGHT_SIDEBAR_KEY),
       hideTopRecommend: loadPageCleanupPreference(HIDE_TOP_RECOMMEND_KEY),
       hideTopVideo: loadPageCleanupPreference(HIDE_TOP_VIDEO_KEY),
+      hideLatestRecommended: loadPageCleanupPreference(
+        HIDE_LATEST_RECOMMENDED_KEY
+      ),
+      showProfileExtras: loadPageCleanupPreference(SHOW_PROFILE_EXTRAS_KEY),
     };
   }
 
@@ -3037,6 +3194,9 @@
     }
     if (preferences.hideTopVideo) {
       selectors.push('.woo-tab-nav > a[href="/tv"]');
+    }
+    if (preferences.hideLatestRecommended) {
+      selectors.push(`.${LATEST_RECOMMENDED_HIDDEN_CLASS}`);
     }
     return selectors.length === 0
       ? ""
@@ -3077,6 +3237,1704 @@
       location.origin === WEIBO_MAIN_ORIGIN &&
       location.pathname === "/"
     );
+  }
+
+  function isLatestFeedRoute() {
+    if (
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN ||
+      location.pathname !== "/mygroups"
+    ) {
+      return false;
+    }
+    const target = resolveLatestFeedUrl();
+    if (target === null || typeof location.href !== "string") return false;
+    try {
+      const currentUrl = new URL(location.href);
+      const targetUrl = new URL(target);
+      return (
+        currentUrl.searchParams.get("gid") ===
+        targetUrl.searchParams.get("gid")
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function elementChildren(node) {
+    return node && node.children ? Array.from(node.children) : [];
+  }
+
+  function hasClass(node, className) {
+    return Boolean(
+      node && node.classList && node.classList.contains(className)
+    );
+  }
+
+  function normalizeLatestRecommendedBadgeText(value) {
+    return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  }
+
+  function classifyLatestRecommendedCard(card) {
+    const article = elementChildren(card).find(
+      (child) => child.tagName === "ARTICLE"
+    );
+    if (!article) return false;
+    const articleBody = elementChildren(article).find(
+      (child) => child.tagName === "DIV"
+    );
+    if (!articleBody) return false;
+    const header = elementChildren(articleBody).find(
+      (child) => child.tagName === "HEADER"
+    );
+    if (!header || typeof header.querySelectorAll !== "function") return false;
+    const badgeComponents = header.querySelectorAll(".wbpro-tag");
+    return Array.from(badgeComponents).some((component) =>
+      elementChildren(component).some(
+        (badgeNode) =>
+          badgeNode.tagName === "DIV" &&
+          normalizeLatestRecommendedBadgeText(badgeNode.textContent) === "荐读"
+      )
+    );
+  }
+
+  function applyLatestRecommendedVisibility(card) {
+    if (!card || !card.classList) return;
+    if (classifyLatestRecommendedCard(card)) {
+      card.classList.add(LATEST_RECOMMENDED_HIDDEN_CLASS);
+    } else {
+      card.classList.remove(LATEST_RECOMMENDED_HIDDEN_CLASS);
+    }
+  }
+
+  function findLatestRecommendedCardAncestor(node) {
+    let current = node && node.nodeType === 1 ? node : node?.parentElement;
+    while (current) {
+      if (hasClass(current, "wbpro-scroller-item")) return current;
+      if (current === latestRecommendedRoot) return null;
+      current = current.parentElement;
+    }
+    return null;
+  }
+
+  function collectLatestRecommendedCards(node, cards) {
+    if (!node) return;
+    const ancestor = findLatestRecommendedCardAncestor(node);
+    if (ancestor) cards.add(ancestor);
+    if (node.nodeType !== 1 || typeof node.querySelectorAll !== "function") {
+      return;
+    }
+    if (hasClass(node, "wbpro-scroller-item")) cards.add(node);
+    for (const card of node.querySelectorAll(".wbpro-scroller-item")) {
+      cards.add(card);
+    }
+  }
+
+  function processLatestRecommendedMutations(mutations) {
+    const cards = new Set();
+    for (const mutation of mutations) {
+      collectLatestRecommendedCards(mutation.target, cards);
+      for (const node of mutation.addedNodes || []) {
+        collectLatestRecommendedCards(node, cards);
+      }
+    }
+    for (const card of cards) applyLatestRecommendedVisibility(card);
+  }
+
+  function clearLatestRecommendedMarkers(root) {
+    if (!root || typeof root.querySelectorAll !== "function") return;
+    for (const card of root.querySelectorAll(
+      `.${LATEST_RECOMMENDED_HIDDEN_CLASS}`
+    )) {
+      card.classList.remove(LATEST_RECOMMENDED_HIDDEN_CLASS);
+    }
+  }
+
+  function findLatestFeedRoot() {
+    if (typeof document.getElementById !== "function") return null;
+    const root = document.getElementById("scroller");
+    return hasClass(root, "vue-recycle-scroller") ? root : null;
+  }
+
+  function teardownLatestFeedRecommendationFilter() {
+    if (
+      !latestRecommendedObserver &&
+      !latestRecommendedRoot &&
+      !latestRecommendedDiscoveryObserver
+    ) {
+      return;
+    }
+    if (latestRecommendedObserver) latestRecommendedObserver.disconnect();
+    if (latestRecommendedDiscoveryObserver) {
+      latestRecommendedDiscoveryObserver.disconnect();
+    }
+    clearLatestRecommendedMarkers(latestRecommendedRoot);
+    latestRecommendedObserver = null;
+    latestRecommendedRoot = null;
+    latestRecommendedDiscoveryObserver = null;
+  }
+
+  function installLatestFeedRecommendationFilter() {
+    if (!pageCleanupPreferences.hideLatestRecommended || !isLatestFeedRoute()) {
+      teardownLatestFeedRecommendationFilter();
+      return false;
+    }
+    const root = findLatestFeedRoot();
+    if (!root) {
+      if (latestRecommendedObserver) {
+        latestRecommendedObserver.disconnect();
+        clearLatestRecommendedMarkers(latestRecommendedRoot);
+        latestRecommendedObserver = null;
+        latestRecommendedRoot = null;
+      }
+      if (!latestRecommendedDiscoveryObserver) {
+        const homeWrap =
+          typeof document.querySelector === "function"
+            ? document.querySelector(".homeWrap")
+            : null;
+        if (homeWrap) {
+          latestRecommendedDiscoveryObserver = new MutationObserver(() => {
+            if (
+              !pageCleanupPreferences.hideLatestRecommended ||
+              !isLatestFeedRoute()
+            ) {
+              teardownLatestFeedRecommendationFilter();
+              return;
+            }
+            if (findLatestFeedRoot()) installLatestFeedRecommendationFilter();
+          });
+          latestRecommendedDiscoveryObserver.observe(homeWrap, {
+            childList: true,
+            subtree: true,
+          });
+        }
+      }
+      return false;
+    }
+    if (latestRecommendedDiscoveryObserver) {
+      latestRecommendedDiscoveryObserver.disconnect();
+      latestRecommendedDiscoveryObserver = null;
+    }
+    if (latestRecommendedRoot === root && latestRecommendedObserver) {
+      for (const card of root.querySelectorAll(".wbpro-scroller-item")) {
+        applyLatestRecommendedVisibility(card);
+      }
+      return true;
+    }
+    if (latestRecommendedObserver) latestRecommendedObserver.disconnect();
+    clearLatestRecommendedMarkers(latestRecommendedRoot);
+    latestRecommendedRoot = root;
+    for (const card of root.querySelectorAll(".wbpro-scroller-item")) {
+      applyLatestRecommendedVisibility(card);
+    }
+    latestRecommendedObserver = new MutationObserver(
+      processLatestRecommendedMutations
+    );
+    latestRecommendedObserver.observe(root, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["data-index", "data-active"],
+    });
+    return true;
+  }
+
+  function resolveProfileRouteTargetUid() {
+    if (
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN ||
+      typeof location.pathname !== "string"
+    ) {
+      return null;
+    }
+    const match = /^\/u\/([1-9]\d*)\/?$/.exec(location.pathname);
+    return match ? normalizeStableUid(match[1]) : null;
+  }
+
+  function profileVisitStorageKey(ownerUid) {
+    return PROFILE_VISIT_STORAGE_PREFIX + ownerUid;
+  }
+
+  function isValidProfileVisitMap(value) {
+    if (!isPlainObject(value)) return false;
+    for (const [uid, record] of Object.entries(value)) {
+      if (
+        normalizeStableUid(uid) !== uid ||
+        !isPlainObject(record) ||
+        !Number.isSafeInteger(record.count) ||
+        record.count < 1 ||
+        typeof record.lastVisitedAt !== "string" ||
+        !Number.isFinite(Date.parse(record.lastVisitedAt))
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function loadProfileVisits(ownerUid) {
+    try {
+      const stored = GM_getValue(profileVisitStorageKey(ownerUid), null);
+      if (stored === null || typeof stored === "undefined") {
+        return { ok: true, visits: {} };
+      }
+      return isValidProfileVisitMap(stored)
+        ? { ok: true, visits: stored }
+        : { ok: false, failureKind: "STORAGE_ERROR" };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function recordProfileVisit(ownerUid, targetUid, visitedAt) {
+    const loaded = loadProfileVisits(ownerUid);
+    if (!loaded.ok) return loaded;
+    const previous = hasOwn(loaded.visits, targetUid)
+      ? loaded.visits[targetUid]
+      : null;
+    if (previous !== null && previous.count >= Number.MAX_SAFE_INTEGER) {
+      return { ok: false, failureKind: "STORAGE_ERROR" };
+    }
+    const nextRecord = {
+      count: previous === null ? 1 : previous.count + 1,
+      lastVisitedAt: visitedAt,
+    };
+    const nextVisits = { ...loaded.visits, [targetUid]: nextRecord };
+    try {
+      GM_setValue(profileVisitStorageKey(ownerUid), nextVisits);
+      const saved = GM_getValue(profileVisitStorageKey(ownerUid), null);
+      if (
+        !isValidProfileVisitMap(saved) ||
+        saved[targetUid].count !== nextRecord.count ||
+        saved[targetUid].lastVisitedAt !== visitedAt
+      ) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return {
+        ok: true,
+        count: nextRecord.count,
+        previousVisitedAt: previous === null ? null : previous.lastVisitedAt,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function addProfileNameObservation(observations, name, observedAt, order) {
+    if (
+      typeof name !== "string" ||
+      name.trim() === "" ||
+      typeof observedAt !== "string" ||
+      !Number.isFinite(Date.parse(observedAt))
+    ) {
+      return;
+    }
+    observations.push({ name, observedAt, order });
+  }
+
+  function deriveProfileLocalFacts(targetUid, friendState, followerState) {
+    const names = [];
+    const relationshipEvents = [];
+    const evidenceTimes = [];
+    let order = 0;
+    let currentName = null;
+    let currentNameObservedAt = Number.NEGATIVE_INFINITY;
+
+    function observeName(name, observedAt) {
+      addProfileNameObservation(names, name, observedAt, order);
+      order += 1;
+      if (
+        typeof observedAt === "string" &&
+        Number.isFinite(Date.parse(observedAt))
+      ) {
+        evidenceTimes.push(observedAt);
+      }
+    }
+
+    function observeCurrentName(name, observedAt) {
+      const observedTime = Date.parse(observedAt);
+      if (
+        typeof name === "string" &&
+        name.trim() !== "" &&
+        Number.isFinite(observedTime) &&
+        observedTime > currentNameObservedAt
+      ) {
+        currentName = name;
+        currentNameObservedAt = observedTime;
+      }
+    }
+
+    if (friendState && friendState.latestSnapshot) {
+      const snapshot = friendState.latestSnapshot;
+      const record = snapshot.records.find((entry) => entry.uid === targetUid);
+      if (record) {
+        observeCurrentName(record.screenName, snapshot.capturedAt);
+        observeName(record.screenName, snapshot.capturedAt);
+      }
+    }
+    if (friendState) {
+      for (const event of friendState.events) {
+        if (event.subjectUid !== targetUid) continue;
+        evidenceTimes.push(event.detectedAt);
+        relationshipEvents.push({
+          observedAt: event.detectedAt,
+          label: EVENT_LABELS[event.type],
+        });
+        if (event.type === EVENT.SCREEN_NAME_CHANGED) {
+          observeName(event.previous.screenName, event.detectedAt);
+          observeName(event.current.screenName, event.detectedAt);
+        } else {
+          observeName(event.displayName, event.detectedAt);
+        }
+      }
+    }
+
+    if (followerState && followerState.latestSnapshot) {
+      const snapshot = followerState.latestSnapshot;
+      const record = snapshot.records.find((entry) => entry.uid === targetUid);
+      if (record) {
+        observeCurrentName(record.screenName, snapshot.capturedAt);
+        observeName(record.screenName, snapshot.capturedAt);
+      }
+    }
+    if (followerState) {
+      for (const event of followerState.events) {
+        if (event.uid !== targetUid) continue;
+        evidenceTimes.push(event.observedAt);
+        relationshipEvents.push({
+          observedAt: event.observedAt,
+          label: FOLLOWER_EVENT_LABELS[event.type],
+        });
+        observeName(event.displayName, event.observedAt);
+      }
+    }
+
+    names.sort((left, right) => {
+      const timeDifference =
+        Date.parse(left.observedAt) - Date.parse(right.observedAt);
+      return timeDifference || left.order - right.order;
+    });
+    if (currentName === null && names.length > 0) {
+      currentName = names[names.length - 1].name;
+    }
+    const seenNames = new Set();
+    const historicalNames = [];
+    for (const observation of names) {
+      if (
+        observation.name === currentName ||
+        seenNames.has(observation.name)
+      ) {
+        continue;
+      }
+      seenNames.add(observation.name);
+      historicalNames.push(observation.name);
+    }
+    relationshipEvents.sort(
+      (left, right) =>
+        Date.parse(right.observedAt) - Date.parse(left.observedAt)
+    );
+    const earliestLocalRecord = evidenceTimes.length
+      ? new Date(
+          Math.min(...evidenceTimes.map((value) => Date.parse(value)))
+        ).toISOString()
+      : null;
+    return {
+      currentName,
+      historicalNames,
+      earliestLocalRecord,
+      recentRelationshipEvent: relationshipEvents[0] || null,
+    };
+  }
+
+  function loadProfileLocalFacts(ownerUid, targetUid) {
+    const friend = loadState(ownerUid);
+    const follower = loadFollowerState(ownerUid);
+    return deriveProfileLocalFacts(
+      targetUid,
+      friend.ok ? friend.state : null,
+      follower.ok ? follower.state : null
+    );
+  }
+
+  function normalizeProfileTabText(value) {
+    return typeof value === "string" ? value.replace(/\s+/g, "").trim() : "";
+  }
+
+  function collectProfileTabLabels(root, labels) {
+    if (!root || root.nodeType !== 1) return;
+    const children = elementChildren(root);
+    if (children.length === 0) {
+      const text = normalizeProfileTabText(root.textContent);
+      if (PROFILE_TAB_LABELS.includes(text)) labels.add(text);
+      return;
+    }
+    for (const child of children) collectProfileTabLabels(child, labels);
+  }
+
+  function findProfileExtrasInsertionPoint() {
+    if (typeof document.querySelector !== "function") return null;
+    const main = document.querySelector("main");
+    if (!main) return null;
+    const stack = [main];
+    const weiboLabels = [];
+    while (stack.length > 0) {
+      const node = stack.pop();
+      const children = elementChildren(node);
+      if (
+        children.length === 0 &&
+        normalizeProfileTabText(node.textContent) === "微博"
+      ) {
+        weiboLabels.push(node);
+      }
+      stack.push(...children);
+    }
+    for (const label of weiboLabels) {
+      let candidate = label.parentElement;
+      for (let depth = 0; candidate && depth < 7; depth += 1) {
+        const labels = new Set();
+        collectProfileTabLabels(candidate, labels);
+        if (labels.has("微博") && labels.size >= 3 && candidate.parentElement) {
+          return { main, host: candidate.parentElement, before: candidate };
+        }
+        if (candidate === main) break;
+        candidate = candidate.parentElement;
+      }
+    }
+    return null;
+  }
+
+  function formatProfileDate(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(
+      date.getDate()
+    )}`;
+  }
+
+  function formatProfileVisitTime(value, nowValue = Date.now()) {
+    const visited = new Date(value);
+    const now = new Date(nowValue);
+    if (Number.isNaN(visited.getTime()) || Number.isNaN(now.getTime())) {
+      return formatMinute(value);
+    }
+    const visitedDay = Date.UTC(
+      visited.getFullYear(),
+      visited.getMonth(),
+      visited.getDate()
+    );
+    const currentDay = Date.UTC(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate()
+    );
+    const daysAgo = Math.round((currentDay - visitedDay) / 86400000);
+    const time = `${String(visited.getHours()).padStart(2, "0")}:${String(
+      visited.getMinutes()
+    ).padStart(2, "0")}`;
+    if (daysAgo === 0) return `今天 ${time}`;
+    if (daysAgo === 1) return `昨天 ${time}`;
+    if (daysAgo >= 2 && daysAgo <= 6) return `${daysAgo} 天前`;
+    return formatProfileDate(value);
+  }
+
+  function addProfileLine(
+    root,
+    label,
+    value,
+    exactTime = null,
+    valueTitle = null
+  ) {
+    const row = createElement("p", null, "wfr-profile-row");
+    row.append(createElement("span", `${label}：`, "wfr-profile-label"));
+    const displayedValue = createElement("span", String(value));
+    if (exactTime !== null) {
+      displayedValue.title = formatMinute(exactTime);
+    } else if (valueTitle !== null) {
+      displayedValue.title = valueTitle;
+    }
+    row.append(displayedValue);
+    root.append(row);
+  }
+
+  function closeProfileNicknamePopover(restoreFocus = false) {
+    const active = activeProfileNicknamePopover;
+    if (active === null) return;
+    activeProfileNicknamePopover = null;
+    if (typeof document.removeEventListener === "function") {
+      document.removeEventListener("click", active.onDocumentClick, true);
+      document.removeEventListener("keydown", active.onKeydown);
+    }
+    if (active.root.parentNode) {
+      active.root.parentNode.removeChild(active.root);
+    }
+    active.trigger.setAttribute("aria-expanded", "false");
+    if (restoreFocus && typeof active.trigger.focus === "function") {
+      active.trigger.focus();
+    }
+  }
+
+  function openProfileNicknamePopover(trigger, names) {
+    if (!trigger || !trigger.parentNode || !Array.isArray(names)) return false;
+    closeProfileNicknamePopover();
+    const popover = createElement(
+      "div",
+      null,
+      "wfr-profile-name-popover"
+    );
+    popover.id = "wfr-profile-name-popover";
+    popover.setAttribute("role", "dialog");
+    popover.setAttribute("aria-label", "本地记录过的昵称");
+    const header = createElement("div", null, "wfr-profile-name-popover-header");
+    header.append(createElement("strong", "本地记录过的昵称"));
+    const closeButton = createElement(
+      "button",
+      "关闭",
+      "wfr-profile-name-close"
+    );
+    closeButton.type = "button";
+    closeButton.setAttribute("aria-label", "关闭昵称列表");
+    header.append(closeButton);
+    const list = createElement("ul", null, "wfr-profile-name-list");
+    for (const name of names) list.append(createElement("li", name));
+    popover.append(header, list);
+    trigger.parentNode.append(popover);
+    trigger.setAttribute("aria-expanded", "true");
+
+    const onDocumentClick = (event) => {
+      const target = event && event.target;
+      if (
+        target &&
+        (popover.contains(target) || trigger.contains(target))
+      ) {
+        return;
+      }
+      closeProfileNicknamePopover();
+    };
+    const onKeydown = (event) => {
+      if (event && event.key === "Escape") {
+        closeProfileNicknamePopover(true);
+      }
+    };
+    activeProfileNicknamePopover = {
+      root: popover,
+      trigger,
+      onDocumentClick,
+      onKeydown,
+    };
+    closeButton.addEventListener("click", () => {
+      closeProfileNicknamePopover(true);
+    });
+    if (typeof document.addEventListener === "function") {
+      document.addEventListener("click", onDocumentClick, true);
+      document.addEventListener("keydown", onKeydown);
+    }
+    return true;
+  }
+
+  function renderProfileExtras(context) {
+    const root = createElement(
+      "section",
+      null,
+      "wfr-profile-extras wfr-root"
+    );
+    root.id = PROFILE_EXTRAS_ID;
+    root.setAttribute("aria-label", "Weibo Toolkit 本地记录");
+    applyThemeToRoot(root);
+
+    const facts = context.facts;
+    if (facts.historicalNames.length > 0) {
+      const row = createElement("div", null, "wfr-profile-name-row");
+      const trigger = createElement(
+        "button",
+        `历史昵称：${facts.historicalNames.length} 个`,
+        "wfr-profile-name-trigger"
+      );
+      trigger.type = "button";
+      trigger.setAttribute("aria-expanded", "false");
+      trigger.setAttribute("aria-haspopup", "dialog");
+      trigger.setAttribute("aria-controls", "wfr-profile-name-popover");
+      trigger.addEventListener("click", () => {
+        if (
+          activeProfileNicknamePopover &&
+          activeProfileNicknamePopover.trigger === trigger
+        ) {
+          closeProfileNicknamePopover(true);
+          return;
+        }
+        openProfileNicknamePopover(trigger, facts.historicalNames);
+      });
+      row.append(trigger);
+      root.append(row);
+    }
+    if (facts.recentRelationshipEvent !== null) {
+      addProfileLine(
+        root,
+        "最近记录",
+        `${formatProfileDate(facts.recentRelationshipEvent.observedAt)} · ${facts.recentRelationshipEvent.label}`,
+        facts.recentRelationshipEvent.observedAt
+      );
+    }
+    if (facts.earliestLocalRecord !== null) {
+      addProfileLine(
+        root,
+        "最早本地记录",
+        formatProfileDate(facts.earliestLocalRecord),
+        facts.earliestLocalRecord
+      );
+    }
+    if (context.visit.ok && context.visit.previousVisitedAt !== null) {
+      addProfileLine(
+        root,
+        "上次访问",
+        formatProfileVisitTime(context.visit.previousVisitedAt),
+        context.visit.previousVisitedAt
+      );
+    }
+    if (context.visit.ok) {
+      addProfileLine(
+        root,
+        "累计访问次数",
+        `${context.visit.count} 次`,
+        null,
+        "当前浏览器中 Toolkit 记录的累计访问次数"
+      );
+    }
+    return root;
+  }
+
+  function profileContextHasContent(context) {
+    return Boolean(
+      context &&
+        (context.visit.ok ||
+          context.facts.historicalNames.length > 0 ||
+          context.facts.earliestLocalRecord !== null ||
+          context.facts.recentRelationshipEvent !== null)
+    );
+  }
+
+  function removeProfileExtrasNode() {
+    closeProfileNicknamePopover();
+    if (typeof document.getElementById !== "function") return;
+    const node = document.getElementById(PROFILE_EXTRAS_ID);
+    if (node && node.parentNode) node.parentNode.removeChild(node);
+  }
+
+  function disconnectProfileExtrasObserver() {
+    if (profileExtrasObserver) profileExtrasObserver.disconnect();
+    profileExtrasObserver = null;
+    profileExtrasObservedMain = null;
+    profileExtrasObservedHost = null;
+  }
+
+  function cancelProfileExtrasDiscovery() {
+    if (profileExtrasDiscoveryTimer !== null) {
+      clearTimeout(profileExtrasDiscoveryTimer);
+      profileExtrasDiscoveryTimer = null;
+    }
+    profileExtrasDiscoveryCount = 0;
+  }
+
+  function teardownProfileExtras(resetContext = true) {
+    disconnectProfileExtrasObserver();
+    cancelProfileExtrasDiscovery();
+    removeProfileExtrasNode();
+    if (resetContext) activeProfileContext = null;
+  }
+
+  function scheduleProfileExtrasEnsure() {
+    if (profileExtrasEnsureScheduled) return;
+    profileExtrasEnsureScheduled = true;
+    setTimeout(() => {
+      profileExtrasEnsureScheduled = false;
+      ensureProfileExtras();
+    }, 0);
+  }
+
+  function observeProfileExtrasHost(point) {
+    if (
+      profileExtrasObserver &&
+      profileExtrasObservedMain === point.main &&
+      profileExtrasObservedHost === point.host
+    ) {
+      return;
+    }
+    disconnectProfileExtrasObserver();
+    profileExtrasObserver = new MutationObserver(scheduleProfileExtrasEnsure);
+    profileExtrasObserver.observe(point.main, { childList: true });
+    if (point.host !== point.main) {
+      profileExtrasObserver.observe(point.host, { childList: true });
+    }
+    profileExtrasObservedMain = point.main;
+    profileExtrasObservedHost = point.host;
+  }
+
+  function scheduleProfileExtrasDiscovery() {
+    if (
+      profileExtrasDiscoveryTimer !== null ||
+      profileExtrasDiscoveryCount >= 20
+    ) {
+      return;
+    }
+    profileExtrasDiscoveryTimer = setTimeout(() => {
+      profileExtrasDiscoveryTimer = null;
+      profileExtrasDiscoveryCount += 1;
+      ensureProfileExtras();
+    }, 250);
+  }
+
+  function ensureProfileExtras() {
+    if (!pageCleanupPreferences.showProfileExtras) {
+      const targetUid = resolveProfileRouteTargetUid();
+      const owner = determineCurrentUid();
+      const sameRecordedRoute = Boolean(
+        activeProfileContext &&
+          owner.ok &&
+          activeProfileContext.ownerUid === owner.uid &&
+          activeProfileContext.targetUid === targetUid
+      );
+      teardownProfileExtras(!sameRecordedRoute);
+      return false;
+    }
+    const targetUid = resolveProfileRouteTargetUid();
+    const owner = determineCurrentUid();
+    if (!owner.ok || targetUid === null || targetUid === owner.uid) {
+      teardownProfileExtras();
+      return false;
+    }
+    if (
+      activeProfileContext === null ||
+      activeProfileContext.ownerUid !== owner.uid ||
+      activeProfileContext.targetUid !== targetUid
+    ) {
+      teardownProfileExtras();
+      const visitedAt = new Date().toISOString();
+      activeProfileContext = {
+        ownerUid: owner.uid,
+        targetUid,
+        facts: loadProfileLocalFacts(owner.uid, targetUid),
+        visit: recordProfileVisit(owner.uid, targetUid, visitedAt),
+      };
+    }
+
+    if (!profileContextHasContent(activeProfileContext)) {
+      removeProfileExtrasNode();
+      disconnectProfileExtrasObserver();
+      cancelProfileExtrasDiscovery();
+      return false;
+    }
+
+    const point = findProfileExtrasInsertionPoint();
+    if (!point) {
+      removeProfileExtrasNode();
+      disconnectProfileExtrasObserver();
+      scheduleProfileExtrasDiscovery();
+      return false;
+    }
+    if (profileExtrasDiscoveryTimer !== null) {
+      clearTimeout(profileExtrasDiscoveryTimer);
+      profileExtrasDiscoveryTimer = null;
+    }
+    profileExtrasDiscoveryCount = 0;
+    let root = document.getElementById(PROFILE_EXTRAS_ID);
+    if (!root || root.parentNode !== point.host) {
+      removeProfileExtrasNode();
+      root = renderProfileExtras(activeProfileContext);
+      point.host.insertBefore(root, point.before);
+    }
+    observeProfileExtrasHost(point);
+    return true;
+  }
+
+  function parseToolkitReleaseVersion(value) {
+    if (typeof value !== "string") return null;
+    const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(
+      value
+    );
+    if (!match) return null;
+    const parts = match.slice(1).map(Number);
+    return parts.every(Number.isSafeInteger) ? parts : null;
+  }
+
+  function compareToolkitReleaseVersions(left, right) {
+    const leftParts = parseToolkitReleaseVersion(left);
+    const rightParts = parseToolkitReleaseVersion(right);
+    if (leftParts === null || rightParts === null) return null;
+    for (let index = 0; index < 3; index += 1) {
+      if (leftParts[index] !== rightParts[index]) {
+        return leftParts[index] < rightParts[index] ? -1 : 1;
+      }
+    }
+    return 0;
+  }
+
+  function getBundledChangelog(version) {
+    return parseToolkitReleaseVersion(version) !== null &&
+      hasOwn(CHANGELOG_BY_VERSION, version)
+      ? CHANGELOG_BY_VERSION[version]
+      : null;
+  }
+
+  function bundledReleaseVersionsThrough(currentVersion) {
+    if (parseToolkitReleaseVersion(currentVersion) === null) return [];
+    return Object.keys(CHANGELOG_BY_VERSION)
+      .filter((version) => {
+        const comparison = compareToolkitReleaseVersions(
+          version,
+          currentVersion
+        );
+        return comparison !== null && comparison <= 0;
+      })
+      .sort((left, right) => compareToolkitReleaseVersions(right, left));
+  }
+
+  function loadSeenChangelogVersion() {
+    try {
+      const value = GM_getValue(CHANGELOG_SEEN_VERSION_KEY, null);
+      return parseToolkitReleaseVersion(value) !== null ? value : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function saveSeenChangelogVersion(version) {
+    if (parseToolkitReleaseVersion(version) === null) return false;
+    try {
+      GM_setValue(CHANGELOG_SEEN_VERSION_KEY, version);
+      return GM_getValue(CHANGELOG_SEEN_VERSION_KEY, null) === version;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function shouldAutoShowBundledChangelog(version) {
+    const rolloutComparison = compareToolkitReleaseVersions(
+      version,
+      AUTO_CHANGELOG_FROM_VERSION
+    );
+    return (
+      rolloutComparison !== null &&
+      rolloutComparison >= 0 &&
+      getBundledChangelog(version) !== null &&
+      loadSeenChangelogVersion() !== version
+    );
+  }
+
+  function appendChangelogSections(body, changelog) {
+    for (const [property, title] of [
+      ["added", "新增"],
+      ["improved", "改进"],
+      ["fixed", "修复"],
+    ]) {
+      const entries = changelog[property];
+      if (!Array.isArray(entries) || entries.length === 0) continue;
+      body.append(createElement("h3", title));
+      const list = createElement("ul", null, "wfr-changelog-list");
+      for (const entry of entries) list.append(createElement("li", entry));
+      body.append(list);
+    }
+  }
+
+  function showBundledChangelog(version) {
+    const changelog = getBundledChangelog(version);
+    if (changelog === null) return false;
+    let body;
+    try {
+      body = showPanel(`Weibo Toolkit v${version} 新功能`);
+      appendChangelogSections(body, changelog);
+      const actions = createElement("div", null, "wfr-actions");
+      const acknowledge = createElement(
+        "button",
+        "知道了",
+        "wfr-button wfr-primary"
+      );
+      acknowledge.type = "button";
+      acknowledge.addEventListener("click", closePanel);
+      actions.append(acknowledge);
+      body.append(actions);
+    } catch (_) {
+      panelDismissHandler = null;
+      closePanel();
+      return false;
+    }
+    panelDismissHandler = () => {
+      saveSeenChangelogVersion(version);
+    };
+    return true;
+  }
+
+  function showUpdateHistory(currentVersion = APP_VERSION) {
+    const versions = bundledReleaseVersionsThrough(currentVersion);
+    if (versions.length === 0) return false;
+    const body = showPanel("更新记录", true);
+    for (const version of versions) {
+      const details = createElement("details", null, "wfr-release-history");
+      details.open = version === currentVersion;
+      details.append(createElement("summary", `v${version}`));
+      const content = createElement(
+        "div",
+        null,
+        "wfr-release-history-content"
+      );
+      appendChangelogSections(content, CHANGELOG_BY_VERSION[version]);
+      details.append(content);
+      body.append(details);
+    }
+    return true;
+  }
+
+  function maybeAutoShowBundledChangelog(version = APP_VERSION) {
+    if (
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN ||
+      panelRoot !== null ||
+      !shouldAutoShowBundledChangelog(version)
+    ) {
+      return false;
+    }
+    return showBundledChangelog(version);
+  }
+
+  function scheduleBundledChangelogAutoShow() {
+    if (!shouldAutoShowBundledChangelog(APP_VERSION)) return;
+    setTimeout(() => {
+      maybeAutoShowBundledChangelog(APP_VERSION);
+    }, 1500);
+  }
+
+  function usageLocalDateKey(nowValue = Date.now()) {
+    const date = new Date(nowValue);
+    if (Number.isNaN(date.getTime())) return null;
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+      date.getDate()
+    )}`;
+  }
+
+  function isValidUsageDateKey(value) {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      return false;
+    }
+    const [year, month, day] = value.split("-").map(Number);
+    const date = new Date(year, month - 1, day);
+    return (
+      date.getFullYear() === year &&
+      date.getMonth() === month - 1 &&
+      date.getDate() === day
+    );
+  }
+
+  function isValidUsagePostId(value) {
+    return typeof value === "string" && /^[A-Za-z0-9]{5,32}$/.test(value);
+  }
+
+  function emptyUsageState(dateKey) {
+    return {
+      version: USAGE_STATE_VERSION,
+      currentDay: {
+        date: dateKey,
+        activeSeconds: 0,
+        uniquePostIds: [],
+      },
+      days: {},
+    };
+  }
+
+  function isValidUsageState(state) {
+    if (
+      !isPlainObject(state) ||
+      state.version !== USAGE_STATE_VERSION ||
+      !isPlainObject(state.currentDay) ||
+      !isValidUsageDateKey(state.currentDay.date) ||
+      typeof state.currentDay.activeSeconds !== "number" ||
+      !Number.isFinite(state.currentDay.activeSeconds) ||
+      state.currentDay.activeSeconds < 0 ||
+      state.currentDay.activeSeconds > 86400 ||
+      !Array.isArray(state.currentDay.uniquePostIds) ||
+      !isPlainObject(state.days)
+    ) {
+      return false;
+    }
+    const postIds = new Set();
+    for (const postId of state.currentDay.uniquePostIds) {
+      if (!isValidUsagePostId(postId) || postIds.has(postId)) return false;
+      postIds.add(postId);
+    }
+    const dayEntries = Object.entries(state.days);
+    if (dayEntries.length > USAGE_RETENTION_DAYS) return false;
+    for (const [dateKey, day] of dayEntries) {
+      if (
+        !isValidUsageDateKey(dateKey) ||
+        dateKey >= state.currentDay.date ||
+        !isPlainObject(day) ||
+        typeof day.activeSeconds !== "number" ||
+        !Number.isFinite(day.activeSeconds) ||
+        day.activeSeconds < 0 ||
+        day.activeSeconds > 86400 ||
+        !Number.isSafeInteger(day.uniquePosts) ||
+        day.uniquePosts < 0
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function usageRetentionCutoff(nowValue) {
+    const date = new Date(nowValue);
+    date.setHours(0, 0, 0, 0);
+    date.setDate(date.getDate() - (USAGE_RETENTION_DAYS - 1));
+    return usageLocalDateKey(date.getTime());
+  }
+
+  function rollUsageStateToDate(state, dateKey, nowValue = Date.now()) {
+    if (state.currentDay.date === dateKey) return state;
+    const days = {
+      ...state.days,
+      [state.currentDay.date]: {
+        activeSeconds: state.currentDay.activeSeconds,
+        uniquePosts: state.currentDay.uniquePostIds.length,
+      },
+    };
+    const cutoff = usageRetentionCutoff(nowValue);
+    for (const storedDate of Object.keys(days)) {
+      if (storedDate < cutoff || storedDate >= dateKey) delete days[storedDate];
+    }
+    return {
+      version: USAGE_STATE_VERSION,
+      currentDay: {
+        date: dateKey,
+        activeSeconds: 0,
+        uniquePostIds: [],
+      },
+      days,
+    };
+  }
+
+  function usageStorageKey(ownerUid) {
+    return USAGE_STORAGE_PREFIX + ownerUid;
+  }
+
+  function loadUsageState(ownerUid, nowValue = Date.now()) {
+    const dateKey = usageLocalDateKey(nowValue);
+    if (dateKey === null) return { ok: false, failureKind: "STORAGE_ERROR" };
+    try {
+      const raw = GM_getValue(usageStorageKey(ownerUid), null);
+      if (raw === null || typeof raw === "undefined") {
+        return { ok: true, state: emptyUsageState(dateKey), raw: null };
+      }
+      if (typeof raw !== "string") {
+        return { ok: false, failureKind: "STORAGE_ERROR" };
+      }
+      const parsed = JSON.parse(raw);
+      if (!isValidUsageState(parsed)) {
+        return { ok: false, failureKind: "STORAGE_ERROR" };
+      }
+      return {
+        ok: true,
+        state: rollUsageStateToDate(parsed, dateKey, nowValue),
+        raw,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function persistUsageState(ownerUid, state) {
+    if (!isValidUsageState(state)) {
+      return { ok: false, failureKind: "PERSISTENCE_ERROR" };
+    }
+    try {
+      const raw = JSON.stringify(state);
+      GM_setValue(usageStorageKey(ownerUid), raw);
+      return GM_getValue(usageStorageKey(ownerUid), null) === raw
+        ? { ok: true, state, raw }
+        : { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function usageLockUnavailable(reason, error) {
+    const result = {
+      ok: false,
+      failureKind: "STATE_LOCK_UNAVAILABLE",
+      reason,
+    };
+    if (error) result.errorName = error.name ? String(error.name) : "Error";
+    return result;
+  }
+
+  async function withUsageStateLock(ownerUid, transaction) {
+    const lockManager = pageLockManager();
+    if (lockManager === null) return usageLockUnavailable("LOCK_UNAVAILABLE");
+    try {
+      return await lockManager.request.call(
+        lockManager,
+        USAGE_LOCK_PREFIX + ownerUid,
+        { mode: "exclusive" },
+        async (lock) => {
+          if (lock === null) return usageLockUnavailable("LOCK_NOT_ACQUIRED");
+          return await transaction();
+        }
+      );
+    } catch (error) {
+      return usageLockUnavailable("LOCK_REQUEST_FAILED", error);
+    }
+  }
+
+  function usageMonotonicNow() {
+    try {
+      if (typeof performance !== "undefined" && performance.now) {
+        return performance.now();
+      }
+    } catch (_) {
+      // Date.now remains a monotonic-enough fallback only for this tab session.
+    }
+    return Date.now();
+  }
+
+  function mergeUsagePendingIntoState(state, activeSeconds, postIds) {
+    const mergedIds = new Set(state.currentDay.uniquePostIds);
+    for (const postId of postIds) mergedIds.add(postId);
+    return {
+      ...state,
+      currentDay: {
+        ...state.currentDay,
+        activeSeconds: Math.min(
+          86400,
+          state.currentDay.activeSeconds + activeSeconds
+        ),
+        uniquePostIds: [...mergedIds].sort(),
+      },
+    };
+  }
+
+  async function flushUsageState() {
+    if (usageFlushInFlight !== null) return await usageFlushInFlight;
+    if (
+      usageRuntimeOwnerUid === null ||
+      usageState === null ||
+      (usagePendingActiveSeconds <= 0 && usagePendingPostIds.size === 0)
+    ) {
+      return { ok: true, state: usageState };
+    }
+    const ownerUid = usageRuntimeOwnerUid;
+    const pendingDate = usageState.currentDay.date;
+    const activeSnapshot = usagePendingActiveSeconds;
+    const postSnapshot = [...usagePendingPostIds];
+    usageFlushInFlight = withUsageStateLock(ownerUid, async () => {
+      const loaded = loadUsageState(ownerUid);
+      if (!loaded.ok || loaded.state.currentDay.date !== pendingDate) {
+        return loaded.ok
+          ? { ok: false, failureKind: "CONCURRENT_MODIFICATION" }
+          : loaded;
+      }
+      const merged = mergeUsagePendingIntoState(
+        loaded.state,
+        activeSnapshot,
+        postSnapshot
+      );
+      return persistUsageState(ownerUid, merged);
+    });
+    const result = await usageFlushInFlight;
+    usageFlushInFlight = null;
+    if (result.ok && usageRuntimeOwnerUid === ownerUid) {
+      usagePendingActiveSeconds = Math.max(
+        0,
+        usagePendingActiveSeconds - activeSnapshot
+      );
+      for (const postId of postSnapshot) usagePendingPostIds.delete(postId);
+      usageState = mergeUsagePendingIntoState(
+        result.state,
+        usagePendingActiveSeconds,
+        usagePendingPostIds
+      );
+      syncUsageCorner();
+    }
+    return result;
+  }
+
+  async function ensureUsageCurrentDay(nowValue = Date.now()) {
+    if (usageState === null) return false;
+    const dateKey = usageLocalDateKey(nowValue);
+    if (dateKey === null) return false;
+    if (usageState.currentDay.date === dateKey) return true;
+    const flushed = await flushUsageState();
+    if (!flushed.ok || usagePendingActiveSeconds > 0 || usagePendingPostIds.size) {
+      return false;
+    }
+    usageState = rollUsageStateToDate(usageState, dateKey, nowValue);
+    return true;
+  }
+
+  function isUsageFeedRoute() {
+    return Boolean(
+      typeof location !== "undefined" &&
+        location.origin === WEIBO_MAIN_ORIGIN &&
+        (location.pathname === "/" || location.pathname === "/mygroups")
+    );
+  }
+
+  function extractUsagePostId(card) {
+    if (!card || !hasClass(card, "wbpro-scroller-item")) return null;
+    const article = elementChildren(card).find(
+      (child) => child.tagName === "ARTICLE"
+    );
+    if (!article) return null;
+    const articleBody = elementChildren(article).find(
+      (child) => child.tagName === "DIV"
+    );
+    if (!articleBody) return null;
+    const header = elementChildren(articleBody).find(
+      (child) => child.tagName === "HEADER"
+    );
+    if (!header) return null;
+    const stack = [header];
+    while (stack.length > 0) {
+      const node = stack.pop();
+      if (node.tagName === "A" && typeof node.href === "string") {
+        try {
+          const url = new URL(node.href, WEIBO_MAIN_ORIGIN);
+          const match = /^\/[1-9]\d*\/([A-Za-z0-9]{5,32})\/?$/.exec(
+            url.pathname
+          );
+          if (url.origin === WEIBO_MAIN_ORIGIN && match) return match[1];
+        } catch (_) {
+          // A malformed or unrelated header link is not a post identity.
+        }
+      }
+      stack.push(...elementChildren(node));
+    }
+    return null;
+  }
+
+  function clearUsageCardDwell(cardState) {
+    if (cardState && cardState.dwellTimer !== null) {
+      clearTimeout(cardState.dwellTimer);
+      cardState.dwellTimer = null;
+    }
+  }
+
+  function cleanupDisconnectedUsageCards() {
+    for (const [card, cardState] of usageCardStates) {
+      if (
+        card.isConnected === false ||
+        !usageFeedRoot ||
+        !usageFeedRoot.contains(card)
+      ) {
+        clearUsageCardDwell(cardState);
+        if (usageIntersectionObserver) usageIntersectionObserver.unobserve(card);
+        usageCardStates.delete(card);
+      }
+    }
+  }
+
+  function registerUsageCard(card) {
+    if (!card || !usageIntersectionObserver) return;
+    const postId = extractUsagePostId(card);
+    const existing = usageCardStates.get(card);
+    if (postId === null) {
+      if (existing) {
+        clearUsageCardDwell(existing);
+        usageIntersectionObserver.unobserve(card);
+        usageCardStates.delete(card);
+      }
+      return;
+    }
+    if (existing && existing.postId === postId) return;
+    if (existing) {
+      clearUsageCardDwell(existing);
+      usageIntersectionObserver.unobserve(card);
+    }
+    usageCardStates.set(card, {
+      postId,
+      visibleRatio: 0,
+      dwellTimer: null,
+    });
+    usageIntersectionObserver.observe(card);
+  }
+
+  function collectUsageCards(node, cards) {
+    if (!node) return;
+    let current = node.nodeType === 1 ? node : node.parentElement;
+    while (current && current !== usageFeedRoot) {
+      if (hasClass(current, "wbpro-scroller-item")) {
+        cards.add(current);
+        break;
+      }
+      current = current.parentElement;
+    }
+    if (node.nodeType !== 1 || typeof node.querySelectorAll !== "function") {
+      return;
+    }
+    if (hasClass(node, "wbpro-scroller-item")) cards.add(node);
+    for (const card of node.querySelectorAll(".wbpro-scroller-item")) {
+      cards.add(card);
+    }
+  }
+
+  function processUsageFeedMutations(mutations) {
+    if (!usageEnabledPreference || !isUsageFeedRoute()) {
+      teardownUsageFeedTracking();
+      return;
+    }
+    const cards = new Set();
+    for (const mutation of mutations) {
+      collectUsageCards(mutation.target, cards);
+      for (const node of mutation.addedNodes || []) collectUsageCards(node, cards);
+    }
+    for (const card of cards) registerUsageCard(card);
+    cleanupDisconnectedUsageCards();
+  }
+
+  function isUsageCardStillHalfVisible(card) {
+    if (!card || typeof card.getBoundingClientRect !== "function") return false;
+    const rect = card.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+    const viewportWidth =
+      typeof window !== "undefined" && Number.isFinite(window.innerWidth)
+        ? window.innerWidth
+        : 0;
+    const viewportHeight =
+      typeof window !== "undefined" && Number.isFinite(window.innerHeight)
+        ? window.innerHeight
+        : 0;
+    if (viewportWidth <= 0 || viewportHeight <= 0) return false;
+    const visibleWidth = Math.max(
+      0,
+      Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0)
+    );
+    const visibleHeight = Math.max(
+      0,
+      Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0)
+    );
+    return (
+      (visibleWidth * visibleHeight) / (rect.width * rect.height) >=
+      USAGE_POST_VISIBILITY_RATIO
+    );
+  }
+
+  function noteUsageActivity() {
+    if (!usageEnabledPreference || usageRuntimeOwnerUid === null) return;
+    usageLastActivityMonotonic = usageMonotonicNow();
+  }
+
+  async function recordQualifiedUsagePost(postId) {
+    if (!usageEnabledPreference || !isValidUsagePostId(postId)) return false;
+    const owner = determineCurrentUid();
+    if (!owner.ok || owner.uid !== usageRuntimeOwnerUid) return false;
+    if (!(await ensureUsageCurrentDay())) return false;
+    noteUsageActivity();
+    let changed = false;
+    if (!usageSessionPostIds.has(postId)) {
+      usageSessionPostIds.add(postId);
+      changed = true;
+    }
+    if (!usageState.currentDay.uniquePostIds.includes(postId)) {
+      usageState.currentDay.uniquePostIds.push(postId);
+      usagePendingPostIds.add(postId);
+      changed = true;
+    }
+    if (changed) syncUsageCorner();
+    return changed;
+  }
+
+  async function finishUsageCardDwell(card, capturedPostId) {
+    const cardState = usageCardStates.get(card);
+    if (cardState) cardState.dwellTimer = null;
+    const owner = determineCurrentUid();
+    if (
+      !usageEnabledPreference ||
+      !isUsageFeedRoute() ||
+      !owner.ok ||
+      owner.uid !== usageRuntimeOwnerUid ||
+      !cardState ||
+      cardState.postId !== capturedPostId ||
+      cardState.visibleRatio < USAGE_POST_VISIBILITY_RATIO ||
+      card.isConnected === false ||
+      !usageFeedRoot ||
+      !usageFeedRoot.contains(card) ||
+      extractUsagePostId(card) !== capturedPostId ||
+      !isUsageCardStillHalfVisible(card)
+    ) {
+      return false;
+    }
+    return await recordQualifiedUsagePost(capturedPostId);
+  }
+
+  function processUsageIntersections(entries) {
+    for (const entry of entries) {
+      const cardState = usageCardStates.get(entry.target);
+      if (!cardState) continue;
+      cardState.visibleRatio =
+        entry.isIntersecting === true && Number.isFinite(entry.intersectionRatio)
+          ? entry.intersectionRatio
+          : 0;
+      clearUsageCardDwell(cardState);
+      if (cardState.visibleRatio >= USAGE_POST_VISIBILITY_RATIO) {
+        const capturedPostId = cardState.postId;
+        cardState.dwellTimer = setTimeout(
+          () => finishUsageCardDwell(entry.target, capturedPostId),
+          USAGE_POST_DWELL_MS
+        );
+      }
+    }
+  }
+
+  function teardownUsageFeedTracking(resetDiscovery = true) {
+    if (usageFeedObserver) usageFeedObserver.disconnect();
+    if (usageIntersectionObserver) usageIntersectionObserver.disconnect();
+    if (resetDiscovery && usageFeedDiscoveryTimer !== null) {
+      clearTimeout(usageFeedDiscoveryTimer);
+    }
+    for (const cardState of usageCardStates.values()) {
+      clearUsageCardDwell(cardState);
+    }
+    usageFeedRoot = null;
+    usageFeedObserver = null;
+    usageIntersectionObserver = null;
+    if (resetDiscovery) {
+      usageFeedDiscoveryTimer = null;
+      usageFeedDiscoveryCount = 0;
+    }
+    usageCardStates = new Map();
+  }
+
+  function scheduleUsageFeedDiscovery() {
+    if (usageFeedDiscoveryTimer !== null || usageFeedDiscoveryCount >= 20) {
+      return;
+    }
+    usageFeedDiscoveryTimer = setTimeout(() => {
+      usageFeedDiscoveryTimer = null;
+      usageFeedDiscoveryCount += 1;
+      installUsageFeedTrackingForRoute();
+    }, 250);
+  }
+
+  function installUsageFeedTrackingForRoute() {
+    if (!usageEnabledPreference || usageRuntimeOwnerUid === null) {
+      teardownUsageFeedTracking();
+      return false;
+    }
+    if (!isUsageFeedRoute()) {
+      teardownUsageFeedTracking();
+      return false;
+    }
+    const root = findLatestFeedRoot();
+    if (!root) {
+      teardownUsageFeedTracking(false);
+      scheduleUsageFeedDiscovery();
+      return false;
+    }
+    if (
+      usageFeedRoot === root &&
+      usageFeedObserver &&
+      usageIntersectionObserver
+    ) {
+      return true;
+    }
+    teardownUsageFeedTracking();
+    if (
+      typeof IntersectionObserver !== "function" ||
+      typeof MutationObserver !== "function"
+    ) {
+      return false;
+    }
+    usageFeedRoot = root;
+    usageIntersectionObserver = new IntersectionObserver(
+      processUsageIntersections,
+      { threshold: [0, USAGE_POST_VISIBILITY_RATIO, 1] }
+    );
+    usageFeedObserver = new MutationObserver(processUsageFeedMutations);
+    for (const card of root.querySelectorAll(".wbpro-scroller-item")) {
+      registerUsageCard(card);
+    }
+    usageFeedObserver.observe(root, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["href", "data-index", "data-active"],
+    });
+    return true;
+  }
+
+  function usageDocumentIsActive(nowMonotonic) {
+    if (
+      !usageEnabledPreference ||
+      usageRuntimeOwnerUid === null ||
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN ||
+      document.visibilityState !== "visible" ||
+      typeof document.hasFocus !== "function" ||
+      !document.hasFocus()
+    ) {
+      return false;
+    }
+    return nowMonotonic - usageLastActivityMonotonic <= USAGE_INACTIVITY_MS;
+  }
+
+  async function runUsageHeartbeat(nowMonotonic = usageMonotonicNow()) {
+    if (!usageEnabledPreference || usageRuntimeOwnerUid === null) return false;
+    const owner = determineCurrentUid();
+    if (!owner.ok || owner.uid !== usageRuntimeOwnerUid) {
+      stopUsageTracking(false);
+      usageRuntimeOwnerUid = null;
+      usageState = null;
+      return false;
+    }
+    if (!(await ensureUsageCurrentDay())) return false;
+    if (usageLastHeartbeatMonotonic === null) {
+      usageLastHeartbeatMonotonic = nowMonotonic;
+      return false;
+    }
+    const elapsedMilliseconds = Math.max(
+      0,
+      nowMonotonic - usageLastHeartbeatMonotonic
+    );
+    usageLastHeartbeatMonotonic = nowMonotonic;
+    if (!usageDocumentIsActive(nowMonotonic)) return false;
+    const addedSeconds =
+      Math.min(elapsedMilliseconds, USAGE_MAX_HEARTBEAT_GAP_MS) / 1000;
+    if (addedSeconds <= 0) return false;
+    usageState.currentDay.activeSeconds = Math.min(
+      86400,
+      usageState.currentDay.activeSeconds + addedSeconds
+    );
+    usageSessionActiveSeconds += addedSeconds;
+    usagePendingActiveSeconds += addedSeconds;
+    syncUsageCorner();
+    return true;
+  }
+
+  function scheduleUsageHeartbeat() {
+    if (usageHeartbeatTimer !== null || !usageEnabledPreference) return;
+    usageHeartbeatTimer = setTimeout(async () => {
+      usageHeartbeatTimer = null;
+      await runUsageHeartbeat();
+      scheduleUsageHeartbeat();
+    }, USAGE_HEARTBEAT_MS);
+  }
+
+  function scheduleUsageFlush() {
+    if (usageFlushTimer !== null || !usageEnabledPreference) return;
+    usageFlushTimer = setTimeout(async () => {
+      usageFlushTimer = null;
+      await flushUsageState();
+      scheduleUsageFlush();
+    }, USAGE_FLUSH_MS);
+  }
+
+  function handleUsageVisibilityChange() {
+    if (document.visibilityState !== "visible") void flushUsageState();
+  }
+
+  function handleUsagePageHide() {
+    void flushUsageState();
+  }
+
+  function installUsageActivityListeners() {
+    if (usageListenersInstalled) return;
+    for (const type of ["pointerdown", "keydown", "wheel", "touchstart"]) {
+      document.addEventListener(type, noteUsageActivity, {
+        passive: type === "wheel" || type === "touchstart",
+      });
+    }
+    window.addEventListener("scroll", noteUsageActivity, { passive: true });
+    document.addEventListener(
+      "visibilitychange",
+      handleUsageVisibilityChange
+    );
+    window.addEventListener("pagehide", handleUsagePageHide);
+    usageListenersInstalled = true;
+  }
+
+  function removeUsageActivityListeners() {
+    if (!usageListenersInstalled) return;
+    for (const type of ["pointerdown", "keydown", "wheel", "touchstart"]) {
+      document.removeEventListener(type, noteUsageActivity);
+    }
+    window.removeEventListener("scroll", noteUsageActivity);
+    document.removeEventListener(
+      "visibilitychange",
+      handleUsageVisibilityChange
+    );
+    window.removeEventListener("pagehide", handleUsagePageHide);
+    usageListenersInstalled = false;
+  }
+
+  function startUsageTracking(fromUserAction = false) {
+    if (!usageEnabledPreference) return { ok: false, reason: "DISABLED" };
+    const owner = determineCurrentUid();
+    if (!owner.ok) return owner;
+    if (pageLockManager() === null) {
+      return { ok: false, failureKind: "STATE_LOCK_UNAVAILABLE" };
+    }
+    if (usageRuntimeOwnerUid === owner.uid && usageState !== null) {
+      installUsageActivityListeners();
+      installUsageFeedTrackingForRoute();
+      scheduleUsageHeartbeat();
+      scheduleUsageFlush();
+      syncUsageCorner();
+      if (fromUserAction) noteUsageActivity();
+      return { ok: true };
+    }
+    const loaded = loadUsageState(owner.uid);
+    if (!loaded.ok) return loaded;
+    usageRuntimeOwnerUid = owner.uid;
+    usageState = loaded.state;
+    usagePendingActiveSeconds = 0;
+    usagePendingPostIds = new Set();
+    usageLastHeartbeatMonotonic = usageMonotonicNow();
+    usageLastActivityMonotonic = Number.NEGATIVE_INFINITY;
+    if (usageSessionOwnerUid !== owner.uid) {
+      usageSessionOwnerUid = owner.uid;
+      usageSessionActiveSeconds = 0;
+      usageSessionPostIds = new Set();
+    }
+    installUsageActivityListeners();
+    installUsageFeedTrackingForRoute();
+    scheduleUsageHeartbeat();
+    scheduleUsageFlush();
+    if (fromUserAction) noteUsageActivity();
+    syncUsageCorner();
+    return { ok: true };
+  }
+
+  function stopUsageTracking(flushPending = true) {
+    if (usageHeartbeatTimer !== null) clearTimeout(usageHeartbeatTimer);
+    if (usageFlushTimer !== null) clearTimeout(usageFlushTimer);
+    usageHeartbeatTimer = null;
+    usageFlushTimer = null;
+    removeUsageActivityListeners();
+    teardownUsageFeedTracking();
+    removeUsageCorner();
+    usageLastHeartbeatMonotonic = null;
+    usageLastActivityMonotonic = Number.NEGATIVE_INFINITY;
+    if (flushPending) void flushUsageState();
+  }
+
+  function handleUsageRouteChange() {
+    if (!usageEnabledPreference || usageRuntimeOwnerUid === null) return;
+    void flushUsageState();
+    installUsageFeedTrackingForRoute();
   }
 
   function latestFeedWasNormalizedInThisTab() {
@@ -3137,6 +4995,9 @@
     setTimeout(() => {
       latestFeedRouteCheckScheduled = false;
       maybeNormalizeHomeToLatest();
+      installLatestFeedRecommendationFilter();
+      ensureProfileExtras();
+      handleUsageRouteChange();
     }, 0);
   }
 
@@ -3187,12 +5048,16 @@
 
   function applyTheme() {
     applyThemeToRoot(launcherButton);
+    applyThemeToRoot(usageCornerButton);
     applyThemeToRoot(panelRoot);
   }
 
   function closePanel() {
+    const dismissHandler = panelDismissHandler;
+    panelDismissHandler = null;
     if (panelRoot && panelRoot.parentNode) panelRoot.parentNode.removeChild(panelRoot);
     panelRoot = null;
+    if (typeof dismissHandler === "function") dismissHandler();
   }
 
   function showPanel(title, withBack = false) {
@@ -3230,6 +5095,174 @@
     const span = createElement("span", String(value));
     row.append(strong, span);
     body.append(row);
+  }
+
+  function formatUsageMinutes(seconds) {
+    return Math.max(0, Math.round(seconds / 60));
+  }
+
+  function usageCornerText(state) {
+    return `今日 ${formatUsageMinutes(
+      state.currentDay.activeSeconds
+    )} 分钟 · ${state.currentDay.uniquePostIds.length} 条`;
+  }
+
+  function removeUsageCorner() {
+    if (usageCornerButton && usageCornerButton.parentNode) {
+      usageCornerButton.parentNode.removeChild(usageCornerButton);
+    }
+    usageCornerButton = null;
+  }
+
+  function syncUsageCorner() {
+    if (
+      !usageEnabledPreference ||
+      !usageCornerPreference ||
+      usageRuntimeOwnerUid === null ||
+      usageState === null ||
+      !document.body
+    ) {
+      removeUsageCorner();
+      return;
+    }
+    if (!usageCornerButton) {
+      usageCornerButton = createElement(
+        "button",
+        null,
+        "wfr-usage-corner wfr-root"
+      );
+      usageCornerButton.id = USAGE_CORNER_ID;
+      usageCornerButton.type = "button";
+      usageCornerButton.setAttribute("aria-label", "打开微博计步器");
+      usageCornerButton.addEventListener("click", showUsageStatistics);
+      applyThemeToRoot(usageCornerButton);
+      document.body.append(usageCornerButton);
+    }
+    usageCornerButton.textContent = usageCornerText(usageState);
+  }
+
+  function usageStateForDisplay(ownerUid) {
+    if (usageRuntimeOwnerUid === ownerUid && usageState !== null) {
+      return { ok: true, state: usageState };
+    }
+    return loadUsageState(ownerUid);
+  }
+
+  async function clearUsageStatisticsForOwner(ownerUid) {
+    const result = await withUsageStateLock(ownerUid, async () => {
+      try {
+        GM_deleteValue(usageStorageKey(ownerUid));
+        return GM_getValue(usageStorageKey(ownerUid), null) === null
+          ? { ok: true }
+          : { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      } catch (error) {
+        return {
+          ok: false,
+          failureKind: "PERSISTENCE_ERROR",
+          errorName: error && error.name ? String(error.name) : "Error",
+        };
+      }
+    });
+    if (!result.ok) return result;
+    if (usageRuntimeOwnerUid === ownerUid) {
+      usageState = emptyUsageState(usageLocalDateKey());
+      usagePendingActiveSeconds = 0;
+      usagePendingPostIds = new Set();
+    }
+    if (usageSessionOwnerUid === ownerUid) {
+      usageSessionActiveSeconds = 0;
+      usageSessionPostIds = new Set();
+    }
+    syncUsageCorner();
+    return { ok: true };
+  }
+
+  function appendUsageClearAction(body, ownerUid) {
+    const actions = createElement("div", null, "wfr-actions");
+    const clearButton = createElement(
+      "button",
+      "清空使用统计",
+      "wfr-button wfr-danger"
+    );
+    clearButton.type = "button";
+    clearButton.addEventListener("click", async () => {
+      const confirmed = confirm(
+        "清空当前账号在本浏览器中的使用统计？\n此操作不会影响微博数据。"
+      );
+      if (!confirmed) return;
+      const currentOwner = determineCurrentUid();
+      if (!currentOwner.ok || currentOwner.uid !== ownerUid) {
+        showFailure("微博计步器", {
+          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+        });
+        return;
+      }
+      const cleared = await clearUsageStatisticsForOwner(ownerUid);
+      if (!cleared.ok) {
+        showFailure("微博计步器", cleared);
+        return;
+      }
+      showUsageStatistics("使用统计已清空。追踪偏好保持不变。");
+    });
+    actions.append(clearButton);
+    body.append(actions);
+  }
+
+  function showUsageStatistics(statusText = null) {
+    const owner = determineCurrentUid();
+    if (!owner.ok) {
+      showFailure("微博计步器", owner);
+      return;
+    }
+    const loaded = usageStateForDisplay(owner.uid);
+    if (!loaded.ok) {
+      const body = showPanel("微博计步器", true);
+      body.append(
+        createElement(
+          "p",
+          "本地使用统计无法读取。请先检查或清空该账号的使用统计。",
+          "wfr-error"
+        )
+      );
+      appendUsageClearAction(body, owner.uid);
+      return;
+    }
+    const body = showPanel("微博计步器", true);
+    if (statusText) body.append(createElement("p", statusText, "wfr-success"));
+    body.append(createElement("h3", "今日"));
+    addLine(
+      body,
+      "活跃时间",
+      `约 ${formatUsageMinutes(loaded.state.currentDay.activeSeconds)} 分钟`
+    );
+    addLine(
+      body,
+      "浏览微博",
+      `${loaded.state.currentDay.uniquePostIds.length} 条不同微博`
+    );
+    body.append(createElement("h3", "本标签页"));
+    addLine(
+      body,
+      "活跃时间",
+      `约 ${formatUsageMinutes(
+        usageSessionOwnerUid === owner.uid ? usageSessionActiveSeconds : 0
+      )} 分钟`
+    );
+    addLine(
+      body,
+      "浏览微博",
+      `${
+        usageSessionOwnerUid === owner.uid ? usageSessionPostIds.size : 0
+      } 条不同微博`
+    );
+    body.append(
+      createElement(
+        "p",
+        "仅保存在当前浏览器，不记录微博正文或具体浏览历史。",
+        "wfr-muted"
+      )
+    );
+    appendUsageClearAction(body, owner.uid);
   }
 
   function failureText(result) {
@@ -7647,6 +9680,207 @@
       )
     );
 
+    const latestRecommendedLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row"
+    );
+    const latestRecommendedInput = createElement("input");
+    latestRecommendedInput.type = "checkbox";
+    latestRecommendedInput.checked =
+      pageCleanupPreferences.hideLatestRecommended;
+    latestRecommendedInput.setAttribute(
+      "aria-label",
+      "隐藏最新微博中的“荐读”"
+    );
+    latestRecommendedLabel.append(
+      latestRecommendedInput,
+      createElement("span", "隐藏最新微博中的“荐读”")
+    );
+    latestRecommendedInput.addEventListener("change", () => {
+      const previous = pageCleanupPreferences.hideLatestRecommended;
+      const next = latestRecommendedInput.checked === true;
+      const saved = savePageCleanupPreference(
+        HIDE_LATEST_RECOMMENDED_KEY,
+        next
+      );
+      if (!saved.ok) {
+        latestRecommendedInput.checked = previous;
+        status.textContent = "页面设置未能保存。";
+        return;
+      }
+      pageCleanupPreferences.hideLatestRecommended = next;
+      try {
+        applyPageCleanupStyles();
+        installLatestFeedRecommendationFilter();
+      } catch (_) {
+        pageCleanupPreferences.hideLatestRecommended = previous;
+        savePageCleanupPreference(HIDE_LATEST_RECOMMENDED_KEY, previous);
+        latestRecommendedInput.checked = previous;
+        try {
+          applyPageCleanupStyles();
+          installLatestFeedRecommendationFilter();
+        } catch (_) {
+          // The previous fail-closed state remains the recovery boundary.
+        }
+        status.textContent = "“荐读”隐藏设置未能应用，微博内容未改变。";
+        return;
+      }
+      status.textContent = next
+        ? "已隐藏最新微博中明确标记为“荐读”的内容。"
+        : "已恢复被隐藏的“荐读”内容。";
+    });
+    body.append(
+      latestRecommendedLabel,
+      createElement(
+        "p",
+        "隐藏微博在“最新微博”时间线中明确标记为“荐读”的内容。",
+        "wfr-muted"
+      )
+    );
+
+    body.append(createElement("h3", "主页增强"));
+    const profileExtrasLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row"
+    );
+    const profileExtrasInput = createElement("input");
+    profileExtrasInput.type = "checkbox";
+    profileExtrasInput.checked = pageCleanupPreferences.showProfileExtras;
+    profileExtrasInput.setAttribute("aria-label", "显示主页小档案");
+    profileExtrasLabel.append(
+      profileExtrasInput,
+      createElement("span", "显示主页小档案")
+    );
+    profileExtrasInput.addEventListener("change", () => {
+      const previous = pageCleanupPreferences.showProfileExtras;
+      const next = profileExtrasInput.checked === true;
+      const saved = savePageCleanupPreference(SHOW_PROFILE_EXTRAS_KEY, next);
+      if (!saved.ok) {
+        profileExtrasInput.checked = previous;
+        status.textContent = "主页小档案设置未能保存。";
+        return;
+      }
+      pageCleanupPreferences.showProfileExtras = next;
+      if (next) {
+        ensureProfileExtras();
+      } else {
+        teardownProfileExtras(false);
+      }
+      status.textContent = next
+        ? "已启用其他用户主页的 Toolkit 本地小档案与访问记录。"
+        : "已停止显示主页小档案和记录主页访问。";
+    });
+    body.append(
+      profileExtrasLabel,
+      createElement(
+        "p",
+        "仅使用 Toolkit 已有的本地关系记录；启用后会按当前微博账号记录访问次数和上次访问时间，不会请求新的微博数据。",
+        "wfr-muted"
+      )
+    );
+
+    body.append(createElement("h3", "使用统计"));
+    const usageEnabledLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row"
+    );
+    const usageEnabledInput = createElement("input");
+    usageEnabledInput.type = "checkbox";
+    usageEnabledInput.checked = usageEnabledPreference;
+    usageEnabledInput.setAttribute("aria-label", "记录网页版使用统计");
+    usageEnabledLabel.append(
+      usageEnabledInput,
+      createElement("span", "记录网页版使用统计")
+    );
+    usageEnabledInput.addEventListener("change", () => {
+      const previous = usageEnabledPreference;
+      const next = usageEnabledInput.checked === true;
+      const saved = savePageCleanupPreference(USAGE_ENABLED_KEY, next);
+      if (!saved.ok) {
+        usageEnabledInput.checked = previous;
+        status.textContent = "使用统计设置未能保存。";
+        return;
+      }
+      usageEnabledPreference = next;
+      if (next) {
+        const started = startUsageTracking(true);
+        if (!started.ok) {
+          usageEnabledPreference = previous;
+          savePageCleanupPreference(USAGE_ENABLED_KEY, previous);
+          usageEnabledInput.checked = previous;
+          stopUsageTracking(false);
+          status.textContent =
+            "当前无法安全启动使用统计；设置未改变，也没有开始记录。";
+          return;
+        }
+        status.textContent = "已开始在本浏览器记录网页版使用统计。";
+      } else {
+        stopUsageTracking(true);
+        status.textContent = "已停止记录；已有统计会保留到手动清空。";
+      }
+      syncUsageCorner();
+    });
+    body.append(
+      usageEnabledLabel,
+      createElement(
+        "p",
+        "仅在本浏览器本地记录活跃时间和浏览数量，不保存微博正文或具体浏览历史。",
+        "wfr-muted"
+      )
+    );
+
+    const usageCornerLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row"
+    );
+    const usageCornerInput = createElement("input");
+    usageCornerInput.type = "checkbox";
+    usageCornerInput.checked = usageCornerPreference;
+    usageCornerInput.setAttribute("aria-label", "在页面角落显示今日统计");
+    usageCornerLabel.append(
+      usageCornerInput,
+      createElement("span", "在页面角落显示今日统计")
+    );
+    usageCornerInput.addEventListener("change", () => {
+      const previous = usageCornerPreference;
+      const next = usageCornerInput.checked === true;
+      const saved = savePageCleanupPreference(USAGE_CORNER_KEY, next);
+      if (!saved.ok) {
+        usageCornerInput.checked = previous;
+        status.textContent = "角落统计设置未能保存。";
+        return;
+      }
+      usageCornerPreference = next;
+      syncUsageCorner();
+      status.textContent = next
+        ? usageEnabledPreference
+          ? "已显示今日统计。"
+          : "角落统计已准备；开启使用统计后显示。"
+        : "已隐藏角落统计。";
+    });
+    const usageActions = createElement("div", null, "wfr-actions");
+    const usagePanelButton = createElement(
+      "button",
+      "查看微博计步器",
+      "wfr-button"
+    );
+    usagePanelButton.type = "button";
+    usagePanelButton.addEventListener("click", showUsageStatistics);
+    usageActions.append(usagePanelButton);
+    body.append(
+      usageCornerLabel,
+      createElement(
+        "p",
+        "开启记录后，可在页面角落显示“今日 N 分钟 · N 条”的轻量计数。",
+        "wfr-muted"
+      ),
+      usageActions
+    );
+
     body.append(createElement("h3", "页面净化"));
     body.append(createElement("h3", "侧栏"));
     appendToggle(
@@ -7820,6 +10054,25 @@
     cleanupActions.append(cleanupButton);
     cleanupSection.append(cleanupTitle, cleanupActions);
     body.append(cleanupSection);
+
+    if (bundledReleaseVersionsThrough(APP_VERSION).length > 0) {
+      const changelogFooter = createElement(
+        "p",
+        null,
+        "wfr-changelog-footer wfr-muted"
+      );
+      const changelogButton = createElement(
+        "button",
+        `v${APP_VERSION} · 更新记录`,
+        "wfr-button wfr-changelog-link"
+      );
+      changelogButton.type = "button";
+      changelogButton.addEventListener("click", () => {
+        showUpdateHistory(APP_VERSION);
+      });
+      changelogFooter.append(changelogButton);
+      body.append(changelogFooter);
+    }
   }
 
   // Toolkit-only appearance preference: it changes nothing but Toolkit styling.
@@ -7944,6 +10197,28 @@
       .wfr-module { margin-top: 22px; }
       .wfr-body h3 { margin: 18px 0 6px; font-size: 15px; }
       .wfr-body h3:first-child { margin-top: 0; }
+      .wfr-profile-extras { box-sizing: border-box; position: relative; margin: 0 0 7px; padding: 2px 16px 7px; background: transparent; color: var(--wfr-muted); font: 12px/1.35 system-ui, sans-serif; font-weight: 400; }
+      .wfr-profile-row { margin: 2px 0; overflow-wrap: anywhere; font-weight: 400; }
+      .wfr-profile-label { color: var(--wfr-muted); }
+      .wfr-profile-name-row { position: relative; width: max-content; max-width: 100%; margin: 3px 0; }
+      .wfr-profile-name-trigger { appearance: none; border: 0; padding: 0; background: transparent; color: var(--wfr-button-text); font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
+      .wfr-profile-name-trigger:focus-visible, .wfr-profile-name-close:focus-visible { outline: 2px solid var(--wfr-primary-bg); outline-offset: 2px; }
+      .wfr-profile-name-popover { position: absolute; top: calc(100% + 5px); left: 0; z-index: 20; box-sizing: border-box; min-width: 220px; max-width: min(320px, calc(100vw - 48px)); padding: 9px 11px; border: 1px solid var(--wfr-border); border-radius: 6px; background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: 0 6px 18px rgba(0,0,0,.18); }
+      .wfr-profile-name-popover-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+      .wfr-profile-name-close { appearance: none; border: 0; padding: 1px 3px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
+      .wfr-profile-name-list { max-height: 180px; margin: 7px 0 0; padding-left: 20px; overflow-y: auto; }
+      .wfr-changelog-list { margin: 7px 0; padding-left: 22px; }
+      .wfr-changelog-footer { margin: 18px 0 0; }
+      .wfr-changelog-link { padding: 3px 7px; font-size: 12px; opacity: .78; }
+      .wfr-changelog-link:hover, .wfr-changelog-link:focus-visible { opacity: 1; }
+      .wfr-release-history { padding: 8px 0; border-bottom: 1px solid var(--wfr-border); }
+      .wfr-release-history:first-child { padding-top: 0; }
+      .wfr-release-history summary { cursor: pointer; font-weight: 600; }
+      .wfr-release-history-content { padding: 2px 0 2px 12px; }
+      .wfr-release-history-content h3 { margin: 8px 0 3px; font-size: 13px; }
+      .wfr-release-history-content .wfr-changelog-list { margin: 3px 0 5px; }
+      .wfr-usage-corner { position: fixed; right: 18px; bottom: 58px; z-index: 2147482999; padding: 4px 8px; border: 1px solid var(--wfr-launcher-border); border-radius: 999px; background: var(--wfr-launcher-bg); color: var(--wfr-launcher-text); box-shadow: none; font: 11px/1.35 system-ui, sans-serif; opacity: .68; cursor: pointer; }
+      .wfr-usage-corner:hover, .wfr-usage-corner:focus-visible { opacity: 1; border-color: var(--wfr-launcher-hover-border); }
       .wfr-toolkit-launcher { position: fixed; right: 18px; bottom: 18px; z-index: 2147483000; display: inline-flex; align-items: center; gap: 7px; padding: 8px 14px; border: 1px solid var(--wfr-launcher-border); border-radius: 999px; background: var(--wfr-launcher-bg); color: var(--wfr-launcher-text); box-shadow: none; font: 13px/1.35 system-ui, sans-serif; opacity: .9; transition: opacity 100ms ease, background-color 100ms ease, border-color 100ms ease; }
       .wfr-toolkit-launcher:hover, .wfr-toolkit-launcher:focus-visible { border-color: var(--wfr-launcher-hover-border); background: var(--wfr-launcher-hover-bg); opacity: 1; }
       .wfr-launcher-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 19px; height: 19px; padding: 0 6px; box-sizing: border-box; border-radius: 999px; background: var(--wfr-badge-bg); color: var(--wfr-badge-text); font-size: 11px; font-weight: 700; line-height: 1; }
@@ -7961,12 +10236,18 @@
   currentTheme = loadTheme();
   pageCleanupPreferences = loadPageCleanupPreferences();
   preferLatestFeed = loadPageCleanupPreference(PREFER_LATEST_FEED_KEY);
+  usageEnabledPreference = loadPageCleanupPreference(USAGE_ENABLED_KEY);
+  usageCornerPreference = loadPageCleanupPreference(USAGE_CORNER_KEY);
   installStyles();
   applyPageCleanupStyles();
   registerMenuCommands();
   installToolkitLauncher();
   installLatestFeedRouteHook();
   maybeNormalizeHomeToLatest();
+  installLatestFeedRecommendationFilter();
+  ensureProfileExtras();
+  if (usageEnabledPreference) startUsageTracking(false);
+  scheduleBundledChangelogAutoShow();
   setTimeout(
     () => void checkAutomaticUpdatesSequentially(),
     AUTO_STARTUP_DELAY_MS

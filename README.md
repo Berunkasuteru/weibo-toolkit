@@ -42,13 +42,27 @@ Toolkit-owned UI provides **跟随系统 / 浅色 / 深色** appearance options.
 
 ## Page Settings
 
-**页面设置** contains optional, local preferences for Weibo's page UI. All five options default to **关闭**; a fresh install or normal upgrade leaves the page unchanged until you explicitly enable one.
+**页面设置** contains optional, local preferences for Weibo's page UI. All options default to **关闭**; a fresh install or normal upgrade leaves the page unchanged until you explicitly enable one.
 
 Under **时间线**, **首页优先进入最新微博** may send the first eligible Home visit in each browser tab/session to Weibo's native, time-ordered **最新微博** route. It is a preference, not a permanent lock: after that one automatic entry you can switch to Weibo's native **全部关注** and remain there. Profile, Hot, Video, post-detail, private-message, and other non-Home routes are not forcibly redirected.
+
+**隐藏最新微博中的“荐读”** optionally hides only cards that current Weibo explicitly marks with its dedicated **荐读** badge in the authenticated owner's native Latest Feed. It defaults to **关闭** and is not a generic keyword or post-content filter.
 
 Under **页面净化**, you may independently enable **隐藏微博热搜**, **隐藏整个右侧栏**, **隐藏顶部推荐入口**, and **隐藏顶部视频入口**. Disabling an option restores normal page behavior immediately. **隐藏整个右侧栏** hides every sidebar module, including potentially useful content such as Creator Center and recommendations; it is not an advertisement-only filter.
 
 Page Settings are stored only in userscript-local browser storage, add no telemetry or background API requests, and are excluded from Backup v2. They handle only explicitly identified page components and do not identify feed advertisements or filter post text.
+
+### Profile Extras
+
+Optional **显示主页小档案** adds lightweight local facts to other users' `/u/<UID>` profiles. Depending on what Toolkit has actually observed, this can show locally recorded historical nicknames, the most recent stored relationship event, the earliest provable local record, the previous profile visit, and **累计访问次数**. It defaults to **关闭**, uses existing local Friend Radar/Follower Snapshot data, makes no additional profile API request, and does not claim a complete nickname or relationship history or a real follow date.
+
+### 微博计步器
+
+Optional **记录网页版使用统计** estimates active time and counts distinct feed posts that qualified as viewed; **在页面角落显示今日统计** adds a small optional counter. Both default to **关闭**. Statistics stay in the current browser, and the feature stores no post text, author analytics, media, or detailed browsing-history timeline.
+
+## Update History
+
+From v0.8.1, Toolkit may show the current version's bundled **新功能** notice once after an update or fresh install. Intentional dismissal prevents repeat display for that version, while **更新记录** on Toolkit Home can reopen verified public release notes from v0.3.0 onward. No release notes are fetched from the network.
 
 ## Follower Snapshot and follower changes
 
@@ -124,6 +138,8 @@ A single **Weibo Toolkit：打开工具箱** userscript menu command remains ava
 
 Tested with Tampermonkey on Chrome, Edge, Vivaldi, and Firefox. Violentmonkey is expected to be compatible but is not part of the current real-browser validation set.
 
+Weibo Toolkit is intended for desktop Weibo web usage. Mobile Safari and iPhone/iPad Weibo web are not currently supported.
+
 For Edge and other Chromium browsers, if userscripts do not run after installing Tampermonkey, open the browser's extension settings and ensure userscript execution is allowed. Depending on the browser and extension version, enabling developer mode may also be required.
 
 Install `.user.js` files through Tampermonkey, Violentmonkey, or Greasy Fork. Do not launch them by double-clicking in Windows Script Host.
@@ -158,7 +174,7 @@ Existing version 1 backups remain restorable. A v1 file contains Friend Radar da
 
 Restore validates the whole file before writing anything, requires the backup owner UID to match the current authenticated account, and shows a preview before confirmation. A confirmed restore completely replaces the covered modules for that account; it does not merge data. Export the current data first if you may need it later.
 
-Backups deliberately exclude environment-local and temporary information: automatic-update settings and their attempt/cooldown timestamps, appearance and Page Settings preferences, and the short-lived markers used to reconcile removals the Toolkit itself performed. Backups never contain login credentials or request authentication data.
+Backups deliberately exclude environment-local and temporary information: automatic-update settings and their attempt/cooldown timestamps, appearance and Page Settings preferences, Profile Extras visit footprints, usage statistics, changelog state, and the short-lived markers used to reconcile removals the Toolkit itself performed. Backups never contain login credentials or request authentication data.
 
 Existing v0.2.0-v0.6.0 state remains compatible with normal in-place upgrades, so a backup is not required merely to upgrade.
 
@@ -187,7 +203,9 @@ Automatic update is optional and defaults to **关闭**. Available intervals are
 
 ## Status
 
-v0.8.0 — current release. Adds local, default-off Page Settings: one per-tab preference for entering Weibo's native Latest Feed on the first eligible Home visit, plus reversible controls for hiding Hot Search, the whole right sidebar, and the top Recommendation or Video entries. These settings do not enter Backup v2 and do not add advertisement or post-content filtering.
+v0.8.1 — current release. Adds optional exact-badge “荐读” filtering in Latest Feed, local Profile Extras with historical nickname and visit-footprint display, local Weibo StepMeter usage statistics, and bundled Update History with a one-time current-version notice. All new page/usage features default to off, add no telemetry, and remain outside Backup v2.
+
+v0.8.0 — added local, default-off Page Settings: one per-tab preference for entering Weibo's native Latest Feed on the first eligible Home visit, plus reversible controls for hiding Hot Search, the whole right sidebar, and the top Recommendation or Video entries. These settings do not enter Backup v2 and do not add advertisement or post-content filtering.
 
 v0.7.1 — maintenance release for Follower Snapshot automatic updates, automatic-result visibility, and Follower Hygiene filtering/layout.
 
