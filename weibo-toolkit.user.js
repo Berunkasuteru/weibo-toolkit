@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.8.3
+// @version      0.9.0
 // @description  Local-first Weibo toolkit for relationship tracking, follower tools, PM export, and optional page enhancements.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -922,7 +922,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.8.3";
+  const APP_VERSION = "0.9.0";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -1022,6 +1022,12 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.9.0": Object.freeze({
+      improved: Object.freeze([
+        "项目源码拆分为可维护的有序源码片段，发布脚本仍保持单文件",
+        "新增可复现构建与源码/发布文件一致性校验",
+      ]),
+    }),
     "0.8.3": Object.freeze({
       improved: Object.freeze([
         "“隐藏荐读”现在同时支持首页和“最新微博”",
