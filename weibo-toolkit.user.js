@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.8.2
+// @version      0.8.3
 // @description  Local-first Weibo toolkit for relationship tracking, follower tools, PM export, and optional page enhancements.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -922,7 +922,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.8.2";
+  const APP_VERSION = "0.8.3";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -1022,6 +1022,14 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.8.3": Object.freeze({
+      improved: Object.freeze([
+        "“隐藏荐读”现在同时支持首页和“最新微博”",
+      ]),
+      fixed: Object.freeze([
+        "修复首页中明确标记为“荐读”的内容不会被该设置隐藏的问题",
+      ]),
+    }),
     "0.8.2": Object.freeze({
       improved: Object.freeze([
         "项目说明改为中文主导，安装、隐私与功能边界更清晰",
@@ -3248,13 +3256,19 @@
   function isLatestFeedRoute() {
     if (
       typeof location === "undefined" ||
-      location.origin !== WEIBO_MAIN_ORIGIN ||
-      location.pathname !== "/mygroups"
+      location.origin !== WEIBO_MAIN_ORIGIN
     ) {
       return false;
     }
     const target = resolveLatestFeedUrl();
-    if (target === null || typeof location.href !== "string") return false;
+    if (target === null) return false;
+    if (location.pathname === "/") return true;
+    if (
+      location.pathname !== "/mygroups" ||
+      typeof location.href !== "string"
+    ) {
+      return false;
+    }
     try {
       const currentUrl = new URL(location.href);
       const targetUrl = new URL(target);
@@ -9697,11 +9711,11 @@
       pageCleanupPreferences.hideLatestRecommended;
     latestRecommendedInput.setAttribute(
       "aria-label",
-      "隐藏最新微博中的“荐读”"
+      "隐藏信息流中的“荐读”"
     );
     latestRecommendedLabel.append(
       latestRecommendedInput,
-      createElement("span", "隐藏最新微博中的“荐读”")
+      createElement("span", "隐藏信息流中的“荐读”")
     );
     latestRecommendedInput.addEventListener("change", () => {
       const previous = pageCleanupPreferences.hideLatestRecommended;
@@ -9733,14 +9747,14 @@
         return;
       }
       status.textContent = next
-        ? "已隐藏最新微博中明确标记为“荐读”的内容。"
+        ? "已隐藏首页和“最新微博”中明确标记为“荐读”的内容。"
         : "已恢复被隐藏的“荐读”内容。";
     });
     body.append(
       latestRecommendedLabel,
       createElement(
         "p",
-        "隐藏微博在“最新微博”时间线中明确标记为“荐读”的内容。",
+        "仅隐藏首页和“最新微博”中微博明确标记为“荐读”的内容，不扫描微博正文关键词。",
         "wfr-muted"
       )
     );
