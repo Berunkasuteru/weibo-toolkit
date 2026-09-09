@@ -1,10 +1,51 @@
 
   function showPageSettings() {
-    const body = showPanel("页面设置", true);
-    const status = createElement("p", "", "wfr-muted");
+    const body = showPanel("浏览体验", true);
+    const status = createElement("p", "", "wfr-muted wfr-browse-status");
+    const tabList = createElement("div", null, "wfr-browse-tabs");
+    tabList.setAttribute("role", "tablist");
+    tabList.setAttribute("aria-label", "浏览体验分类");
+    const tabs = [];
 
-    function appendToggle(labelText, key, property, description) {
-      const label = createElement("label", null, "wfr-toggle wfr-row");
+    function createBrowseTab(id, labelText, selected) {
+      const button = createElement("button", labelText, "wfr-browse-tab");
+      button.type = "button";
+      button.id = `wfr-browse-tab-${id}`;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-controls", `wfr-browse-panel-${id}`);
+      button.setAttribute("aria-selected", selected ? "true" : "false");
+      const panel = createElement("section", null, "wfr-browse-panel");
+      panel.id = `wfr-browse-panel-${id}`;
+      panel.setAttribute("role", "tabpanel");
+      panel.setAttribute("aria-labelledby", button.id);
+      panel.hidden = !selected;
+      const tab = { button, panel };
+      tabs.push(tab);
+      button.addEventListener("click", () => {
+        for (const candidate of tabs) {
+          const isSelected = candidate === tab;
+          candidate.button.setAttribute(
+            "aria-selected",
+            isSelected ? "true" : "false"
+          );
+          candidate.panel.hidden = !isSelected;
+        }
+      });
+      tabList.append(button);
+      return panel;
+    }
+
+    const feedPanel = createBrowseTab("feed", "信息流", true);
+    const enhancementPanel = createBrowseTab("enhancement", "增强", false);
+    const cleanupPanel = createBrowseTab("cleanup", "净化", false);
+    body.append(tabList, feedPanel, enhancementPanel, cleanupPanel);
+
+    function appendToggle(container, labelText, key, property, description) {
+      const label = createElement(
+        "label",
+        null,
+        "wfr-toggle wfr-row wfr-setting-label"
+      );
       const input = createElement("input");
       input.type = "checkbox";
       input.checked = pageCleanupPreferences[property];
@@ -36,12 +77,23 @@
         }
         status.textContent = next ? "已隐藏所选页面组件。" : "已恢复所选页面组件。";
       });
-      body.append(label);
-      if (description) body.append(createElement("p", description, "wfr-muted"));
+      container.append(label);
+      if (description) {
+        container.append(
+          createElement(
+            "p",
+            description,
+            "wfr-muted wfr-setting-description"
+          )
+        );
+      }
     }
 
-    body.append(createElement("h3", "时间线"));
-    const latestLabel = createElement("label", null, "wfr-toggle wfr-row");
+    const latestLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row wfr-setting-label"
+    );
     const latestInput = createElement("input");
     latestInput.type = "checkbox";
     latestInput.checked = preferLatestFeed;
@@ -53,7 +105,7 @@
       const saved = savePageCleanupPreference(PREFER_LATEST_FEED_KEY, next);
       if (!saved.ok) {
         latestInput.checked = previous;
-        status.textContent = "页面设置未能保存。";
+        status.textContent = "浏览体验偏好未能保存。";
         return;
       }
       preferLatestFeed = next;
@@ -62,19 +114,19 @@
         ? "每个标签页首次进入微博首页时将打开最新微博。"
         : "已停止自动进入最新微博。";
     });
-    body.append(
+    feedPanel.append(
       latestLabel,
       createElement(
         "p",
         "每个标签页首次打开微博首页时自动进入按时间排序的“最新微博”。",
-        "wfr-muted"
+        "wfr-muted wfr-setting-description"
       )
     );
 
     const latestRecommendedLabel = createElement(
       "label",
       null,
-      "wfr-toggle wfr-row"
+      "wfr-toggle wfr-row wfr-setting-label"
     );
     const latestRecommendedInput = createElement("input");
     latestRecommendedInput.type = "checkbox";
@@ -82,11 +134,11 @@
       pageCleanupPreferences.hideLatestRecommended;
     latestRecommendedInput.setAttribute(
       "aria-label",
-      "隐藏信息流中的“荐读”"
+      "隐藏信息流中的推广内容"
     );
     latestRecommendedLabel.append(
       latestRecommendedInput,
-      createElement("span", "隐藏信息流中的“荐读”")
+      createElement("span", "隐藏信息流中的推广内容")
     );
     latestRecommendedInput.addEventListener("change", () => {
       const previous = pageCleanupPreferences.hideLatestRecommended;
@@ -97,7 +149,7 @@
       );
       if (!saved.ok) {
         latestRecommendedInput.checked = previous;
-        status.textContent = "页面设置未能保存。";
+        status.textContent = "浏览体验偏好未能保存。";
         return;
       }
       pageCleanupPreferences.hideLatestRecommended = next;
@@ -119,22 +171,132 @@
       }
       status.textContent = next
         ? "已隐藏首页和“最新微博”中明确标记为“荐读”的内容。"
-        : "已恢复被隐藏的“荐读”内容。";
+        : "已停止隐藏信息流推广内容；强力规则偏好会保留但不生效。";
     });
-    body.append(
+    feedPanel.append(
       latestRecommendedLabel,
       createElement(
         "p",
-        "仅隐藏首页和“最新微博”中微博明确标记为“荐读”的内容，不扫描微博正文关键词。",
-        "wfr-muted"
+        "默认仅隐藏明确标记为“荐读”的内容。",
+        "wfr-muted wfr-setting-description"
       )
     );
 
-    body.append(createElement("h3", "主页增强"));
+    const strongPromotionLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row wfr-setting-label wfr-suboption"
+    );
+    const strongPromotionInput = createElement("input");
+    strongPromotionInput.type = "checkbox";
+    strongPromotionInput.checked =
+      pageCleanupPreferences.strongFeedPromotionFilter;
+    strongPromotionInput.setAttribute(
+      "aria-label",
+      "使用强力规则（可能误伤）"
+    );
+    strongPromotionLabel.append(
+      strongPromotionInput,
+      createElement("span", "使用强力规则（可能误伤）")
+    );
+    strongPromotionInput.addEventListener("change", () => {
+      const previous = pageCleanupPreferences.strongFeedPromotionFilter;
+      const next = strongPromotionInput.checked === true;
+      const saved = savePageCleanupPreference(
+        STRONG_FEED_PROMOTION_FILTER_KEY,
+        next
+      );
+      if (!saved.ok) {
+        strongPromotionInput.checked = previous;
+        status.textContent = "强力过滤偏好未能保存。";
+        return;
+      }
+      pageCleanupPreferences.strongFeedPromotionFilter = next;
+      try {
+        applyPageCleanupStyles();
+        installLatestFeedRecommendationFilter();
+      } catch (_) {
+        pageCleanupPreferences.strongFeedPromotionFilter = previous;
+        savePageCleanupPreference(STRONG_FEED_PROMOTION_FILTER_KEY, previous);
+        strongPromotionInput.checked = previous;
+        try {
+          applyPageCleanupStyles();
+          installLatestFeedRecommendationFilter();
+        } catch (_) {
+          // The previous fail-closed state remains the recovery boundary.
+        }
+        status.textContent = "强力过滤规则未能应用，微博内容未改变。";
+        return;
+      }
+      status.textContent = next
+        ? pageCleanupPreferences.hideLatestRecommended
+          ? "已启用强力推广过滤。"
+          : "已保存强力规则偏好；启用上方推广过滤后才会生效。"
+        : "已停用强力规则，精确“荐读”规则保持不变。";
+    });
+    feedPanel.append(
+      strongPromotionLabel,
+      createElement(
+        "p",
+        "额外识别推荐、广告等推广标签和明确广告模块。",
+        "wfr-muted wfr-setting-description wfr-suboption-description"
+      )
+    );
+
+    const autoExpandLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row wfr-setting-label"
+    );
+    const autoExpandInput = createElement("input");
+    autoExpandInput.type = "checkbox";
+    autoExpandInput.checked = pageCleanupPreferences.autoExpandLongPosts;
+    autoExpandInput.setAttribute("aria-label", "自动展开长微博");
+    autoExpandLabel.append(
+      autoExpandInput,
+      createElement("span", "自动展开长微博")
+    );
+    autoExpandInput.addEventListener("change", () => {
+      const previous = pageCleanupPreferences.autoExpandLongPosts;
+      const next = autoExpandInput.checked === true;
+      const saved = savePageCleanupPreference(AUTO_EXPAND_LONG_POSTS_KEY, next);
+      if (!saved.ok) {
+        autoExpandInput.checked = previous;
+        status.textContent = "自动展开偏好未能保存。";
+        return;
+      }
+      pageCleanupPreferences.autoExpandLongPosts = next;
+      try {
+        installLatestFeedRecommendationFilter();
+      } catch (_) {
+        pageCleanupPreferences.autoExpandLongPosts = previous;
+        savePageCleanupPreference(AUTO_EXPAND_LONG_POSTS_KEY, previous);
+        autoExpandInput.checked = previous;
+        try {
+          installLatestFeedRecommendationFilter();
+        } catch (_) {
+          // The previous fail-closed state remains the recovery boundary.
+        }
+        status.textContent = "自动展开未能启动，微博正文未改变。";
+        return;
+      }
+      status.textContent = next
+        ? "已启用视口内长微博自动展开。"
+        : "已停止后续自动展开；已经展开的正文不会被强制收起。";
+    });
+    feedPanel.append(
+      autoExpandLabel,
+      createElement(
+        "p",
+        "首页和“最新微博”中自动展开进入视野的外层长微博正文；可能触发微博自身的正文加载。",
+        "wfr-muted wfr-setting-description"
+      )
+    );
+
     const profileExtrasLabel = createElement(
       "label",
       null,
-      "wfr-toggle wfr-row"
+      "wfr-toggle wfr-row wfr-setting-label"
     );
     const profileExtrasInput = createElement("input");
     profileExtrasInput.type = "checkbox";
@@ -163,20 +325,19 @@
         ? "已启用其他用户主页的 Toolkit 本地小档案与访问记录。"
         : "已停止显示主页小档案和记录主页访问。";
     });
-    body.append(
+    enhancementPanel.append(
       profileExtrasLabel,
       createElement(
         "p",
-        "仅使用 Toolkit 已有的本地关系记录；启用后会按当前微博账号记录访问次数和上次访问时间，不会请求新的微博数据。",
-        "wfr-muted"
+        "使用 Toolkit 已有本地关系记录显示历史昵称等资料，并记录当前浏览器的访问次数和上次访问时间；不新增个人主页请求。",
+        "wfr-muted wfr-setting-description"
       )
     );
 
-    body.append(createElement("h3", "使用统计"));
     const usageEnabledLabel = createElement(
       "label",
       null,
-      "wfr-toggle wfr-row"
+      "wfr-toggle wfr-row wfr-setting-label"
     );
     const usageEnabledInput = createElement("input");
     usageEnabledInput.type = "checkbox";
@@ -214,19 +375,19 @@
       }
       syncUsageCorner();
     });
-    body.append(
+    enhancementPanel.append(
       usageEnabledLabel,
       createElement(
         "p",
-        "仅在本浏览器本地记录活跃时间和浏览数量，不保存微博正文或具体浏览历史。",
-        "wfr-muted"
+        "仅在当前浏览器记录估算活跃时间和浏览数量，不保存微博正文或详细浏览历史。",
+        "wfr-muted wfr-setting-description"
       )
     );
 
     const usageCornerLabel = createElement(
       "label",
       null,
-      "wfr-toggle wfr-row"
+      "wfr-toggle wfr-row wfr-setting-label wfr-suboption"
     );
     const usageCornerInput = createElement("input");
     usageCornerInput.type = "checkbox";
@@ -253,7 +414,11 @@
           : "角落统计已准备；开启使用统计后显示。"
         : "已隐藏角落统计。";
     });
-    const usageActions = createElement("div", null, "wfr-actions");
+    const usageActions = createElement(
+      "div",
+      null,
+      "wfr-actions wfr-compact-actions"
+    );
     const usagePanelButton = createElement(
       "button",
       "查看微博计步器",
@@ -262,46 +427,53 @@
     usagePanelButton.type = "button";
     usagePanelButton.addEventListener("click", showUsageStatistics);
     usageActions.append(usagePanelButton);
-    body.append(
+    enhancementPanel.append(
       usageCornerLabel,
       createElement(
         "p",
-        "开启记录后，可在页面角落显示“今日 N 分钟 · N 条”的轻量计数。",
-        "wfr-muted"
+        "开启记录后，可在页面角落显示今日分钟数和浏览数量。",
+        "wfr-muted wfr-setting-description wfr-suboption-description"
       ),
       usageActions
     );
 
-    body.append(createElement("h3", "页面净化"));
-    body.append(createElement("h3", "侧栏"));
+    cleanupPanel.append(createElement("h3", "侧栏"));
     appendToggle(
+      cleanupPanel,
       "隐藏微博热搜",
       HIDE_HOT_SEARCH_KEY,
       "hideHotSearch",
-      "仅隐藏微博热搜模块，可随时恢复。"
+      "隐藏右侧热搜模块，可随时恢复。"
     );
     appendToggle(
+      cleanupPanel,
       "隐藏整个右侧栏",
       HIDE_RIGHT_SIDEBAR_KEY,
       "hideRightSidebar",
-      "会同时隐藏热搜、推荐、创作者中心等全部右侧栏模块。"
+      "隐藏热搜、推荐、创作者中心等整个右侧区域。"
     );
 
-    body.append(createElement("h3", "顶部导航"));
+    cleanupPanel.append(createElement("h3", "顶部导航"));
     appendToggle(
+      cleanupPanel,
       "隐藏顶部推荐入口",
       HIDE_TOP_RECOMMEND_KEY,
       "hideTopRecommend"
     );
-    appendToggle("隐藏顶部视频入口", HIDE_TOP_VIDEO_KEY, "hideTopVideo");
-    body.append(
-      status,
+    appendToggle(
+      cleanupPanel,
+      "隐藏顶部视频入口",
+      HIDE_TOP_VIDEO_KEY,
+      "hideTopVideo"
+    );
+    cleanupPanel.append(
       createElement(
         "p",
         "仅隐藏明确列出的页面组件，不处理信息流内容。",
-        "wfr-muted"
+        "wfr-muted wfr-setting-description"
       )
     );
+    body.append(status);
   }
 
   function showToolkitHome() {
@@ -435,16 +607,16 @@
     );
     followerSection.append(followerActions);
 
-    const cleanupSection = createElement("div", null, "wfr-module");
-    const cleanupTitle = createElement("p", null, "wfr-row");
-    cleanupTitle.append(createElement("strong", "页面设置"));
-    const cleanupActions = createElement("div", null, "wfr-actions");
-    const cleanupButton = createElement("button", "页面设置", "wfr-button");
-    cleanupButton.type = "button";
-    cleanupButton.addEventListener("click", showPageSettings);
-    cleanupActions.append(cleanupButton);
-    cleanupSection.append(cleanupTitle, cleanupActions);
-    body.append(cleanupSection);
+    const browseSection = createElement("div", null, "wfr-module");
+    const browseTitle = createElement("p", null, "wfr-row");
+    browseTitle.append(createElement("strong", "浏览体验"));
+    const browseActions = createElement("div", null, "wfr-actions");
+    const browseButton = createElement("button", "浏览体验", "wfr-button");
+    browseButton.type = "button";
+    browseButton.addEventListener("click", showPageSettings);
+    browseActions.append(browseButton);
+    browseSection.append(browseTitle, browseActions);
+    body.append(browseSection);
 
     if (bundledReleaseVersionsThrough(APP_VERSION).length > 0) {
       const changelogFooter = createElement(
@@ -545,6 +717,19 @@
       .wfr-search { width: 100%; box-sizing: border-box; margin-top: 12px; padding: 6px 9px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
       .wfr-select { margin-left: 8px; padding: 5px 8px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
       .wfr-toggle { display: flex; align-items: center; gap: 8px; }
+      .wfr-browse-tabs { display: flex; gap: 4px; margin: -4px 0 8px; border-bottom: 1px solid var(--wfr-border); }
+      .wfr-browse-tab { appearance: none; border: 0; border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0; background: transparent; color: var(--wfr-muted); padding: 6px 11px 5px; font: inherit; font-weight: 600; cursor: pointer; }
+      .wfr-browse-tab:hover { color: var(--wfr-button-text); background: var(--wfr-card-bg); }
+      .wfr-browse-tab[aria-selected="true"] { color: var(--wfr-button-text); border-bottom-color: var(--wfr-primary-bg); background: var(--wfr-card-bg); }
+      .wfr-browse-tab:focus-visible { outline: 2px solid var(--wfr-primary-bg); outline-offset: 2px; }
+      .wfr-browse-panel { padding-top: 2px; }
+      .wfr-browse-panel[hidden] { display: none; }
+      .wfr-setting-label { margin: 5px 0 1px; }
+      .wfr-setting-description { margin: 0 0 7px; padding-left: 22px; font-size: 12.5px; line-height: 1.4; }
+      .wfr-suboption { margin-left: 22px; }
+      .wfr-suboption-description { margin-left: 22px; }
+      .wfr-browse-status { margin: 9px 0 0; }
+      .wfr-browse-status:empty { display: none; }
       .wfr-event-list { display: grid; gap: 10px; margin-top: 14px; }
       .wfr-event { border: 1px solid var(--wfr-border); border-radius: 6px; padding: 10px 12px; background: var(--wfr-card-bg); }
       .wfr-event h3 { margin: 0 0 6px; font-size: 14px; }
@@ -585,9 +770,12 @@
       .wfr-confirm-list { max-height: 190px; overflow-y: auto; margin: 6px 0 10px; padding: 6px 8px 6px 26px; border: 1px solid var(--wfr-border); border-radius: 5px; }
       .wfr-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
       .wfr-actions .wfr-primary { margin: 0; }
+      .wfr-compact-actions { margin-top: 6px; }
       .wfr-module { margin-top: 22px; }
       .wfr-body h3 { margin: 18px 0 6px; font-size: 15px; }
       .wfr-body h3:first-child { margin-top: 0; }
+      .wfr-browse-panel h3 { margin: 10px 0 4px; }
+      .wfr-browse-panel h3:first-child { margin-top: 2px; }
       .wfr-profile-extras { box-sizing: border-box; position: relative; margin: 0 0 7px; padding: 2px 16px 7px; background: transparent; color: var(--wfr-muted); font: 12px/1.35 system-ui, sans-serif; font-weight: 400; }
       .wfr-profile-row { margin: 2px 0; overflow-wrap: anywhere; font-weight: 400; }
       .wfr-profile-label { color: var(--wfr-muted); }
@@ -624,6 +812,14 @@
     GM_registerMenuCommand("Weibo Toolkit：打开工具箱", showToolkitHome);
   }
 
+  function scheduleNormalSurfaceStartupCoordinators() {
+    scheduleBundledChangelogAutoShow();
+    setTimeout(
+      () => void checkAutomaticUpdatesSequentially(),
+      AUTO_STARTUP_DELAY_MS
+    );
+  }
+
   currentTheme = loadTheme();
   pageCleanupPreferences = loadPageCleanupPreferences();
   preferLatestFeed = loadPageCleanupPreference(PREFER_LATEST_FEED_KEY);
@@ -633,14 +829,8 @@
   applyPageCleanupStyles();
   registerMenuCommands();
   installToolkitLauncher();
-  installLatestFeedRouteHook();
-  maybeNormalizeHomeToLatest();
-  installLatestFeedRecommendationFilter();
-  ensureProfileExtras();
+  installPageRouteHook();
+  syncPageRouteFeatures();
   if (usageEnabledPreference) startUsageTracking(false);
-  scheduleBundledChangelogAutoShow();
-  setTimeout(
-    () => void checkAutomaticUpdatesSequentially(),
-    AUTO_STARTUP_DELAY_MS
-  );
+  scheduleNormalSurfaceStartupCoordinators();
 })();

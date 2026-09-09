@@ -777,21 +777,25 @@
     }
   }
 
-  function scheduleLatestFeedRouteCheck() {
-    if (latestFeedRouteCheckScheduled) return;
-    latestFeedRouteCheckScheduled = true;
+  function syncPageRouteFeatures() {
+    maybeNormalizeHomeToLatest();
+    installLatestFeedRecommendationFilter();
+    ensureProfileExtras();
+    handleUsageRouteChange();
+  }
+
+  function schedulePageRouteSync() {
+    if (pageRouteSyncScheduled) return;
+    pageRouteSyncScheduled = true;
     setTimeout(() => {
-      latestFeedRouteCheckScheduled = false;
-      maybeNormalizeHomeToLatest();
-      installLatestFeedRecommendationFilter();
-      ensureProfileExtras();
-      handleUsageRouteChange();
+      pageRouteSyncScheduled = false;
+      syncPageRouteFeatures();
     }, 0);
   }
 
-  function installLatestFeedRouteHook() {
+  function installPageRouteHook() {
     if (
-      latestFeedRouteHookInstalled ||
+      pageRouteHookInstalled ||
       typeof location === "undefined" ||
       location.origin !== WEIBO_MAIN_ORIGIN
     ) {
@@ -808,17 +812,17 @@
     }
     const routeHistory = routeWindow && routeWindow.history;
     if (!routeHistory) return;
-    latestFeedRouteHookInstalled = true;
+    pageRouteHookInstalled = true;
     for (const method of ["pushState", "replaceState"]) {
       const original = routeHistory[method];
       if (typeof original !== "function") continue;
       routeHistory[method] = function (...args) {
         const result = original.apply(this, args);
-        scheduleLatestFeedRouteCheck();
+        schedulePageRouteSync();
         return result;
       };
     }
     if (typeof routeWindow.addEventListener === "function") {
-      routeWindow.addEventListener("popstate", scheduleLatestFeedRouteCheck);
+      routeWindow.addEventListener("popstate", schedulePageRouteSync);
     }
   }

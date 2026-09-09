@@ -3,7 +3,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.9.0";
+  const APP_VERSION = "0.9.1";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -68,6 +68,10 @@
   const PREFER_LATEST_FEED_KEY = "weiboToolkit.page.preferLatestFeed.v1";
   const HIDE_LATEST_RECOMMENDED_KEY =
     "weiboToolkit.page.hideLatestRecommended.v1";
+  const STRONG_FEED_PROMOTION_FILTER_KEY =
+    "weiboToolkit.page.strongFeedPromotionFilter.v1";
+  const AUTO_EXPAND_LONG_POSTS_KEY =
+    "weiboToolkit.page.autoExpandLongPosts.v1";
   const SHOW_PROFILE_EXTRAS_KEY =
     "weiboToolkit.page.showProfileExtras.v1";
   const PROFILE_VISIT_STORAGE_PREFIX =
@@ -92,6 +96,15 @@
   const PAGE_PREFERENCE_STYLE_ID = "wfr-page-preferences-style";
   const LATEST_RECOMMENDED_HIDDEN_CLASS =
     "wfr-latest-recommended-hidden";
+  const STRONG_FEED_PROMOTION_HIDDEN_CLASS =
+    "wfr-strong-feed-promotion-hidden";
+  const STRONG_FEED_PROMOTION_TAG_TEXTS = Object.freeze([
+    "荐读",
+    "广告",
+    "推荐",
+    "推广",
+  ]);
+  const AUTO_EXPAND_INTERSECTION_RATIO = 0.25;
   const PROFILE_EXTRAS_ID = "wfr-profile-extras";
   const WEIBO_MAIN_ORIGIN = "https://weibo.com";
   const AUTO_CHANGELOG_FROM_VERSION = "0.8.1";
@@ -103,6 +116,16 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.9.1": Object.freeze({
+      added: Object.freeze([
+        "新增可选“强力规则”，可进一步尝试隐藏推荐、广告等推广标签和明确广告模块",
+        "新增“自动展开长微博”，可在首页和“最新微博”中自动展开进入视野的外层长微博",
+      ]),
+      improved: Object.freeze([
+        "“页面设置”整理为“浏览体验”，并分为“信息流 / 增强 / 净化”三个页签",
+        "整理页面功能与启动任务的生命周期边界，减少互相干扰",
+      ]),
+    }),
     "0.9.0": Object.freeze({
       improved: Object.freeze([
         "项目源码拆分为可维护的有序源码片段，发布脚本仍保持单文件",
@@ -273,12 +296,15 @@
   let pageCleanupPreferences = null;
   let pagePreferenceStyleNode = null;
   let preferLatestFeed = false;
-  let latestFeedRouteHookInstalled = false;
-  let latestFeedRouteCheckScheduled = false;
+  let pageRouteHookInstalled = false;
+  let pageRouteSyncScheduled = false;
   let latestFeedNavigationPending = false;
   let latestRecommendedObserver = null;
   let latestRecommendedRoot = null;
   let latestRecommendedDiscoveryObserver = null;
+  let longPostIntersectionObserver = null;
+  let longPostObservedControls = new Set();
+  let longPostClickedControlStates = new WeakMap();
   let profileExtrasObserver = null;
   let profileExtrasObservedMain = null;
   let profileExtrasObservedHost = null;
