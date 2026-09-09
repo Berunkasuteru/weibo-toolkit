@@ -1,214 +1,237 @@
 # Weibo Toolkit
 
-A local-first userscript toolkit for Weibo. It currently includes Friend Radar, Follower Snapshot with follower-change tracking and local follower hygiene, and current-conversation private-message Markdown export.
+一个本地优先的微博桌面网页版用户脚本工具箱，用于记录关系变化、查看粉丝快照、导出当前私信会话，以及提供可选的页面增强。
 
-The visible product brand is **Weibo Toolkit**. The current product UI is Chinese-focused and does not yet provide a full internationalized interface or language selector.
+产品界面以中文为主。除“移除粉丝”外，主要功能均为只读或仅修改浏览器本地数据；所有页面增强和使用统计默认关闭。
 
-## Friend Radar
+## 先看重要边界
 
-Friend Radar manually snapshots the API-visible following list and compares successful snapshots by stable UID. It records when an account:
+- **关系雷达**只能记录微博接口当前返回的可见关注结果，不是完整社交关系档案。
+- “从可见关注列表消失”只表示接口不再返回该账号，**不等于**取关、拉黑、销号或任何确定原因。
+- **粉丝快照**同样只是 API 可见结果，微博可能过滤部分粉丝，不能保证完整。
+- **私信导出**只包含接口在导出时实际返回的当前普通一对一会话内容，不是账号级完整私信备份。
+- **页面设置、主页小档案和微博计步器全部默认关闭**，升级后不会自动改变微博页面外观或开始记录使用统计。
+- **移除粉丝**是主要功能中唯一会修改真实微博关系的操作；每次都需要确认，并受顺序、限速和遇错停止规则约束。
+- 当前面向桌面微博网页；Mobile Safari、iPhone 和 iPad 微博网页暂不支持。
 
-- appears in the visible following list;
-- disappears from the visible following list;
-- starts following you;
-- stops following you;
-- changes its screen name.
+## 安装与首次使用
 
-It does not guess why an account disappeared. The first successful run creates a baseline and no historical events.
+目标页面：
 
-### What "follow-me" changes actually cover
+```text
+https://weibo.com/
+```
 
-Friend Radar tracks only the following list that Weibo's API makes visible to you. Follow-me changes — *starts following you* and *stops following you* — are observed **only for accounts present in that API-visible following list**, that is, accounts you follow and that the API returns.
+典型环境：桌面 Chrome、Edge、Firefox 或 Safari，加 Tampermonkey 或兼容的用户脚本管理器。当前实际浏览器验证覆盖 Tampermonkey on Chrome、Edge、Vivaldi 和 Firefox；未验证的平台不作额外兼容性承诺。
 
-Friend Radar does **not** crawl your complete followers/fans list. If someone who follows you is not in your API-visible following list, Friend Radar never sees them, and their unfollowing you produces no event. This is therefore not complete "who unfollowed me" monitoring.
+1. 安装 Tampermonkey 或兼容用户脚本管理器。
+2. 从现有 Greasy Fork 条目安装 **Weibo Toolkit - Friend Radar**，或将完整的 `weibo-toolkit.user.js` 手动安装为一个用户脚本。
+3. 登录并打开 `https://weibo.com/`。
+4. 刷新页面。
+5. 页面右下角应出现 **Weibo Toolkit** 启动器。
 
-### While an update runs
+用户脚本菜单中还保留一个 **Weibo Toolkit：打开工具箱** 入口，作为启动器不可用时的后备方式。
 
-During **立即更新**, Friend Radar shows live progress — current page, requests made, validated records read, and the total the API reports — updated only after a page has been received and validated. The reported total is shown as-is and is not treated as an exact completion percentage.
+### 没有看到启动器？
 
-### Events, details and timelines
+如果 Tampermonkey 显示当前页面没有运行脚本，请依次确认：
 
-Each stored event opens a detail view showing its type, the stored display name, the stable UID, the detection time, and the truthful before/after relationship meaning. From there you can open a per-person **relationship timeline**, keyed on stable UID and ordered newest first. A nickname change keeps one timeline; two accounts sharing a nickname stay separate. The event list can be filtered with a plain nickname/UID search.
+- 使用的是桌面浏览器，而不是 iPhone/iPad/Mobile Safari；
+- 地址确实是 `https://weibo.com/`，私信导出页面则是微博当前的 `https://api.weibo.com/chat...`；
+- 用户脚本已启用；
+- 浏览器已允许 Tampermonkey 访问该站点；
+- 修改用户脚本后已经保存并刷新微博页面。
 
-A timeline shows only events Weibo Toolkit actually observed and stored. It is not the complete real-world relationship history.
+手动安装的副本不会自动获得用户脚本版本更新。升级时应在原有脚本上替换内容并保存，不要删除后另建第二份脚本，以免本地存储变得不可访问。
 
-### Relationship overview and event exports
+## 主要功能
 
-The lower-right launcher shows a small unread-event badge when stored events remain unread. **关系概览** separates the current visible-following state from historical event-occurrence counts, so current account counts are not confused with the number of past changes.
+### 关系雷达
 
-Stored relationship events can be exported as UTF-8 CSV or Markdown for spreadsheet analysis, archival, or AI-assisted analysis. These exports contain only events Weibo Toolkit actually observed and stored; JSON backup remains the recovery format.
+关系雷达手动读取 API 可见关注列表，以稳定 UID 保存成功快照，并比较后续成功快照。它可以记录：
 
-Toolkit-owned UI provides **跟随系统 / 浅色 / 深色** appearance options. The default follows the browser/system `prefers-color-scheme` preference, while explicit light or dark mode affects only Weibo Toolkit and does not modify Weibo's own theme.
+- 账号出现在可见关注列表；
+- 账号从可见关注列表消失；
+- 可见列表中的账号开始关注你或停止关注你；
+- 昵称变化。
 
-## Page Settings
+第一次成功更新只建立基线，不生成历史事件。更新时会显示当前页、请求数和已验证记录数；接口报告总数只原样显示，不被当作精确进度。
 
-**页面设置** contains optional, local preferences for Weibo's page UI. All options default to **关闭**; a fresh install or normal upgrade leaves the page unchanged until you explicitly enable one.
+事件详情保留中性的前后状态。个人关系时间线按 UID 归并、按时间倒序显示；同名账号不会合并，改名也不会切断同一 UID 的时间线。事件列表可按昵称或 UID 搜索，并可导出 UTF-8 CSV 或 Markdown。导出只包含 Toolkit 已观察并保存的事件。
 
-Under **时间线**, **首页优先进入最新微博** may send the first eligible Home visit in each browser tab/session to Weibo's native, time-ordered **最新微博** route. It is a preference, not a permanent lock: after that one automatic entry you can switch to Weibo's native **全部关注** and remain there. Profile, Hot, Video, post-detail, private-message, and other non-Home routes are not forcibly redirected.
+“开始关注你 / 停止关注你”只覆盖同时存在于 API 可见关注列表中的账号；工具不会为此抓取完整粉丝列表。
 
-**隐藏最新微博中的“荐读”** optionally hides only cards that current Weibo explicitly marks with its dedicated **荐读** badge in the authenticated owner's native Latest Feed. It defaults to **关闭** and is not a generic keyword or post-content filter.
+### 粉丝快照与粉丝变化
 
-Under **页面净化**, you may independently enable **隐藏微博热搜**, **隐藏整个右侧栏**, **隐藏顶部推荐入口**, and **隐藏顶部视频入口**. Disabling an option restores normal page behavior immediately. **隐藏整个右侧栏** hides every sidebar module, including potentially useful content such as Creator Center and recommendations; it is not an advertisement-only filter.
+**更新粉丝快照**读取微博 API 当前返回的粉丝结果，并以稳定 UID 保存到当前浏览器。第一次成功更新只建立快照；后续更新可记录：
 
-Page Settings are stored only in userscript-local browser storage, add no telemetry or background API requests, and are excluded from Backup v2. They handle only explicitly identified page components and do not identify feed advertisements or filter post text.
+- 出现在 API 可见粉丝结果；
+- 从 API 可见粉丝结果消失。
 
-### Profile Extras
+这些描述不推断取关、拉黑、销号等原因。粉丝变化事件可以单条清除或确认后全部清空；清除事件不会修改微博关系，也不会删除粉丝快照。
 
-Optional **显示主页小档案** adds lightweight local facts to other users' `/u/<UID>` profiles. Depending on what Toolkit has actually observed, this can show locally recorded historical nicknames, the most recent stored relationship event, the earliest provable local record, the previous profile visit, and **累计访问次数**. It defaults to **关闭**, uses existing local Friend Radar/Follower Snapshot data, makes no additional profile API request, and does not claim a complete nickname or relationship history or a real follow date.
+### 粉丝体检
+
+**粉丝体检**只在最新成功粉丝快照上进行本地筛选，本身不向微博发送请求。可使用的事实条件包括：
+
+- 你没有关注该账号；
+- API 显示的公开微博数、粉丝数或关注数不高于指定值；
+- API 显示为未认证；
+- 注册日期晚于指定日期；
+- 关注来源属于推荐、个人主页、搜索、其他或未知来源。
+
+未知值不会匹配数值阈值。结果每页 50 条；换页或修改筛选会清空当前选择。工具不提供“选择全部结果”或自动清理，也不会给账号贴“机器人”“僵尸粉”等判断标签。
+
+### 移除粉丝
+
+粉丝体检结果支持单个 **移除粉丝**，也支持对当前页手动选择的账号执行 **移除所选粉丝**。两者都会修改真实微博关系，移除后相关账号将不再是你的粉丝，Toolkit 无法自动撤销。
+
+安全边界：
+
+- 每批最多 50 个账号，且只能来自当前页；
+- 每次操作前明确确认；
+- 请求逐个顺序发送，不并发；
+- 每个已验证成功后约等待 3 秒；
+- 不自动重试；
+- 一旦失败、结果无法确认或用户停止，剩余请求不再发送；
+- 没有“移除全部筛选结果”或后台自动移除。
+
+成功移除不会伪造粉丝快照变化。需要再次更新粉丝快照，才能看到接口当前返回的结果。
+
+### 自动更新
+
+关系雷达和粉丝快照分别提供可选自动更新，默认均为 **关闭**。可选间隔为 24、48、72 小时、7 天或 15 天。
+
+自动更新只在打开或刷新桌面微博页面后检查一次，不是浏览器后台服务，不会轮询，也永远不会自动移除粉丝。失败不会进入连续重试。浏览器无法提供可靠跨标签锁时，自动更新会安全跳过。
+
+### 页面设置
+
+所有页面选项默认关闭，且不进入 Backup v2：
+
+- **首页优先进入最新微博**：每个标签页首次符合条件进入首页时，可跳转一次到微博原生“最新微博”；之后用户可切回“全部关注”并停留。
+- **隐藏最新微博中的“荐读”**：只隐藏微博用专用“荐读”标记明确标出的卡片，不扫描正文关键词，也不是通用广告过滤器。
+- **隐藏微博热搜**、**隐藏整个右侧栏**、**隐藏顶部推荐入口**、**隐藏顶部视频入口**：彼此独立，可随时恢复。
+
+### 主页小档案
+
+可选 **显示主页小档案** 默认关闭，只作用于其他用户的 `/u/<UID>` 主页，不作用于当前账号自己的主页。
+
+它只复用当前浏览器里已有的关系雷达、粉丝快照和事件数据，可能显示：
+
+- 历史昵称（仅 Toolkit 本地实际记录过的名称）；
+- 最近一条本地关系记录；
+- 能由现有持久数据证明的最早本地记录；
+- 上次访问；
+- 当前浏览器中的累计访问次数。
+
+历史昵称通过紧凑的语义化浮层查看。主页小档案不新增个人主页 API 请求，不声称“完整曾用名”“真实关注日期”或“完整关系历史”。访问足迹仅包含目标 UID、次数和最后访问时间，不进入 Backup v2。
 
 ### 微博计步器
 
-Optional **记录网页版使用统计** estimates active time and counts distinct feed posts that qualified as viewed; **在页面角落显示今日统计** adds a small optional counter. Both default to **关闭**. Statistics stay in the current browser, and the feature stores no post text, author analytics, media, or detailed browsing-history timeline.
+可选 **记录网页版使用统计** 和 **在页面角落显示今日统计** 均默认关闭。
 
-## Update History
+启用后可查看：
 
-From v0.8.1, Toolkit may show the current version's bundled **新功能** notice once after an update or fresh install. Intentional dismissal prevents repeat display for that version, while **更新记录** on Toolkit Home can reopen verified public release notes from v0.3.0 onward. No release notes are fetched from the network.
+- 今日估算活跃时间；
+- 今日已浏览的不同微博数量；
+- 当前标签页的估算活跃时间和不同微博数量。
 
-## Follower Snapshot and follower changes
+活跃时间要求页面可见、有焦点且最近有真实交互；60 秒无活动后暂停。帖子需要约 50% 可见并持续约 800 毫秒才计入，当天按稳定帖子 ID 去重。当前日结束后会丢弃具体 ID，只保留最多 90 天的每日活跃秒数和数量汇总。
 
-**更新粉丝快照** reads the follower result Weibo's API currently makes visible and stores it locally as a Follower Snapshot. A snapshot records **the API-visible follower result**, which is not necessarily the complete real follower relationship: Weibo's API may filter some followers, and the UI states this caveat.
+统计仅保存在当前浏览器；不保存微博正文、作者浏览分析、媒体、滚动位置或逐条浏览时间线。可确认后清空当前账号的使用统计，不影响微博数据或其他 Toolkit 模块。
 
-The first successful update only stores the first snapshot and creates no historical changes. Every later successful update is compared against the previous successful snapshot and records two neutral event types:
+### 更新记录
 
-- a follower appears in the API-visible result;
-- a follower disappears from the API-visible result.
+从 v0.8.1 起，新版本可在首次符合条件的启动时显示一次当前版本的 **新功能**；用户主动关闭后，该版本不会反复弹出。Toolkit Home 的 **更新记录** 可随时重新打开从 v0.3.0 起有公开 tag 证据的版本说明。
 
-A disappearance only means the account is no longer present in the current API-visible result. Weibo Toolkit cannot determine the reason from that alone, and does not present it as unfollowing, blocking, or account deletion.
+全部内容随用户脚本内置，不从 GitHub 或其他服务器读取。旧版本不会依次自动弹出。
 
-In **粉丝变化** you can clear a single record with **清除这条**, or clear them all with **清空变化事件** (confirmation required). This only removes the change records stored locally; it never modifies Weibo relationships or the stored snapshot.
+### 私信 Markdown 导出
 
-Follower Snapshot automatic update is a separate setting, defaults to **关闭**, and offers 24 hours, 48 hours, 72 hours, 7 days, and 15 days. It is checked once when you open or reload web Weibo, does not run as a browser background service, and never removes followers. If the visible follower set exceeds the automatic-update safety range (roughly 100 pages at 20 records per page), that automatic run is skipped, the stored snapshot is left unchanged, and manual update remains available.
+在微博网页版私信中手动打开一个普通一对一会话后，使用会话界面的 **导出 Markdown**。Toolkit 会按顺序读取当前接口实际可访问的历史，并生成本地 `.md` 文件。
 
-## Follower Hygiene
+支持选择保存位置的浏览器会先显示保存对话框；取消时不发起历史请求、不生成文件。其他浏览器使用普通下载流程。
 
-**粉丝体检** filters the latest successful Follower Snapshot locally and sends no further request to Weibo by itself. Every available condition is a factual description:
+`WEIBO_PM_AI_3` 使用紧凑 A/B 对话格式，保留消息顺序、正文、源时间语义，以及图片、链接和不支持消息的标记。Toolkit 本身不调用 AI API。
 
-- the account is not followed by you;
-- the API reports 0 public posts;
-- the account is unverified;
-- followers ≤ / following ≤ a chosen number;
-- registered after a chosen date;
-- follow source: Recommendation, Profile, Search, Other sources, or Unknown source (several may be selected; belonging to any one of them counts as a match).
+范围限制：
 
-Results are paginated locally at 50 per page. Selection applies to the current page only, and changing pages or filters clears it. There is **no** "remove all matched results" and no one-click cleanup. Cards always show the raw follow-source text returned by the API; the source groups exist only for filtering and for the filter summary.
+- 只导出用户当前手动选择的普通一对一会话；
+- 不自动遍历全部会话；
+- 不支持群聊、服务/公共消息文件夹；
+- 不下载媒体；
+- 不恢复私信；
+- 不发送、删除或撤回消息；
+- 不主动修改未读状态；
+- 接口没有返回、已删除、已撤回或不可访问的内容可能缺失。
 
-Weibo Toolkit presents evidence, not judgement: it never labels accounts as bots, spam, or anything similar.
+导出文件是本地明文。虽然元数据不写入 A/B 与真实账号的映射、UID 或昵称，消息正文自身仍可能含有个人信息。把文件交给第三方服务属于用户与该服务之间的独立隐私边界。
 
-## Removing followers
+## 数据与隐私
 
-From the Follower Hygiene results you can remove one account with **移除粉丝**, or select several and use **移除所选粉丝**. Both modify real Weibo relationships — the affected accounts stop being your followers — and both require explicit confirmation.
+- 没有项目服务器、telemetry 或云同步。
+- 关系雷达、粉丝快照和对应事件按当前微博账号 UID 隔离，保存在用户脚本本地存储。
+- 页面设置、主页访问足迹、微博计步器和更新记录已读状态都是当前浏览器的环境数据，不进入 Backup v2。
+- 自动更新设置、尝试/冷却时间、外观设置和移除协调标记同样不进入 Backup v2。
+- 清除浏览器或用户脚本存储会删除或使本地数据不可访问。
+- 工具不会在备份中保存登录凭据或请求认证信息。
 
-Batch removal stays inside these bounds:
+## 备份与恢复
 
-- at most 50 selected accounts at a time, all from the current page;
-- requests are sent one at a time, never concurrently;
-- roughly 3 seconds pass after each validated successful removal before the next one;
-- no automatic retry;
-- a failure or an unconfirmable result stops the batch immediately, and the remaining accounts are never sent;
-- there is no "remove all matched results" and no automatic cleanup.
+**导出备份**生成当前账号的本地 JSON 文件。支持的浏览器可显示原生“另存为”，否则由浏览器下载设置决定保存位置。
 
-Weibo Toolkit does not automatically undo or replay removals. After a successful removal the local snapshot still holds the pre-removal data; update the snapshot again to refresh it.
+Backup v2 包含：
 
-## Private-message Markdown export
+- 关系雷达快照和事件；
+- 粉丝快照和粉丝变化事件，或明确记录导出时不存在粉丝快照。
 
-Open an ordinary one-to-one conversation in Weibo's web private messages, then use **导出 Markdown** in that conversation. Weibo Toolkit reads the conversation history the API currently makes accessible, in order, and produces a local `.md` file.
+恢复前会完整验证文件，要求当前登录账号与备份 owner UID 一致，并显示替换预览。确认后完整替换备份覆盖的当前账号本地模块，不做合并。
 
-Browsers that support choosing a save location show the save dialog first, and the export starts only after a destination is chosen; cancelling that dialog issues no request and creates no file. Browsers without that capability keep using the normal download flow, with identical content and filename.
+旧 Backup v1 仍可恢复。v1 只覆盖关系雷达，因此恢复 v1 时会保留当前粉丝快照和粉丝变化，不会清空它们。
 
-The `WEIBO_PM_AI_3` format uses a compact A/B transcript that reduces repeated structure while preserving message order, message bodies, source time semantics, and markers for images, links, and unsupported messages, so the file can be handed to an AI that reads Markdown or long text. Weibo Toolkit itself never calls an AI API.
+普通原地升级兼容现有 v0.2.0–v0.8.2 本地状态，不需要仅为升级而恢复备份。跨浏览器、跨设备或卸载/重装前建议先导出。
 
-The export covers only the ordinary one-to-one conversation you manually selected. It does not support group chats, service/public message folders, automatically walking every conversation, media downloads, message recovery, or background sync. The file contains only the messages Weibo's API actually returned at export time; deleted, recalled, inaccessible, or unreturned content may be missing.
+## 已知限制
 
-Conversation history is read with same-origin GET requests. The Toolkit does not send, delete, or recall messages, does not deliberately change read state, does not build a message database, and does not upload exports.
+- API 可见关注数可能不同于微博显示总数。
+- 关系变化发生在多页扫描期间时，可能出现一次短暂观察。
+- 关系时间线只覆盖 Toolkit 实际观察并保存的事件。
+- 粉丝快照可能被微博过滤；“消失”不揭示原因。
+- 多标签页写入使用浏览器锁协调，但不是数据库级事务；浏览器无法安全协调时会失败或跳过，而不是静默覆盖。
+- 切换微博账号后，应刷新页面再使用 Toolkit。
+- 关系雷达单次最多 100 个请求；达到上限时不保存不完整结果。按每页 20 条估算约为 2,000 条可见记录，但这不是精确账号规模上限。
+- 粉丝快照单次最多读取 100 个非空页，并可额外发送 1 个终止验证请求；达到安全上限时不保存结果。
+- 私信导出只代表导出时接口实际返回的当前会话可访问历史。
+- 移除粉丝会修改真实关系，无法自动撤销或重放。
 
-The exported file is local plain text. It omits any mapping between A/B and real accounts and writes no UID or nickname into the export metadata, but message bodies are kept as-is and may themselves contain personal or identifying information. If you later submit the file to a third-party AI service, that service's data handling is a separate privacy boundary between you and it.
+## 开发与测试
 
-## Installation
+当前发布产物仍是单一文件：
 
-Install with [Tampermonkey](https://www.tampermonkey.net/) and Greasy Fork:
+```text
+weibo-toolkit.user.js
+```
 
-1. Install the Tampermonkey extension in your browser.
-2. Install **Weibo Toolkit - Friend Radar** from its Greasy Fork page.
-3. Open authenticated `https://weibo.com/`.
-4. Reload the page.
-5. Use the lower-right **Weibo Toolkit** launcher.
-6. For PM export, open Weibo's web private-message page, select an ordinary one-to-one conversation, and use **导出 Markdown** in that conversation.
+仓库提供一组小型公开核心不变量测试，直接从实际 userscript 源码加载并调用产品函数，不复制产品算法：
 
-A single **Weibo Toolkit：打开工具箱** userscript menu command remains available as a fallback entry; individual functions are accessed from the Toolkit UI.
+```text
+node tests/run.js
+```
 
-Tested with Tampermonkey on Chrome, Edge, Vivaldi, and Firefox. Violentmonkey is expected to be compatible but is not part of the current real-browser validation set.
+维护者还使用更完整的本地回归工具；这些 exhaustive harnesses 和浏览器考古 fixture 不作为公共仓库的一部分。公开测试用于证明关键语义与安全声明，不替代完整发布验证。
 
-Weibo Toolkit is intended for desktop Weibo web usage. Mobile Safari and iPhone/iPad Weibo web are not currently supported.
+项目没有 npm 依赖，不需要 Jest、Vitest 或 Mocha。未来可能在独立阶段对生产源码做机械模块化；当前版本仍以 committed userscript 作为发布事实来源。
 
-For Edge and other Chromium browsers, if userscripts do not run after installing Tampermonkey, open the browser's extension settings and ensure userscript execution is allowed. Depending on the browser and extension version, enabling developer mode may also be required.
+## 版本状态
 
-Install `.user.js` files through Tampermonkey, Violentmonkey, or Greasy Fork. Do not launch them by double-clicking in Windows Script Host.
+当前公开版本：`v0.8.2`。
 
-### Manual source installation (developers / fallback)
+Toolkit 内的 **更新记录** 提供从 v0.3.0 起的简明公开版本历史。
 
-If you are working from source or Greasy Fork is unavailable, install manually with Tampermonkey or Violentmonkey:
+## English summary
 
-1. Create a new userscript.
-2. Paste the complete contents of `weibo-toolkit.user.js`.
-3. Save, then open authenticated `https://weibo.com/` and reload.
+Weibo Toolkit is a local-first userscript for desktop web Weibo. It provides relationship-change tracking, API-visible follower snapshots and local hygiene tools, bounded follower removal, current-conversation Markdown export, and optional page/profile/usage enhancements. The UI is Chinese-focused. Most data stays in userscript-local browser storage; there is no project telemetry or cloud service. Mobile Safari and iPhone/iPad Weibo web are not currently supported.
 
-Manually installed copies do not receive automatic userscript-version updates.
+## 许可证
 
-## Upgrade
-
-To upgrade, open the existing installed **Weibo Toolkit** userscript, replace its contents with the new `weibo-toolkit.user.js`, and save it in place. Do not delete the existing script first, and do not create a second installed copy as an upgrade procedure.
-
-Normal in-place upgrades preserve Friend Radar GM storage. Deleting or uninstalling the userscript may remove its storage or make that storage unavailable. Export a backup before uninstalling/reinstalling the userscript or moving to another browser or device. Backup Restore is the supported migration/recovery path and requires signing in to the backup's matching Weibo account. Do not assume separately created userscript copies automatically share GM storage.
-
-## Data and Privacy
-
-Data stays in userscript-local browser storage. There is no project server, telemetry, or continuous background service. Updates are manual unless the user explicitly enables the page-open automatic-update option. Clearing browser or userscript storage deletes the local baseline and event history.
-
-### Backup export and restore
-
-Weibo Toolkit can export the current account's validated local state as a JSON backup. On supported browsers export may show a native Save As dialog; otherwise the backup is handed to the browser's normal download system.
-
-Backups created by v0.7.0 use backup version 2 and contain both durable modules: Friend Radar state, and the Follower Snapshot together with its follower-change events. A version 2 file explicitly records whether a Follower Snapshot existed when it was exported, and restore reproduces exactly what the file records.
-
-Existing version 1 backups remain restorable. A v1 file contains Friend Radar data only, so restoring it replaces Friend Radar state and **leaves the current Follower Snapshot and follower-change records untouched** — it never clears them. The restore preview states which data the selected file will replace.
-
-Restore validates the whole file before writing anything, requires the backup owner UID to match the current authenticated account, and shows a preview before confirmation. A confirmed restore completely replaces the covered modules for that account; it does not merge data. Export the current data first if you may need it later.
-
-Backups deliberately exclude environment-local and temporary information: automatic-update settings and their attempt/cooldown timestamps, appearance and Page Settings preferences, Profile Extras visit footprints, usage statistics, changelog state, and the short-lived markers used to reconcile removals the Toolkit itself performed. Backups never contain login credentials or request authentication data.
-
-Existing v0.2.0-v0.6.0 state remains compatible with normal in-place upgrades, so a backup is not required merely to upgrade.
-
-### Optional automatic updates
-
-Automatic update is optional and defaults to **关闭**. Available intervals are 24 hours, 48 hours, 72 hours, 7 days, and 15 days. Friend Radar and Follower Snapshot have separate settings. Eligibility is checked once after web Weibo is opened or reloaded; Weibo Toolkit does not poll continuously in the browser background. The first snapshot must still be established manually for Friend Radar, manual update remains available for both, a failed automatic attempt does not enter a continuous retry loop, and automatic updates never remove followers.
-
-## Known Limitations
-
-- The API-visible following list may differ from Weibo's reported total.
-- Follow-me changes are observed only for accounts in the API-visible following list; the complete followers/fans list is never crawled, so this is not complete "who unfollowed me" monitoring.
-- The reason an account disappeared cannot be determined.
-- Relationship timelines cover only events Weibo Toolkit observed and stored, not the complete real-world history.
-- A relationship change during a multi-page scan can theoretically create a transient observation.
-- Automatic scans use narrow owner-scoped mutual exclusion; if reliable locking is unavailable, automatic scanning skips rather than racing.
-- With several Weibo tabs open, Weibo Toolkit coordinates local state writes so tabs do not overwrite each other's data. If the browser offers no reliable coordination, an operation fails safely instead of overwriting, and local data is left unchanged. This is not a database-grade transactional guarantee.
-- The Follower Snapshot records the API-visible follower result, which may be filtered by Weibo and is not necessarily the complete follower relationship.
-- A follower disappearing from the API-visible result does not reveal why; Weibo Toolkit cannot tell unfollowing, blocking, and account removal apart.
-- Follower removal modifies real Weibo relationships through Weibo's current web APIs, is never retried automatically, and is not undone or replayed by Weibo Toolkit.
-- Automatic updates only run when the Weibo web page is opened or reloaded, never as a browser background service. A very large visible follower set exceeds the automatic Snapshot safety range and is skipped, leaving the last successful snapshot in place.
-- Reload Weibo after switching accounts.
-- Local data is browser-local. Use backup export and matching-account restore for migration or recovery.
-- A single Friend Radar scan makes at most 100 requests and saves no scan result once that ceiling is reached. At 20 records per page this is roughly 2,000 visible records — an estimate derived from the request ceiling, not an exact account-size limit.
-- A single Follower Snapshot update reads at most 100 non-empty data pages and may make one additional terminal-verification request after them (that request only confirms the end of the list; it is not another page of data). When the safety ceiling is reached the result is not saved, and an incomplete result never replaces the previous successful snapshot.
-- A private-message export represents only the accessible history the conversation API actually returned at export time, not a complete account message backup; group chats, service/public folders, and media downloads are not supported.
-
-## Status
-
-v0.8.1 — current release. Adds optional exact-badge “荐读” filtering in Latest Feed, local Profile Extras with historical nickname and visit-footprint display, local Weibo StepMeter usage statistics, and bundled Update History with a one-time current-version notice. All new page/usage features default to off, add no telemetry, and remain outside Backup v2.
-
-v0.8.0 — added local, default-off Page Settings: one per-tab preference for entering Weibo's native Latest Feed on the first eligible Home visit, plus reversible controls for hiding Hot Search, the whole right sidebar, and the top Recommendation or Video entries. These settings do not enter Backup v2 and do not add advertisement or post-content filtering.
-
-v0.7.1 — maintenance release for Follower Snapshot automatic updates, automatic-result visibility, and Follower Hygiene filtering/layout.
-
-v0.7.0 — added Follower Snapshot with neutral follower-change records, local Follower Hygiene filtering, and explicit single/batch follower removal bounded at 50 selected accounts per batch. Backups moved to version 2 and cover Friend Radar plus the Follower Snapshot and its change records, while existing version 1 backups remain restorable and never clear follower data. Private-message Markdown export kept its `WEIBO_PM_AI_3` format and gained a save-location step on browsers that support it. Friend Radar behavior and its storage schema were unchanged; no migration was involved.
-
-v0.6.0 — added current-conversation private-message Markdown export with an AI-friendly compact A/B format, sequential long-history reading, progress, cancellation, and fail-closed pagination validation.
+[Mozilla Public License 2.0](LICENSE)
