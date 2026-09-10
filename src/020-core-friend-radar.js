@@ -3,7 +3,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.9.1";
+  const APP_VERSION = "0.9.2";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -116,6 +116,16 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.9.2": Object.freeze({
+      improved: Object.freeze([
+        "自动展开调整为“自动展开原创长微博”，并支持首页、“最新微博”和数字 UID 个人主页；转发微博保持折叠",
+        "改进信息流推广内容识别，并增强对当前微博卡片结构和虚拟列表复用的适配",
+      ]),
+      fixed: Object.freeze([
+        "修复页面加载时信息流尚未挂载，导致推广过滤或自动展开可能需要切换设置后才会启动的问题",
+        "修复正常滚动和虚拟列表复用过程中，新出现的推广卡片或原创长微博可能漏处理的问题",
+      ]),
+    }),
     "0.9.1": Object.freeze({
       added: Object.freeze([
         "新增可选“强力规则”，可进一步尝试隐藏推荐、广告等推广标签和明确广告模块",

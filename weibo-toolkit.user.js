@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.9.1
+// @version      0.9.2
 // @description  Local-first Weibo toolkit for relationship tracking, follower tools, PM export, and optional page enhancements.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -922,7 +922,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.9.1";
+  const APP_VERSION = "0.9.2";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -1035,6 +1035,16 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.9.2": Object.freeze({
+      improved: Object.freeze([
+        "自动展开调整为“自动展开原创长微博”，并支持首页、“最新微博”和数字 UID 个人主页；转发微博保持折叠",
+        "改进信息流推广内容识别，并增强对当前微博卡片结构和虚拟列表复用的适配",
+      ]),
+      fixed: Object.freeze([
+        "修复页面加载时信息流尚未挂载，导致推广过滤或自动展开可能需要切换设置后才会启动的问题",
+        "修复正常滚动和虚拟列表复用过程中，新出现的推广卡片或原创长微博可能漏处理的问题",
+      ]),
+    }),
     "0.9.1": Object.freeze({
       added: Object.freeze([
         "新增可选“强力规则”，可进一步尝试隐藏推荐、广告等推广标签和明确广告模块",
@@ -3154,6 +3164,13 @@
       totalStoredEvents: prepared.state.events.length,
     };
   }
+  let pageFeedReconcileHandle = null;
+  let pageFeedReconcileUsesAnimationFrame = false;
+  const PAGE_FEED_ROOT_DISCOVERY_DELAY_MS = 250;
+  const PAGE_FEED_ROOT_DISCOVERY_MAX_ATTEMPTS = 20;
+  let pageFeedRootDiscoveryTimer = null;
+  let pageFeedRootDiscoveryAttempts = 0;
+  let pageFeedRootDiscoveryRouteKey = null;
 
   function createElement(tag, text, className) {
     const element = document.createElement(tag);
@@ -3322,6 +3339,67 @@
     }
   }
 
+  function canonicalPageEnhancementLatestUid() {
+    if (
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN ||
+      location.pathname !== "/mygroups" ||
+      typeof location.href !== "string"
+    ) {
+      return null;
+    }
+    try {
+      const gid = new URL(location.href).searchParams.get("gid");
+      const match = /^11000([1-9]\d*)$/.exec(gid || "");
+      return match ? match[1] : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function isPageEnhancementFeedRoute() {
+    if (
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN ||
+      typeof location.pathname !== "string"
+    ) {
+      return false;
+    }
+    if (location.pathname === "/") return true;
+    const routeUid = canonicalPageEnhancementLatestUid();
+    if (routeUid === null) return false;
+    const configured = determineCurrentUid();
+    return !configured.ok || configured.uid === routeUid;
+  }
+
+  function isAutoExpandLongPostRoute() {
+    if (isPageEnhancementFeedRoute()) return true;
+    return Boolean(
+      typeof location !== "undefined" &&
+        location.origin === WEIBO_MAIN_ORIGIN &&
+        typeof location.pathname === "string" &&
+        /^\/u\/[1-9]\d*\/?$/.test(location.pathname)
+    );
+  }
+
+  function promotionFilterIsActiveForRoute() {
+    return Boolean(
+      pageCleanupPreferences.hideLatestRecommended &&
+        isPageEnhancementFeedRoute()
+    );
+  }
+
+  function autoExpandIsActiveForRoute() {
+    return Boolean(
+      pageCleanupPreferences.autoExpandLongPosts &&
+        isAutoExpandLongPostRoute()
+    );
+  }
+
+  function pageFeedFeaturesAreActiveForRoute() {
+    return promotionFilterIsActiveForRoute() || autoExpandIsActiveForRoute();
+  }
+
   function elementChildren(node) {
     return node && node.children ? Array.from(node.children) : [];
   }
@@ -3336,60 +3414,156 @@
     return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
   }
 
-  function acceptedOuterFeedParts(card) {
-    const article = elementChildren(card).find(
-      (child) => child.tagName === "ARTICLE"
-    );
-    if (!article) return null;
-    const articleBody = elementChildren(article).find(
-      (child) => child.tagName === "DIV"
-    );
-    if (!articleBody) return null;
-    const header = elementChildren(articleBody).find(
-      (child) => child.tagName === "HEADER"
-    );
-    const content = elementChildren(articleBody).find((child) =>
-      hasClass(child, "wbpro-feed-content")
-    );
-    return header && content ? { article, articleBody, header, content } : null;
+  function nearestAncestorTagBefore(node, boundary, tagName) {
+    for (let current = node?.parentElement; current && current !== boundary; ) {
+      if (current.tagName === tagName) return current;
+      current = current.parentElement;
+    }
+    return null;
+  }
+
+  function directChildWithin(node, ancestor) {
+    let current = node;
+    while (current?.parentElement && current.parentElement !== ancestor) {
+      current = current.parentElement;
+    }
+    return current?.parentElement === ancestor ? current : null;
+  }
+
+  function resolvePageFeedCardParts(card) {
+    if (
+      !hasClass(card, "wbpro-scroller-item") ||
+      typeof card.querySelectorAll !== "function"
+    ) {
+      return null;
+    }
+    const articles = [];
+    for (const article of [
+      ...elementChildren(card).filter((child) => child.tagName === "ARTICLE"),
+      ...card.querySelectorAll("article"),
+    ]) {
+      if (!articles.includes(article)) articles.push(article);
+    }
+    for (const article of articles) {
+      if (
+        hasAncestorClassBefore(article, card, "retweet") ||
+        hasAncestorClassBefore(article, card, "wbpro-feed-reText") ||
+        typeof article.querySelectorAll !== "function"
+      ) {
+        continue;
+      }
+      const headers = Array.from(article.querySelectorAll("header")).filter(
+        (candidate) =>
+          nearestAncestorTagBefore(candidate, card, "ARTICLE") === article &&
+          !hasAncestorClassBefore(candidate, article, "retweet") &&
+          !hasAncestorClassBefore(candidate, article, "wbpro-feed-reText")
+      );
+      const contents = Array.from(
+        article.querySelectorAll(".wbpro-feed-content")
+      ).filter(
+        (candidate) =>
+          nearestAncestorTagBefore(candidate, card, "ARTICLE") === article &&
+          !hasAncestorClassBefore(candidate, article, "retweet") &&
+          !hasAncestorClassBefore(candidate, article, "wbpro-feed-reText")
+      );
+      for (const content of contents) {
+        const contentBranch = directChildWithin(content, article);
+        const header =
+          headers.find(
+            (candidate) =>
+              directChildWithin(candidate, article) === contentBranch
+          ) || (headers.length === 1 ? headers[0] : null);
+        if (header) return { card, article, header, content };
+      }
+    }
+    return null;
+  }
+
+  function normalizedComponentText(node) {
+    const ownText = normalizeLatestRecommendedBadgeText(node?.textContent);
+    if (ownText !== "") return ownText;
+    const leafTexts = [];
+    walkElementSubtree(node, (descendant) => {
+      if (descendant !== node && elementChildren(descendant).length === 0) {
+        const text = normalizeLatestRecommendedBadgeText(
+          descendant.textContent
+        );
+        if (text !== "") leafTexts.push(text);
+      }
+    });
+    return normalizeLatestRecommendedBadgeText(leafTexts.join(" "));
+  }
+
+  function pageFeedTagComponents(header) {
+    const components = [];
+    walkElementSubtree(header, (node) => {
+      if (
+        node !== header &&
+        elementClassTokens(node).some((token) =>
+          token.startsWith("wbpro-tag")
+        )
+      ) {
+        components.push(node);
+      }
+    });
+    return components;
   }
 
   function effectiveStrongFeedPromotionFilter() {
     return Boolean(
-      pageCleanupPreferences.hideLatestRecommended &&
+      promotionFilterIsActiveForRoute() &&
         pageCleanupPreferences.strongFeedPromotionFilter
     );
   }
 
   function classifyLatestRecommendedCard(card, strongMode = false) {
-    const parts = acceptedOuterFeedParts(card);
-    if (!parts || typeof parts.header.querySelectorAll !== "function") {
-      return false;
-    }
-    const badgeComponents = parts.header.querySelectorAll(".wbpro-tag");
-    return Array.from(badgeComponents).some((component) => {
-      const preciseMatch = elementChildren(component).some(
-        (badgeNode) =>
-          badgeNode.tagName === "DIV" &&
-          normalizeLatestRecommendedBadgeText(badgeNode.textContent) === "荐读"
-      );
+    const parts = resolvePageFeedCardParts(card);
+    if (!parts) return false;
+    const tagMatch = pageFeedTagComponents(parts.header).some((component) => {
+      const componentText = normalizedComponentText(component);
+      const preciseMatch = componentText === "荐读";
       if (preciseMatch || !strongMode) return preciseMatch;
-      const componentTexts = [
-        normalizeLatestRecommendedBadgeText(component.textContent),
-        ...elementChildren(component).map((child) =>
-          normalizeLatestRecommendedBadgeText(child.textContent)
-        ),
-      ];
-      return componentTexts.some((text) =>
-        STRONG_FEED_PROMOTION_TAG_TEXTS.includes(text)
+      return STRONG_FEED_PROMOTION_TAG_TEXTS.some((token) =>
+        componentText.includes(token)
       );
     });
+    if (tagMatch || !strongMode) return tagMatch;
+    let hasFollowControl = false;
+    let hasNegativeFeedbackSemantic = false;
+    walkElementSubtree(parts.header, (node) => {
+      if (
+        node.hidden === true ||
+        node.getAttribute?.("aria-hidden") === "true"
+      ) {
+        return;
+      }
+      const text = normalizeLatestRecommendedBadgeText(node.textContent);
+      const role = node.getAttribute?.("role");
+      if (
+        (node.tagName === "A" ||
+          node.tagName === "BUTTON" ||
+          role === "button") &&
+        (text === "关注" || text === "+关注")
+      ) {
+        hasFollowControl = true;
+      }
+      const title = normalizeLatestRecommendedBadgeText(
+        node.getAttribute?.("title")
+      );
+      const accessibleLabel = normalizeLatestRecommendedBadgeText(
+        node.getAttribute?.("aria-label")
+      );
+      if (title === "负反馈" || accessibleLabel === "负反馈") {
+        hasNegativeFeedbackSemantic = true;
+      }
+    });
+    return hasFollowControl && hasNegativeFeedbackSemantic;
   }
 
   function applyLatestRecommendedVisibility(card) {
     if (!card || !card.classList) return;
     const shouldHide = Boolean(
-      pageCleanupPreferences.hideLatestRecommended &&
+      promotionFilterIsActiveForRoute() &&
         classifyLatestRecommendedCard(
           card,
           effectiveStrongFeedPromotionFilter()
@@ -3459,19 +3633,6 @@
     return null;
   }
 
-  function collectLatestRecommendedCards(node, cards) {
-    if (!node) return;
-    const ancestor = findLatestRecommendedCardAncestor(node);
-    if (ancestor) cards.add(ancestor);
-    if (node.nodeType !== 1 || typeof node.querySelectorAll !== "function") {
-      return;
-    }
-    if (hasClass(node, "wbpro-scroller-item")) cards.add(node);
-    for (const card of node.querySelectorAll(".wbpro-scroller-item")) {
-      cards.add(card);
-    }
-  }
-
   function hasAncestorClassBefore(node, boundary, className) {
     for (let current = node?.parentElement; current && current !== boundary; ) {
       if (hasClass(current, className)) return true;
@@ -3501,10 +3662,19 @@
     return null;
   }
 
+  function longPostDedupIdentity(card, parts) {
+    const postIdentity = longPostIdentity(parts);
+    if (postIdentity !== null) return postIdentity;
+    const dataIndex = card?.getAttribute?.("data-index");
+    return typeof dataIndex === "string" && dataIndex !== ""
+      ? `index:${dataIndex}`
+      : card;
+  }
+
   function validateLongPostExpandControl(control) {
     if (
       !pageCleanupPreferences.autoExpandLongPosts ||
-      !isLatestFeedRoute() ||
+      !isAutoExpandLongPostRoute() ||
       !latestRecommendedRoot ||
       !control ||
       control.nodeType !== 1 ||
@@ -3522,35 +3692,94 @@
     ) {
       return null;
     }
-    const parts = acceptedOuterFeedParts(card);
+    const parts = resolvePageFeedCardParts(card);
     if (
       !parts ||
+      typeof card.querySelector !== "function" ||
+      card.querySelector(".retweet") ||
+      card.querySelector(".wbpro-feed-reText") ||
       !parts.content.contains(control) ||
-      !hasAncestorClassBefore(control, parts.content, "wbpro-feed-ogText") ||
       hasAncestorClassBefore(control, card, "wbpro-feed-reText") ||
       hasAncestorClassBefore(control, card, "retweet")
     ) {
       return null;
     }
-    const identity = longPostIdentity(parts);
-    return identity === null ? null : { card, parts, identity };
+    return {
+      card,
+      parts,
+      identity: longPostDedupIdentity(card, parts),
+    };
+  }
+
+  function visibleAreaRatio(element) {
+    if (!element || typeof element.getBoundingClientRect !== "function") {
+      return null;
+    }
+    const rect = element.getBoundingClientRect();
+    const width = Number(rect.width) || Number(rect.right) - Number(rect.left);
+    const height = Number(rect.height) || Number(rect.bottom) - Number(rect.top);
+    if (!(width > 0) || !(height > 0)) return null;
+    const viewportWidth = Number(window?.innerWidth) || 0;
+    const viewportHeight = Number(window?.innerHeight) || 0;
+    if (!(viewportWidth > 0) || !(viewportHeight > 0)) return null;
+    const visibleWidth = Math.max(
+      0,
+      Math.min(Number(rect.right), viewportWidth) - Math.max(Number(rect.left), 0)
+    );
+    const visibleHeight = Math.max(
+      0,
+      Math.min(Number(rect.bottom), viewportHeight) - Math.max(Number(rect.top), 0)
+    );
+    return (visibleWidth * visibleHeight) / (width * height);
+  }
+
+  function longPostControlIsMeaningfullyVisible(control, card) {
+    const cardRatio = visibleAreaRatio(card);
+    if (cardRatio !== null && cardRatio <= 0) return false;
+    const controlRatio = visibleAreaRatio(control);
+    if (controlRatio !== null) {
+      return controlRatio >= AUTO_EXPAND_INTERSECTION_RATIO;
+    }
+    return (
+      cardRatio !== null && cardRatio >= AUTO_EXPAND_INTERSECTION_RATIO
+    );
+  }
+
+  function clickValidatedLongPostControl(control, validated) {
+    if (
+      !validated ||
+      longPostClickedControlStates.get(control) === validated.identity
+    ) {
+      return false;
+    }
+    longPostClickedControlStates.set(control, validated.identity);
+    if (longPostIntersectionObserver) {
+      longPostIntersectionObserver.unobserve(control);
+    }
+    longPostObservedControls.delete(control);
+    if (typeof control.click === "function") control.click();
+    return true;
   }
 
   function registerLongPostControls(card) {
-    if (
-      !longPostIntersectionObserver ||
-      !card ||
-      typeof card.querySelectorAll !== "function"
-    ) {
+    if (!card || typeof card.querySelectorAll !== "function") {
       return;
     }
     for (const control of card.querySelectorAll(".expand")) {
       const validated = validateLongPostExpandControl(control);
-      if (
-        !validated ||
-        longPostClickedControlStates.get(control) === validated.identity ||
-        longPostObservedControls.has(control)
-      ) {
+      if (!validated) continue;
+      if (longPostClickedControlStates.get(control) === validated.identity) {
+        if (longPostIntersectionObserver) {
+          longPostIntersectionObserver.unobserve(control);
+        }
+        longPostObservedControls.delete(control);
+        continue;
+      }
+      if (longPostControlIsMeaningfullyVisible(control, validated.card)) {
+        clickValidatedLongPostControl(control, validated);
+        continue;
+      }
+      if (!longPostIntersectionObserver || longPostObservedControls.has(control)) {
         continue;
       }
       longPostObservedControls.add(control);
@@ -3577,18 +3806,7 @@
       }
       const control = entry.target;
       const validated = validateLongPostExpandControl(control);
-      if (
-        !validated ||
-        longPostClickedControlStates.get(control) === validated.identity
-      ) {
-        continue;
-      }
-      longPostClickedControlStates.set(control, validated.identity);
-      if (longPostIntersectionObserver) {
-        longPostIntersectionObserver.unobserve(control);
-      }
-      longPostObservedControls.delete(control);
-      if (typeof control.click === "function") control.click();
+      clickValidatedLongPostControl(control, validated);
     }
   }
 
@@ -3604,43 +3822,77 @@
   function syncLongPostAutoExpand() {
     if (
       !pageCleanupPreferences.autoExpandLongPosts ||
-      !isLatestFeedRoute() ||
-      !latestRecommendedRoot ||
-      typeof IntersectionObserver !== "function"
+      !isAutoExpandLongPostRoute() ||
+      !latestRecommendedRoot
     ) {
       teardownLongPostAutoExpand();
       return false;
     }
-    if (!longPostIntersectionObserver) {
+    if (
+      !longPostIntersectionObserver &&
+      typeof IntersectionObserver === "function"
+    ) {
       longPostIntersectionObserver = new IntersectionObserver(
         processLongPostIntersections,
         { threshold: AUTO_EXPAND_INTERSECTION_RATIO }
       );
     }
     pruneLongPostControls();
-    for (const card of latestRecommendedRoot.querySelectorAll(
-      ".wbpro-scroller-item"
-    )) {
-      registerLongPostControls(card);
+    return true;
+  }
+
+  function reconcileCurrentPageFeed() {
+    const root = latestRecommendedRoot;
+    if (
+      !root ||
+      !pageFeedFeaturesAreActiveForRoute() ||
+      findLatestFeedRoot() !== root
+    ) {
+      return false;
+    }
+    const autoExpandActive = syncLongPostAutoExpand();
+    for (const card of root.querySelectorAll(".wbpro-scroller-item")) {
+      applyLatestRecommendedVisibility(card);
+      if (autoExpandActive) registerLongPostControls(card);
+    }
+    reconcileStrongTipsAdModules(root);
+    return true;
+  }
+
+  function cancelPageFeedReconcile() {
+    if (pageFeedReconcileHandle === null) return;
+    const handle = pageFeedReconcileHandle;
+    const usedAnimationFrame = pageFeedReconcileUsesAnimationFrame;
+    pageFeedReconcileHandle = null;
+    pageFeedReconcileUsesAnimationFrame = false;
+    if (
+      usedAnimationFrame &&
+      typeof cancelAnimationFrame === "function"
+    ) {
+      cancelAnimationFrame(handle);
+    } else {
+      clearTimeout(handle);
+    }
+  }
+
+  function schedulePageFeedReconcile() {
+    if (pageFeedReconcileHandle !== null) return false;
+    const callback = () => {
+      pageFeedReconcileHandle = null;
+      pageFeedReconcileUsesAnimationFrame = false;
+      reconcileCurrentPageFeed();
+    };
+    if (typeof requestAnimationFrame === "function") {
+      pageFeedReconcileUsesAnimationFrame = true;
+      pageFeedReconcileHandle = requestAnimationFrame(callback);
+    } else {
+      pageFeedReconcileHandle = setTimeout(callback, 0);
     }
     return true;
   }
 
-  function processLatestRecommendedMutations(mutations) {
-    const cards = new Set();
-    for (const mutation of mutations) {
-      collectLatestRecommendedCards(mutation.target, cards);
-      walkElementSubtree(mutation.target, applyStrongTipsAdVisibility);
-      for (const node of mutation.addedNodes || []) {
-        collectLatestRecommendedCards(node, cards);
-        walkElementSubtree(node, applyStrongTipsAdVisibility);
-      }
-    }
-    pruneLongPostControls();
-    for (const card of cards) {
-      applyLatestRecommendedVisibility(card);
-      registerLongPostControls(card);
-    }
+  function processLatestRecommendedMutations() {
+    schedulePageFeedReconcile();
   }
 
   function clearLatestRecommendedMarkers(root) {
@@ -3663,15 +3915,93 @@
     return hasClass(root, "vue-recycle-scroller") ? root : null;
   }
 
+  function findPageFeedDiscoveryHost() {
+    if (typeof document.querySelector !== "function") return null;
+    if (
+      resolveProfileRouteTargetUid() !== null &&
+      autoExpandIsActiveForRoute()
+    ) {
+      return document.querySelector("main");
+    }
+    return document.querySelector(".homeWrap");
+  }
+
+  function currentPageFeedDiscoveryRouteKey() {
+    return pageFeedFeaturesAreActiveForRoute() &&
+      typeof location?.href === "string"
+      ? location.href
+      : null;
+  }
+
+  function cancelPageFeedRootDiscovery() {
+    if (pageFeedRootDiscoveryTimer !== null) {
+      clearTimeout(pageFeedRootDiscoveryTimer);
+    }
+    pageFeedRootDiscoveryTimer = null;
+    pageFeedRootDiscoveryAttempts = 0;
+    pageFeedRootDiscoveryRouteKey = null;
+  }
+
+  function schedulePageFeedRootDiscovery() {
+    const routeKey = currentPageFeedDiscoveryRouteKey();
+    if (routeKey === null || findLatestFeedRoot()) {
+      cancelPageFeedRootDiscovery();
+      return false;
+    }
+    if (
+      pageFeedRootDiscoveryTimer !== null &&
+      pageFeedRootDiscoveryRouteKey === routeKey
+    ) {
+      return false;
+    }
+    if (
+      pageFeedRootDiscoveryTimer !== null ||
+      pageFeedRootDiscoveryRouteKey !== routeKey
+    ) {
+      cancelPageFeedRootDiscovery();
+    }
+    pageFeedRootDiscoveryRouteKey = routeKey;
+    pageFeedRootDiscoveryTimer = setTimeout(() => {
+      pageFeedRootDiscoveryTimer = null;
+      if (
+        currentPageFeedDiscoveryRouteKey() !== routeKey ||
+        !pageFeedFeaturesAreActiveForRoute()
+      ) {
+        cancelPageFeedRootDiscovery();
+        return;
+      }
+      if (findLatestFeedRoot() || findPageFeedDiscoveryHost()) {
+        pageFeedRootDiscoveryAttempts = 0;
+        pageFeedRootDiscoveryRouteKey = null;
+        installLatestFeedRecommendationFilter();
+        return;
+      }
+      pageFeedRootDiscoveryAttempts += 1;
+      if (
+        pageFeedRootDiscoveryAttempts >=
+        PAGE_FEED_ROOT_DISCOVERY_MAX_ATTEMPTS
+      ) {
+        cancelPageFeedRootDiscovery();
+        return;
+      }
+      schedulePageFeedRootDiscovery();
+    }, PAGE_FEED_ROOT_DISCOVERY_DELAY_MS);
+    return true;
+  }
+
   function teardownLatestFeedRecommendationFilter() {
     if (
       !latestRecommendedObserver &&
       !latestRecommendedRoot &&
       !latestRecommendedDiscoveryObserver &&
-      !longPostIntersectionObserver
+      !longPostIntersectionObserver &&
+      pageFeedRootDiscoveryTimer === null &&
+      pageFeedReconcileHandle === null
     ) {
       return;
     }
+    cancelPageFeedRootDiscovery();
+    cancelPageFeedReconcile();
     teardownLongPostAutoExpand();
     if (latestRecommendedObserver) latestRecommendedObserver.disconnect();
     if (latestRecommendedDiscoveryObserver) {
@@ -3684,16 +4014,13 @@
   }
 
   function installLatestFeedRecommendationFilter() {
-    if (
-      (!pageCleanupPreferences.hideLatestRecommended &&
-        !pageCleanupPreferences.autoExpandLongPosts) ||
-      !isLatestFeedRoute()
-    ) {
+    if (!pageFeedFeaturesAreActiveForRoute()) {
       teardownLatestFeedRecommendationFilter();
       return false;
     }
     const root = findLatestFeedRoot();
     if (!root) {
+      cancelPageFeedReconcile();
       if (latestRecommendedObserver) {
         latestRecommendedObserver.disconnect();
         clearLatestRecommendedMarkers(latestRecommendedRoot);
@@ -3702,49 +4029,40 @@
       }
       teardownLongPostAutoExpand();
       if (!latestRecommendedDiscoveryObserver) {
-        const homeWrap =
-          typeof document.querySelector === "function"
-            ? document.querySelector(".homeWrap")
-            : null;
-        if (homeWrap) {
+        const discoveryHost = findPageFeedDiscoveryHost();
+        if (discoveryHost) {
+          cancelPageFeedRootDiscovery();
           latestRecommendedDiscoveryObserver = new MutationObserver(() => {
-            if (
-              (!pageCleanupPreferences.hideLatestRecommended &&
-                !pageCleanupPreferences.autoExpandLongPosts) ||
-              !isLatestFeedRoute()
-            ) {
+            if (!pageFeedFeaturesAreActiveForRoute()) {
               teardownLatestFeedRecommendationFilter();
               return;
             }
             if (findLatestFeedRoot()) installLatestFeedRecommendationFilter();
           });
-          latestRecommendedDiscoveryObserver.observe(homeWrap, {
+          latestRecommendedDiscoveryObserver.observe(discoveryHost, {
             childList: true,
             subtree: true,
           });
+        } else {
+          schedulePageFeedRootDiscovery();
         }
       }
       return false;
     }
+    cancelPageFeedRootDiscovery();
     if (latestRecommendedDiscoveryObserver) {
       latestRecommendedDiscoveryObserver.disconnect();
       latestRecommendedDiscoveryObserver = null;
     }
     if (latestRecommendedRoot === root && latestRecommendedObserver) {
-      for (const card of root.querySelectorAll(".wbpro-scroller-item")) {
-        applyLatestRecommendedVisibility(card);
-      }
-      reconcileStrongTipsAdModules(root);
-      syncLongPostAutoExpand();
+      cancelPageFeedReconcile();
+      reconcileCurrentPageFeed();
       return true;
     }
+    cancelPageFeedReconcile();
     if (latestRecommendedObserver) latestRecommendedObserver.disconnect();
     clearLatestRecommendedMarkers(latestRecommendedRoot);
     latestRecommendedRoot = root;
-    for (const card of root.querySelectorAll(".wbpro-scroller-item")) {
-      applyLatestRecommendedVisibility(card);
-    }
-    reconcileStrongTipsAdModules(root);
     latestRecommendedObserver = new MutationObserver(
       processLatestRecommendedMutations
     );
@@ -3753,9 +4071,9 @@
       subtree: true,
       characterData: true,
       attributes: true,
-      attributeFilter: ["data-index", "data-active"],
+      attributeFilter: ["data-index", "data-active", "class"],
     });
-    syncLongPostAutoExpand();
+    reconcileCurrentPageFeed();
     return true;
   }
 
@@ -10183,10 +10501,10 @@
     const autoExpandInput = createElement("input");
     autoExpandInput.type = "checkbox";
     autoExpandInput.checked = pageCleanupPreferences.autoExpandLongPosts;
-    autoExpandInput.setAttribute("aria-label", "自动展开长微博");
+    autoExpandInput.setAttribute("aria-label", "自动展开原创长微博");
     autoExpandLabel.append(
       autoExpandInput,
-      createElement("span", "自动展开长微博")
+      createElement("span", "自动展开原创长微博")
     );
     autoExpandInput.addEventListener("change", () => {
       const previous = pageCleanupPreferences.autoExpandLongPosts;
@@ -10220,7 +10538,7 @@
       autoExpandLabel,
       createElement(
         "p",
-        "首页和“最新微博”中自动展开进入视野的外层长微博正文；可能触发微博自身的正文加载。",
+        "首页、“最新微博”和个人主页中，自动展开进入视野的原创长微博；转发微博保持折叠，展开时可能触发微博自身的正文加载。",
         "wfr-muted wfr-setting-description"
       )
     );

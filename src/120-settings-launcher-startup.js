@@ -251,10 +251,10 @@
     const autoExpandInput = createElement("input");
     autoExpandInput.type = "checkbox";
     autoExpandInput.checked = pageCleanupPreferences.autoExpandLongPosts;
-    autoExpandInput.setAttribute("aria-label", "自动展开长微博");
+    autoExpandInput.setAttribute("aria-label", "自动展开原创长微博");
     autoExpandLabel.append(
       autoExpandInput,
-      createElement("span", "自动展开长微博")
+      createElement("span", "自动展开原创长微博")
     );
     autoExpandInput.addEventListener("change", () => {
       const previous = pageCleanupPreferences.autoExpandLongPosts;
@@ -288,7 +288,7 @@
       autoExpandLabel,
       createElement(
         "p",
-        "首页和“最新微博”中自动展开进入视野的外层长微博正文；可能触发微博自身的正文加载。",
+        "首页、“最新微博”和个人主页中，自动展开进入视野的原创长微博；转发微博保持折叠，展开时可能触发微博自身的正文加载。",
         "wfr-muted wfr-setting-description"
       )
     );
