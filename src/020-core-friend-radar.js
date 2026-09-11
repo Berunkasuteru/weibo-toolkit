@@ -3,7 +3,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.9.2";
+  const APP_VERSION = "0.9.3";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -116,6 +116,16 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.9.3": Object.freeze({
+      improved: Object.freeze([
+        "优化原创长微博自动展开时机：滚动过程中不再展开，并优先在当前阅读位置稳定后处理",
+        "隐藏信息流推广内容时改进虚拟列表布局处理，减少被隐藏卡片留下大块空白",
+      ]),
+      fixed: Object.freeze([
+        "修复长微博在已经划过后从页面上方迟到展开，导致当前阅读位置明显位移的问题",
+        "修复部分推广卡片隐藏后仍保留原有虚拟列表高度、形成大面积空白的问题",
+      ]),
+    }),
     "0.9.2": Object.freeze({
       improved: Object.freeze([
         "自动展开调整为“自动展开原创长微博”，并支持首页、“最新微博”和数字 UID 个人主页；转发微博保持折叠",

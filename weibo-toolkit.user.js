@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.9.2
+// @version      0.9.3
 // @description  Local-first Weibo toolkit for relationship tracking, follower tools, PM export, and optional page enhancements.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -922,7 +922,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.9.2";
+  const APP_VERSION = "0.9.3";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -1035,6 +1035,16 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.9.3": Object.freeze({
+      improved: Object.freeze([
+        "优化原创长微博自动展开时机：滚动过程中不再展开，并优先在当前阅读位置稳定后处理",
+        "隐藏信息流推广内容时改进虚拟列表布局处理，减少被隐藏卡片留下大块空白",
+      ]),
+      fixed: Object.freeze([
+        "修复长微博在已经划过后从页面上方迟到展开，导致当前阅读位置明显位移的问题",
+        "修复部分推广卡片隐藏后仍保留原有虚拟列表高度、形成大面积空白的问题",
+      ]),
+    }),
     "0.9.2": Object.freeze({
       improved: Object.freeze([
         "自动展开调整为“自动展开原创长微博”，并支持首页、“最新微博”和数字 UID 个人主页；转发微博保持折叠",
@@ -3168,9 +3178,30 @@
   let pageFeedReconcileUsesAnimationFrame = false;
   const PAGE_FEED_ROOT_DISCOVERY_DELAY_MS = 250;
   const PAGE_FEED_ROOT_DISCOVERY_MAX_ATTEMPTS = 20;
+  const AUTO_EXPAND_SCROLL_IDLE_MS = 120;
+  const AUTO_EXPAND_VIEWPORT_INTENT_MS = 280;
+  const AUTO_EXPAND_POINTER_FAST_IDLE_MS = 120;
+  const AUTO_EXPAND_SAFE_ZONE_TOP_RATIO = 0.35;
+  const AUTO_EXPAND_SAFE_ZONE_BOTTOM_RATIO = 0.85;
+  const AUTO_EXPAND_GEOMETRY_STABLE_DELTA_PX = 8;
   let pageFeedRootDiscoveryTimer = null;
   let pageFeedRootDiscoveryAttempts = 0;
   let pageFeedRootDiscoveryRouteKey = null;
+  let autoExpandScrollTargets = [];
+  let autoExpandScrollIdleTimer = null;
+  let autoExpandScrollEpoch = 0;
+  let autoExpandExpandedEpoch = -1;
+  let autoExpandScrollIsIdle = false;
+  let autoExpandPointerTarget = null;
+  let autoExpandPointerKnown = false;
+  let autoExpandPointerX = 0;
+  let autoExpandPointerY = 0;
+  let autoExpandViewportIntentTimer = null;
+  let autoExpandDominantCandidate = null;
+  let autoExpandViewportIntentGeneration = 0;
+  let autoExpandGeometryFrameHandle = null;
+  let autoExpandGeometryCandidate = null;
+  let autoExpandGeometryGeneration = 0;
 
   function createElement(tag, text, className) {
     const element = document.createElement(tag);
@@ -3256,6 +3287,7 @@
 
   function buildPageCleanupCss(preferences) {
     const selectors = [];
+    const rules = [];
     if (preferences.hideHotSearch) selectors.push(".hotBand");
     if (preferences.hideRightSidebar) selectors.push("#__sidebar");
     if (preferences.hideTopRecommend) {
@@ -3265,14 +3297,29 @@
       selectors.push('.woo-tab-nav > a[href="/tv"]');
     }
     if (preferences.hideLatestRecommended) {
-      selectors.push(`.${LATEST_RECOMMENDED_HIDDEN_CLASS}`);
+      rules.push(
+        `.wbpro-scroller-item.${LATEST_RECOMMENDED_HIDDEN_CLASS} {`,
+        "  height: 1px !important;",
+        "  min-height: 1px !important;",
+        "  max-height: 1px !important;",
+        "  margin-block: 0 !important;",
+        "  padding-block: 0 !important;",
+        "  border-block-width: 0 !important;",
+        "  overflow: hidden !important;",
+        "  visibility: hidden !important;",
+        "  pointer-events: none !important;",
+        "}"
+      );
       if (preferences.strongFeedPromotionFilter) {
         selectors.push(`.${STRONG_FEED_PROMOTION_HIDDEN_CLASS}`);
       }
     }
-    return selectors.length === 0
-      ? ""
-      : selectors.join(",\n") + " { display: none !important; }";
+    if (selectors.length > 0) {
+      rules.unshift(
+        selectors.join(",\n") + " { display: none !important; }"
+      );
+    }
+    return rules.join("\n");
   }
 
   function applyPageCleanupStyles() {
@@ -3613,6 +3660,10 @@
       latestRecommendedRoot.contains(node)
     ) {
       node.classList.add(STRONG_FEED_PROMOTION_HIDDEN_CLASS);
+      const card = findLatestRecommendedCardAncestor(node);
+      if (card && latestRecommendedRoot.contains(card)) {
+        card.classList.add(LATEST_RECOMMENDED_HIDDEN_CLASS);
+      }
     } else {
       node.classList.remove(STRONG_FEED_PROMOTION_HIDDEN_CLASS);
     }
@@ -3688,7 +3739,8 @@
     if (
       !card ||
       !latestRecommendedRoot.contains(card) ||
-      !latestRecommendedRoot.contains(control)
+      !latestRecommendedRoot.contains(control) ||
+      hasClass(card, LATEST_RECOMMENDED_HIDDEN_CLASS)
     ) {
       return null;
     }
@@ -3745,13 +3797,460 @@
     );
   }
 
+  function autoExpandSafeZoneGeometry(control) {
+    if (!control || typeof control.getBoundingClientRect !== "function") {
+      return null;
+    }
+    const viewportHeight = Number(window?.innerHeight) || 0;
+    const rect = control.getBoundingClientRect();
+    const top = Number(rect.top);
+    const bottom = Number(rect.bottom);
+    if (
+      !(viewportHeight > 0) ||
+      !Number.isFinite(top) ||
+      !Number.isFinite(bottom) ||
+      !(bottom > top)
+    ) {
+      return null;
+    }
+    const centerY = (top + bottom) / 2;
+    if (
+      centerY < viewportHeight * AUTO_EXPAND_SAFE_ZONE_TOP_RATIO ||
+      centerY > viewportHeight * AUTO_EXPAND_SAFE_ZONE_BOTTOM_RATIO
+    ) {
+      return null;
+    }
+    return { centerY };
+  }
+
+  function clearAutoExpandScrollIdleTimer() {
+    if (autoExpandScrollIdleTimer !== null) {
+      clearTimeout(autoExpandScrollIdleTimer);
+    }
+    autoExpandScrollIdleTimer = null;
+  }
+
+  function clearAutoExpandViewportIntent() {
+    if (autoExpandViewportIntentTimer !== null) {
+      clearTimeout(autoExpandViewportIntentTimer);
+    }
+    autoExpandViewportIntentTimer = null;
+    autoExpandDominantCandidate = null;
+    autoExpandViewportIntentGeneration += 1;
+  }
+
+  function pageAllowsAutoExpandReadingIntent() {
+    if (
+      document.hidden === true ||
+      document.visibilityState === "hidden" ||
+      (typeof document.hasFocus === "function" && !document.hasFocus()) ||
+      typeof window.getSelection !== "function"
+    ) {
+      return false;
+    }
+    try {
+      const selection = window.getSelection();
+      return Boolean(selection && selection.isCollapsed === true);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function pointerElementIsInteractive(element, card) {
+    const interactiveTags = new Set([
+      "A",
+      "BUTTON",
+      "INPUT",
+      "TEXTAREA",
+      "SELECT",
+      "SUMMARY",
+    ]);
+    for (let current = element; current; current = current.parentElement) {
+      const role = current.getAttribute?.("role");
+      if (
+        interactiveTags.has(current.tagName) ||
+        hasClass(current, "expand") ||
+        role === "button" ||
+        role === "link" ||
+        current.getAttribute?.("contenteditable") === "true" ||
+        current.isContentEditable === true
+      ) {
+        return true;
+      }
+      if (current === card) break;
+    }
+    return false;
+  }
+
+  function dominantAutoExpandCandidate() {
+    if (
+      autoExpandExpandedEpoch === autoExpandScrollEpoch ||
+      !latestRecommendedRoot ||
+      !pageCleanupPreferences.autoExpandLongPosts ||
+      !isAutoExpandLongPostRoute()
+    ) {
+      return null;
+    }
+    const viewportHeight = Number(window?.innerHeight) || 0;
+    if (!(viewportHeight > 0)) return null;
+    let dominant = null;
+    for (const card of latestRecommendedRoot.querySelectorAll(
+      ".wbpro-scroller-item"
+    )) {
+      const cardRatio = visibleAreaRatio(card);
+      if (
+        cardRatio === null ||
+        cardRatio < AUTO_EXPAND_INTERSECTION_RATIO ||
+        typeof card.getBoundingClientRect !== "function" ||
+        typeof card.querySelectorAll !== "function"
+      ) {
+        continue;
+      }
+      const rect = card.getBoundingClientRect();
+      const visibleTop = Math.max(Number(rect.top), 0);
+      const visibleBottom = Math.min(Number(rect.bottom), viewportHeight);
+      if (!(visibleBottom > visibleTop)) continue;
+      const score = Math.abs(
+        (visibleTop + visibleBottom) / 2 - viewportHeight / 2
+      );
+      for (const control of card.querySelectorAll(".expand")) {
+        const validated = validateLongPostExpandControl(control);
+        if (
+          validated &&
+          longPostClickedControlStates.get(control) !== validated.identity &&
+          longPostControlIsMeaningfullyVisible(control, validated.card) &&
+          autoExpandSafeZoneGeometry(control) !== null &&
+          (!dominant || score < dominant.score)
+        ) {
+          dominant = {
+            root: latestRecommendedRoot,
+            card,
+            control,
+            identity: validated.identity,
+            score,
+          };
+        }
+      }
+    }
+    return dominant;
+  }
+
+  function intentCandidatesMatch(left, right) {
+    return Boolean(
+      left &&
+        right &&
+        left.root === right.root &&
+        left.card === right.card &&
+        left.control === right.control &&
+        left.identity === right.identity
+    );
+  }
+
+  function currentPointerElement() {
+    if (
+      !autoExpandPointerKnown ||
+      typeof document.elementFromPoint !== "function"
+    ) {
+      return null;
+    }
+    const pointed = document.elementFromPoint(
+      autoExpandPointerX,
+      autoExpandPointerY
+    );
+    return pointed && pointed.nodeType === 1 ? pointed : null;
+  }
+
+  function pointerBlocksDominantCandidate(candidate) {
+    const pointed = currentPointerElement();
+    if (!pointed || !candidate.card.contains(pointed)) return false;
+    return pointerElementIsInteractive(pointed, candidate.card);
+  }
+
+  function pointerFastPathMatches(candidate) {
+    const pointed = currentPointerElement();
+    return Boolean(
+      pointed &&
+        candidate.card.contains(pointed) &&
+        !pointerElementIsInteractive(pointed, candidate.card)
+    );
+  }
+
+  function cancelAutoExpandGeometryConfirmation() {
+    if (
+      autoExpandGeometryFrameHandle !== null &&
+      typeof cancelAnimationFrame === "function"
+    ) {
+      cancelAnimationFrame(autoExpandGeometryFrameHandle);
+    }
+    autoExpandGeometryFrameHandle = null;
+    autoExpandGeometryCandidate = null;
+    autoExpandGeometryGeneration += 1;
+  }
+
+  function scheduleAutoExpandGeometryConfirmation(candidate) {
+    if (!candidate || typeof requestAnimationFrame !== "function") {
+      return false;
+    }
+    if (
+      autoExpandGeometryFrameHandle !== null &&
+      intentCandidatesMatch(candidate, autoExpandGeometryCandidate)
+    ) {
+      return true;
+    }
+    cancelAutoExpandGeometryConfirmation();
+    const current = dominantAutoExpandCandidate();
+    const firstGeometry = autoExpandSafeZoneGeometry(current?.control);
+    if (
+      !intentCandidatesMatch(current, candidate) ||
+      !firstGeometry ||
+      !autoExpandScrollIsIdle ||
+      pointerBlocksDominantCandidate(current) ||
+      !pageAllowsAutoExpandReadingIntent()
+    ) {
+      return false;
+    }
+    autoExpandGeometryCandidate = current;
+    const generation = autoExpandGeometryGeneration;
+    autoExpandGeometryFrameHandle = requestAnimationFrame(() => {
+      autoExpandGeometryFrameHandle = null;
+      if (generation !== autoExpandGeometryGeneration) return;
+      const expected = autoExpandGeometryCandidate;
+      const latest = dominantAutoExpandCandidate();
+      const secondGeometry = autoExpandSafeZoneGeometry(latest?.control);
+      const geometryStable = Boolean(
+        secondGeometry &&
+          Math.abs(secondGeometry.centerY - firstGeometry.centerY) <=
+            AUTO_EXPAND_GEOMETRY_STABLE_DELTA_PX
+      );
+      if (
+        !intentCandidatesMatch(latest, expected) ||
+        !geometryStable ||
+        !autoExpandScrollIsIdle ||
+        pointerBlocksDominantCandidate(latest) ||
+        !pageAllowsAutoExpandReadingIntent()
+      ) {
+        cancelAutoExpandGeometryConfirmation();
+        clearAutoExpandViewportIntent();
+        return;
+      }
+      const validated = validateLongPostExpandControl(latest.control);
+      if (
+        !validated ||
+        validated.identity !== latest.identity ||
+        !longPostControlIsMeaningfullyVisible(latest.control, validated.card) ||
+        !autoExpandSafeZoneGeometry(latest.control)
+      ) {
+        cancelAutoExpandGeometryConfirmation();
+        clearAutoExpandViewportIntent();
+        return;
+      }
+      cancelAutoExpandGeometryConfirmation();
+      clickValidatedLongPostControl(latest.control, validated);
+    });
+    return true;
+  }
+
+  function clickCurrentViewportIntentCandidate(candidate) {
+    if (
+      !candidate ||
+      !autoExpandScrollIsIdle ||
+      autoExpandExpandedEpoch === autoExpandScrollEpoch ||
+      !pageAllowsAutoExpandReadingIntent()
+    ) {
+      return false;
+    }
+    const current = dominantAutoExpandCandidate();
+    if (
+      !intentCandidatesMatch(current, candidate) ||
+      pointerBlocksDominantCandidate(current)
+    ) {
+      return false;
+    }
+    const validated = validateLongPostExpandControl(current.control);
+    if (
+      !validated ||
+      validated.identity !== current.identity ||
+      !longPostControlIsMeaningfullyVisible(current.control, validated.card) ||
+      !autoExpandSafeZoneGeometry(current.control)
+    ) {
+      return false;
+    }
+    return scheduleAutoExpandGeometryConfirmation(current);
+  }
+
+  function reconcileAutoExpandViewportIntent() {
+    const candidate = dominantAutoExpandCandidate();
+    if (!candidate) {
+      cancelAutoExpandGeometryConfirmation();
+      clearAutoExpandViewportIntent();
+      return false;
+    }
+    if (
+      autoExpandGeometryCandidate &&
+      !intentCandidatesMatch(candidate, autoExpandGeometryCandidate)
+    ) {
+      cancelAutoExpandGeometryConfirmation();
+    }
+    if (
+      autoExpandGeometryFrameHandle !== null &&
+      intentCandidatesMatch(candidate, autoExpandGeometryCandidate)
+    ) {
+      return true;
+    }
+    if (
+      intentCandidatesMatch(candidate, autoExpandDominantCandidate) &&
+      autoExpandScrollIsIdle &&
+      AUTO_EXPAND_POINTER_FAST_IDLE_MS <= AUTO_EXPAND_SCROLL_IDLE_MS &&
+      pointerFastPathMatches(candidate)
+    ) {
+      if (clickCurrentViewportIntentCandidate(candidate)) {
+        clearAutoExpandViewportIntent();
+        return true;
+      }
+    }
+    if (
+      intentCandidatesMatch(candidate, autoExpandDominantCandidate) &&
+      autoExpandViewportIntentTimer !== null
+    ) {
+      return true;
+    }
+    clearAutoExpandViewportIntent();
+    autoExpandDominantCandidate = candidate;
+    const generation = autoExpandViewportIntentGeneration;
+    autoExpandViewportIntentTimer = setTimeout(() => {
+      autoExpandViewportIntentTimer = null;
+      if (generation !== autoExpandViewportIntentGeneration) return;
+      const current = dominantAutoExpandCandidate();
+      if (!intentCandidatesMatch(current, candidate)) {
+        clearAutoExpandViewportIntent();
+        if (current) reconcileAutoExpandViewportIntent();
+        return;
+      }
+      clearAutoExpandViewportIntent();
+      clickCurrentViewportIntentCandidate(current);
+    }, AUTO_EXPAND_VIEWPORT_INTENT_MS);
+    return true;
+  }
+
+  function scheduleAutoExpandScrollIdle(resetDeadline = false) {
+    const root = latestRecommendedRoot;
+    if (
+      !pageCleanupPreferences.autoExpandLongPosts ||
+      !isAutoExpandLongPostRoute() ||
+      !root
+    ) {
+      clearAutoExpandScrollIdleTimer();
+      return false;
+    }
+    if (resetDeadline) clearAutoExpandScrollIdleTimer();
+    if (autoExpandScrollIdleTimer !== null) return false;
+    const epoch = autoExpandScrollEpoch;
+    autoExpandScrollIdleTimer = setTimeout(() => {
+      autoExpandScrollIdleTimer = null;
+      if (
+        epoch !== autoExpandScrollEpoch ||
+        latestRecommendedRoot !== root ||
+        !pageCleanupPreferences.autoExpandLongPosts ||
+        !isAutoExpandLongPostRoute()
+      ) {
+        return;
+      }
+      autoExpandScrollIsIdle = true;
+      reconcileCurrentPageFeed();
+    }, AUTO_EXPAND_SCROLL_IDLE_MS);
+    return true;
+  }
+
+  function handleAutoExpandRelevantScroll() {
+    autoExpandScrollEpoch += 1;
+    autoExpandScrollIsIdle = false;
+    cancelAutoExpandGeometryConfirmation();
+    clearAutoExpandViewportIntent();
+    scheduleAutoExpandScrollIdle(true);
+    schedulePageFeedReconcile();
+  }
+
+  function handleAutoExpandPointerMove(event) {
+    if (
+      !event ||
+      !Number.isFinite(event.clientX) ||
+      !Number.isFinite(event.clientY)
+    ) {
+      return;
+    }
+    autoExpandPointerKnown = true;
+    autoExpandPointerX = event.clientX;
+    autoExpandPointerY = event.clientY;
+    if (
+      autoExpandScrollIsIdle &&
+      autoExpandExpandedEpoch !== autoExpandScrollEpoch
+    ) {
+      schedulePageFeedReconcile();
+    }
+  }
+
+  function teardownAutoExpandScrollTracking() {
+    clearAutoExpandScrollIdleTimer();
+    cancelAutoExpandGeometryConfirmation();
+    clearAutoExpandViewportIntent();
+    for (const target of autoExpandScrollTargets) {
+      target.removeEventListener?.("scroll", handleAutoExpandRelevantScroll);
+    }
+    autoExpandScrollTargets = [];
+    if (autoExpandPointerTarget) {
+      autoExpandPointerTarget.removeEventListener?.(
+        "pointermove",
+        handleAutoExpandPointerMove
+      );
+    }
+    autoExpandPointerTarget = null;
+    autoExpandPointerKnown = false;
+    autoExpandPointerX = 0;
+    autoExpandPointerY = 0;
+    autoExpandScrollEpoch = 0;
+    autoExpandExpandedEpoch = -1;
+    autoExpandScrollIsIdle = false;
+  }
+
+  function installAutoExpandScrollTracking() {
+    const targets = [window, latestRecommendedRoot].filter(
+      (target, index, all) =>
+        target &&
+        typeof target.addEventListener === "function" &&
+        all.indexOf(target) === index
+    );
+    if (
+      targets.length === autoExpandScrollTargets.length &&
+      targets.every((target, index) => target === autoExpandScrollTargets[index])
+    ) {
+      return;
+    }
+    teardownAutoExpandScrollTracking();
+    autoExpandScrollTargets = targets;
+    for (const target of autoExpandScrollTargets) {
+      target.addEventListener("scroll", handleAutoExpandRelevantScroll, {
+        passive: true,
+      });
+    }
+    autoExpandPointerTarget = window;
+    autoExpandPointerTarget.addEventListener(
+      "pointermove",
+      handleAutoExpandPointerMove,
+      { passive: true }
+    );
+    scheduleAutoExpandScrollIdle();
+  }
+
   function clickValidatedLongPostControl(control, validated) {
     if (
       !validated ||
+      !autoExpandScrollIsIdle ||
+      autoExpandExpandedEpoch === autoExpandScrollEpoch ||
       longPostClickedControlStates.get(control) === validated.identity
     ) {
       return false;
     }
+    autoExpandExpandedEpoch = autoExpandScrollEpoch;
     longPostClickedControlStates.set(control, validated.identity);
     if (longPostIntersectionObserver) {
       longPostIntersectionObserver.unobserve(control);
@@ -3773,10 +4272,6 @@
           longPostIntersectionObserver.unobserve(control);
         }
         longPostObservedControls.delete(control);
-        continue;
-      }
-      if (longPostControlIsMeaningfullyVisible(control, validated.card)) {
-        clickValidatedLongPostControl(control, validated);
         continue;
       }
       if (!longPostIntersectionObserver || longPostObservedControls.has(control)) {
@@ -3806,11 +4301,14 @@
       }
       const control = entry.target;
       const validated = validateLongPostExpandControl(control);
-      clickValidatedLongPostControl(control, validated);
+      if (!validated) continue;
+      if (!autoExpandScrollIsIdle) scheduleAutoExpandScrollIdle();
+      else schedulePageFeedReconcile();
     }
   }
 
   function teardownLongPostAutoExpand() {
+    teardownAutoExpandScrollTracking();
     if (longPostIntersectionObserver) {
       longPostIntersectionObserver.disconnect();
     }
@@ -3837,6 +4335,7 @@
         { threshold: AUTO_EXPAND_INTERSECTION_RATIO }
       );
     }
+    installAutoExpandScrollTracking();
     pruneLongPostControls();
     return true;
   }
@@ -3856,6 +4355,8 @@
       if (autoExpandActive) registerLongPostControls(card);
     }
     reconcileStrongTipsAdModules(root);
+    if (autoExpandActive) reconcileAutoExpandViewportIntent();
+    else clearAutoExpandViewportIntent();
     return true;
   }
 
@@ -4061,6 +4562,7 @@
     }
     cancelPageFeedReconcile();
     if (latestRecommendedObserver) latestRecommendedObserver.disconnect();
+    teardownLongPostAutoExpand();
     clearLatestRecommendedMarkers(latestRecommendedRoot);
     latestRecommendedRoot = root;
     latestRecommendedObserver = new MutationObserver(
@@ -10538,7 +11040,7 @@
       autoExpandLabel,
       createElement(
         "p",
-        "首页、“最新微博”和个人主页中，自动展开进入视野的原创长微博；转发微博保持折叠，展开时可能触发微博自身的正文加载。",
+        "首页、“最新微博”和个人主页中，在你停下来阅读原创长微博时自动展开；转发微博保持折叠，展开时可能触发微博自身的正文加载。",
         "wfr-muted wfr-setting-description"
       )
     );
