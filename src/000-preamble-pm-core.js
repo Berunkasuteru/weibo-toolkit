@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.9.3
+// @version      0.9.4
 // @description  Local-first Weibo toolkit for relationship tracking, follower tools, PM export, and optional page enhancements.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*

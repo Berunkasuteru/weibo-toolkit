@@ -431,20 +431,13 @@
     return hasFollowControl && hasNegativeFeedbackSemantic;
   }
 
-  function applyLatestRecommendedVisibility(card) {
-    if (!card || !card.classList) return;
-    const shouldHide = Boolean(
-      promotionFilterIsActiveForRoute() &&
-        classifyLatestRecommendedCard(
-          card,
-          effectiveStrongFeedPromotionFilter()
-        )
-    );
-    if (shouldHide) {
-      card.classList.add(LATEST_RECOMMENDED_HIDDEN_CLASS);
-    } else {
-      card.classList.remove(LATEST_RECOMMENDED_HIDDEN_CLASS);
-    }
+  function setToolkitClass(node, className, enabled) {
+    if (!node || !node.classList) return false;
+    const hasClassName = node.classList.contains(className);
+    if (Boolean(enabled) === hasClassName) return false;
+    if (enabled) node.classList.add(className);
+    else node.classList.remove(className);
+    return true;
   }
 
   function elementClassTokens(node) {
@@ -475,22 +468,43 @@
     }
   }
 
+  function cardContainsStrongTipsAd(card) {
+    if (!card || !effectiveStrongFeedPromotionFilter()) return false;
+    let containsTipsAd = false;
+    walkElementSubtree(card, (node) => {
+      if (!containsTipsAd && isStrongTipsAdModule(node)) {
+        containsTipsAd = true;
+      }
+    });
+    return containsTipsAd;
+  }
+
+  function shouldCollapsePageFeedCard(card) {
+    if (!promotionFilterIsActiveForRoute()) return false;
+    const strongMode = effectiveStrongFeedPromotionFilter();
+    return Boolean(
+      classifyLatestRecommendedCard(card, strongMode) ||
+        (strongMode && cardContainsStrongTipsAd(card))
+    );
+  }
+
+  function applyLatestRecommendedVisibility(card) {
+    setToolkitClass(
+      card,
+      LATEST_RECOMMENDED_HIDDEN_CLASS,
+      shouldCollapsePageFeedCard(card)
+    );
+  }
+
   function applyStrongTipsAdVisibility(node) {
     if (!node || !node.classList) return;
-    if (
+    const shouldHide = Boolean(
       isStrongTipsAdModule(node) &&
-      effectiveStrongFeedPromotionFilter() &&
-      latestRecommendedRoot &&
-      latestRecommendedRoot.contains(node)
-    ) {
-      node.classList.add(STRONG_FEED_PROMOTION_HIDDEN_CLASS);
-      const card = findLatestRecommendedCardAncestor(node);
-      if (card && latestRecommendedRoot.contains(card)) {
-        card.classList.add(LATEST_RECOMMENDED_HIDDEN_CLASS);
-      }
-    } else {
-      node.classList.remove(STRONG_FEED_PROMOTION_HIDDEN_CLASS);
-    }
+        effectiveStrongFeedPromotionFilter() &&
+        latestRecommendedRoot &&
+        latestRecommendedRoot.contains(node)
+    );
+    setToolkitClass(node, STRONG_FEED_PROMOTION_HIDDEN_CLASS, shouldHide);
   }
 
   function reconcileStrongTipsAdModules(root) {
@@ -1166,11 +1180,11 @@
 
   function reconcileCurrentPageFeed() {
     const root = latestRecommendedRoot;
-    if (
-      !root ||
-      !pageFeedFeaturesAreActiveForRoute() ||
-      findLatestFeedRoot() !== root
-    ) {
+    if (!root || !pageFeedFeaturesAreActiveForRoute()) {
+      return false;
+    }
+    if (findLatestFeedRoot() !== root) {
+      installLatestFeedRecommendationFilter();
       return false;
     }
     const autoExpandActive = syncLongPostAutoExpand();
@@ -1225,12 +1239,12 @@
     for (const card of root.querySelectorAll(
       `.${LATEST_RECOMMENDED_HIDDEN_CLASS}`
     )) {
-      card.classList.remove(LATEST_RECOMMENDED_HIDDEN_CLASS);
+      setToolkitClass(card, LATEST_RECOMMENDED_HIDDEN_CLASS, false);
     }
     for (const module of root.querySelectorAll(
       `.${STRONG_FEED_PROMOTION_HIDDEN_CLASS}`
     )) {
-      module.classList.remove(STRONG_FEED_PROMOTION_HIDDEN_CLASS);
+      setToolkitClass(module, STRONG_FEED_PROMOTION_HIDDEN_CLASS, false);
     }
   }
 
@@ -1314,11 +1328,20 @@
     return true;
   }
 
+  function disconnectLatestRecommendedDiscoveryObserver() {
+    if (latestRecommendedDiscoveryObserver) {
+      latestRecommendedDiscoveryObserver.disconnect();
+    }
+    latestRecommendedDiscoveryObserver = null;
+    latestRecommendedDiscoveryHost = null;
+  }
+
   function teardownLatestFeedRecommendationFilter() {
     if (
       !latestRecommendedObserver &&
       !latestRecommendedRoot &&
       !latestRecommendedDiscoveryObserver &&
+      !latestRecommendedDiscoveryHost &&
       !longPostIntersectionObserver &&
       pageFeedRootDiscoveryTimer === null &&
       pageFeedReconcileHandle === null
@@ -1329,13 +1352,10 @@
     cancelPageFeedReconcile();
     teardownLongPostAutoExpand();
     if (latestRecommendedObserver) latestRecommendedObserver.disconnect();
-    if (latestRecommendedDiscoveryObserver) {
-      latestRecommendedDiscoveryObserver.disconnect();
-    }
+    disconnectLatestRecommendedDiscoveryObserver();
     clearLatestRecommendedMarkers(latestRecommendedRoot);
     latestRecommendedObserver = null;
     latestRecommendedRoot = null;
-    latestRecommendedDiscoveryObserver = null;
   }
 
   function installLatestFeedRecommendationFilter() {
@@ -1353,32 +1373,39 @@
         latestRecommendedRoot = null;
       }
       teardownLongPostAutoExpand();
-      if (!latestRecommendedDiscoveryObserver) {
-        const discoveryHost = findPageFeedDiscoveryHost();
-        if (discoveryHost) {
-          cancelPageFeedRootDiscovery();
-          latestRecommendedDiscoveryObserver = new MutationObserver(() => {
-            if (!pageFeedFeaturesAreActiveForRoute()) {
-              teardownLatestFeedRecommendationFilter();
-              return;
-            }
-            if (findLatestFeedRoot()) installLatestFeedRecommendationFilter();
-          });
-          latestRecommendedDiscoveryObserver.observe(discoveryHost, {
-            childList: true,
-            subtree: true,
-          });
-        } else {
-          schedulePageFeedRootDiscovery();
-        }
+      const discoveryHost = findPageFeedDiscoveryHost();
+      if (
+        latestRecommendedDiscoveryObserver &&
+        (latestRecommendedDiscoveryHost !== discoveryHost ||
+          latestRecommendedDiscoveryHost?.isConnected === false)
+      ) {
+        disconnectLatestRecommendedDiscoveryObserver();
+      }
+      if (
+        !latestRecommendedDiscoveryObserver &&
+        discoveryHost &&
+        discoveryHost.isConnected !== false
+      ) {
+        cancelPageFeedRootDiscovery();
+        latestRecommendedDiscoveryHost = discoveryHost;
+        latestRecommendedDiscoveryObserver = new MutationObserver(() => {
+          if (!pageFeedFeaturesAreActiveForRoute()) {
+            teardownLatestFeedRecommendationFilter();
+            return;
+          }
+          if (findLatestFeedRoot()) installLatestFeedRecommendationFilter();
+        });
+        latestRecommendedDiscoveryObserver.observe(discoveryHost, {
+          childList: true,
+          subtree: true,
+        });
+      } else if (!latestRecommendedDiscoveryObserver) {
+        schedulePageFeedRootDiscovery();
       }
       return false;
     }
     cancelPageFeedRootDiscovery();
-    if (latestRecommendedDiscoveryObserver) {
-      latestRecommendedDiscoveryObserver.disconnect();
-      latestRecommendedDiscoveryObserver = null;
-    }
+    disconnectLatestRecommendedDiscoveryObserver();
     if (latestRecommendedRoot === root && latestRecommendedObserver) {
       cancelPageFeedReconcile();
       reconcileCurrentPageFeed();

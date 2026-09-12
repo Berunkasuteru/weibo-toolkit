@@ -3,7 +3,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.9.3";
+  const APP_VERSION = "0.9.4";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -116,6 +116,16 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.9.4": Object.freeze({
+      improved: Object.freeze([
+        "改进信息流页面增强的内部更新机制，减少无意义的重复处理和资源占用",
+      ]),
+      fixed: Object.freeze([
+        "修复推广过滤在部分页面结构下可能反复触发自身更新的问题",
+        "修复首页与个人主页快速切换时，信息流页面增强可能未能重新绑定的问题",
+        "修复微博信息流容器被重新创建后，页面增强可能继续停留在旧容器的问题",
+      ]),
+    }),
     "0.9.3": Object.freeze({
       improved: Object.freeze([
         "优化原创长微博自动展开时机：滚动过程中不再展开，并优先在当前阅读位置稳定后处理",
@@ -322,6 +332,7 @@
   let latestRecommendedObserver = null;
   let latestRecommendedRoot = null;
   let latestRecommendedDiscoveryObserver = null;
+  let latestRecommendedDiscoveryHost = null;
   let longPostIntersectionObserver = null;
   let longPostObservedControls = new Set();
   let longPostClickedControlStates = new WeakMap();
