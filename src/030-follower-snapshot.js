@@ -982,6 +982,16 @@
   async function performFollowerUpdate(onProgress, isCancelled, options = {}) {
     const ownerAtStart = determineCurrentUid();
     if (!ownerAtStart.ok) return ownerAtStart;
+    // Optimistic concurrency control for the whole scan. The durable follower
+    // bytes this scan will be diffed against are read before the first request,
+    // and the commit below refuses unless they are still exactly those bytes.
+    // Only exact identity is safe here: a backup restore may legitimately
+    // replace a newer snapshot with an older historical one, so comparing
+    // capturedAt would accept a baseline that was swapped underneath the scan.
+    // Nothing is written here, and no lock is held across the network.
+    const baseline = loadFollowerState(ownerAtStart.uid);
+    if (!baseline.ok) return baseline;
+    const scanStartFollowerRaw = baseline.raw;
     const scan = await scanFollowers(
       ownerAtStart.uid,
       onProgress,
@@ -1002,6 +1012,13 @@
       async () => {
         const fresh = loadFollowerState(ownerAtStart.uid);
         if (!fresh.ok) return fresh;
+        // The baseline this scan was computed against must still be the stored
+        // one. If it is not, the scan is discarded whole: no diff, no events, no
+        // snapshot write and no removal-pending consumption. Carrying no reason
+        // code keeps the follower failure text exactly the accurate one.
+        if (fresh.raw !== scanStartFollowerRaw) {
+          return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+        }
         if (fresh.state.latestSnapshot !== null) {
           const storedTime = Date.parse(fresh.state.latestSnapshot.capturedAt);
           const scanTime = Date.parse(scan.snapshot.capturedAt);

@@ -301,42 +301,44 @@
     return current?.parentElement === ancestor ? current : null;
   }
 
-  function resolvePageFeedCardParts(card) {
+  function pageFeedOuterArticles(card) {
     if (
       !hasClass(card, "wbpro-scroller-item") ||
       typeof card.querySelectorAll !== "function"
     ) {
-      return null;
+      return [];
     }
     const articles = [];
     for (const article of [
       ...elementChildren(card).filter((child) => child.tagName === "ARTICLE"),
       ...card.querySelectorAll("article"),
     ]) {
-      if (!articles.includes(article)) articles.push(article);
-    }
-    for (const article of articles) {
       if (
+        articles.includes(article) ||
         hasAncestorClassBefore(article, card, "retweet") ||
         hasAncestorClassBefore(article, card, "wbpro-feed-reText") ||
         typeof article.querySelectorAll !== "function"
       ) {
         continue;
       }
-      const headers = Array.from(article.querySelectorAll("header")).filter(
-        (candidate) =>
-          nearestAncestorTagBefore(candidate, card, "ARTICLE") === article &&
-          !hasAncestorClassBefore(candidate, article, "retweet") &&
-          !hasAncestorClassBefore(candidate, article, "wbpro-feed-reText")
-      );
-      const contents = Array.from(
-        article.querySelectorAll(".wbpro-feed-content")
-      ).filter(
-        (candidate) =>
-          nearestAncestorTagBefore(candidate, card, "ARTICLE") === article &&
-          !hasAncestorClassBefore(candidate, article, "retweet") &&
-          !hasAncestorClassBefore(candidate, article, "wbpro-feed-reText")
-      );
+      articles.push(article);
+    }
+    return articles;
+  }
+
+  function pageFeedOuterParts(card, article, selector) {
+    return Array.from(article.querySelectorAll(selector)).filter(
+      (candidate) =>
+        nearestAncestorTagBefore(candidate, card, "ARTICLE") === article &&
+        !hasAncestorClassBefore(candidate, article, "retweet") &&
+        !hasAncestorClassBefore(candidate, article, "wbpro-feed-reText")
+    );
+  }
+
+  function resolvePageFeedCardParts(card) {
+    for (const article of pageFeedOuterArticles(card)) {
+      const headers = pageFeedOuterParts(card, article, "header");
+      const contents = pageFeedOuterParts(card, article, ".wbpro-feed-content");
       for (const content of contents) {
         const contentBranch = directChildWithin(content, article);
         const header =
@@ -346,6 +348,21 @@
           ) || (headers.length === 1 ? headers[0] : null);
         if (header) return { card, article, header, content };
       }
+    }
+    return null;
+  }
+
+  // The promotion badge and the author controls beside it live in the outer
+  // header alone. Auto-expand still needs the body wrapper, but a promotion
+  // decision must not fail merely because ".wbpro-feed-content" is absent or
+  // renamed: an exact semantic tag in a resolvable outer header stays
+  // classifiable either way.
+  function resolvePageFeedPromotionHeader(card) {
+    const parts = resolvePageFeedCardParts(card);
+    if (parts) return parts.header;
+    for (const article of pageFeedOuterArticles(card)) {
+      const headers = pageFeedOuterParts(card, article, "header");
+      if (headers.length > 0) return headers[0];
     }
     return null;
   }
@@ -388,9 +405,9 @@
   }
 
   function classifyLatestRecommendedCard(card, strongMode = false) {
-    const parts = resolvePageFeedCardParts(card);
-    if (!parts) return false;
-    const tagMatch = pageFeedTagComponents(parts.header).some((component) => {
+    const header = resolvePageFeedPromotionHeader(card);
+    if (!header) return false;
+    const tagMatch = pageFeedTagComponents(header).some((component) => {
       const componentText = normalizedComponentText(component);
       const preciseMatch = componentText === "荐读";
       if (preciseMatch || !strongMode) return preciseMatch;
@@ -401,7 +418,7 @@
     if (tagMatch || !strongMode) return tagMatch;
     let hasFollowControl = false;
     let hasNegativeFeedbackSemantic = false;
-    walkElementSubtree(parts.header, (node) => {
+    walkElementSubtree(header, (node) => {
       if (
         node.hidden === true ||
         node.getAttribute?.("aria-hidden") === "true"
@@ -468,8 +485,13 @@
     }
   }
 
-  function cardContainsStrongTipsAd(card) {
+  // TipsAd is a third-party-derived module clue, not a card clue. A feed item
+  // that carries no ordinary outer post header is nothing but the ad module and
+  // stays disposable; an ad module embedded beside a real post must never take
+  // that post down with it, so there only the module itself is hidden.
+  function cardIsDisposableStrongTipsAdItem(card) {
     if (!card || !effectiveStrongFeedPromotionFilter()) return false;
+    if (resolvePageFeedPromotionHeader(card) !== null) return false;
     let containsTipsAd = false;
     walkElementSubtree(card, (node) => {
       if (!containsTipsAd && isStrongTipsAdModule(node)) {
@@ -484,7 +506,7 @@
     const strongMode = effectiveStrongFeedPromotionFilter();
     return Boolean(
       classifyLatestRecommendedCard(card, strongMode) ||
-        (strongMode && cardContainsStrongTipsAd(card))
+        (strongMode && cardIsDisposableStrongTipsAdItem(card))
     );
   }
 

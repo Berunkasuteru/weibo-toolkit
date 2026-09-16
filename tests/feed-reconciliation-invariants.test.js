@@ -76,7 +76,7 @@ const tipsAdWriterSource = cardDecisionSource.slice(
 );
 assert(
   cardDecisionSource.includes("classifyLatestRecommendedCard(card, strongMode)") &&
-    cardDecisionSource.includes("cardContainsStrongTipsAd(card)"),
+    cardDecisionSource.includes("cardIsDisposableStrongTipsAdItem(card)"),
   "one card-level decision must combine normal and TipsAd promotion classification"
 );
 assert(

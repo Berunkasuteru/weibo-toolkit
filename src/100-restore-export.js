@@ -140,27 +140,95 @@
   // follower state lock, reads the current value there, and writes exactly what
   // the backup represents: the stored state, or nothing at all when the backup
   // explicitly recorded that no durable follower state existed.
-  async function restoreFollowerStateFromBackup(ownerUid, followerState) {
+  // Reads the exact follower bytes the user is about to review. Absence is a
+  // real reviewed value, so it is represented as null rather than as a failure.
+  function currentFollowerRestoreToken(ownerUid) {
+    try {
+      const raw = GM_getValue(followerStorageKey(ownerUid), null);
+      return { ok: true, raw: typeof raw === "string" ? raw : null };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "FOLLOWER_STATE_UNREADABLE",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  // Called only after a follower mutator was already attempted. A thrown write,
+  // a thrown delete or a failed verification does not prove the effect did not
+  // land, so one bounded re-read inside the still-held lock is used solely to
+  // prove non-mutation. It never upgrades a failed attempt to success and never
+  // retries the mutation.
+  function classifyAttemptedFollowerMutation(key, expectedRaw, failure) {
+    let observedRaw;
+    try {
+      observedRaw = GM_getValue(key, null);
+    } catch (_) {
+      return { ...failure, ok: false, mutationAttempted: true, outcomeUnknown: true };
+    }
+    const normalized = typeof observedRaw === "string" ? observedRaw : null;
+    if (normalized === expectedRaw) {
+      return { ...failure, ok: false, mutationAttempted: true, outcomeUnknown: false };
+    }
+    return { ...failure, ok: false, mutationAttempted: true, outcomeUnknown: true };
+  }
+
+  // The follower half obeys the same preview-time concurrency principle as the
+  // Friend Radar half: the bytes the user reviewed must still be the stored ones.
+  // The expected value is the preview token, never a read taken immediately
+  // before the write, which would always agree with itself.
+  async function restoreFollowerStateFromBackup(
+    ownerUid,
+    followerState,
+    expectedFollowerRaw
+  ) {
     return await withFollowerStateLock(ownerUid, async () => {
       const key = followerStorageKey(ownerUid);
+      let currentRaw;
+      try {
+        currentRaw = GM_getValue(key, null);
+      } catch (error) {
+        return {
+          ok: false,
+          mutationAttempted: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "FOLLOWER_STATE_UNREADABLE",
+          errorName: error && error.name ? String(error.name) : "Error",
+        };
+      }
+      const normalizedCurrent = typeof currentRaw === "string" ? currentRaw : null;
+      if (normalizedCurrent !== expectedFollowerRaw) {
+        return {
+          ok: false,
+          mutationAttempted: false,
+          failureKind: "CONCURRENT_MODIFICATION",
+        };
+      }
       if (followerState === null) {
         try {
           GM_deleteValue(key);
           if (GM_getValue(key, null) !== null) {
-            return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+            return classifyAttemptedFollowerMutation(key, expectedFollowerRaw, {
+              failureKind: "CONCURRENT_MODIFICATION",
+            });
           }
-          return { ok: true };
+          return { ok: true, mutationAttempted: true };
         } catch (error) {
-          return {
-            ok: false,
+          return classifyAttemptedFollowerMutation(key, expectedFollowerRaw, {
             failureKind: "PERSISTENCE_ERROR",
             errorName: error && error.name ? String(error.name) : "Error",
-          };
+          });
         }
       }
-      const fresh = GM_getValue(key, null);
-      const expectedRaw = typeof fresh === "string" ? fresh : null;
-      return persistFollowerState(ownerUid, followerState, expectedRaw);
+      const persisted = persistFollowerState(
+        ownerUid,
+        followerState,
+        expectedFollowerRaw
+      );
+      if (persisted.ok) return { ok: true, mutationAttempted: true };
+      return classifyAttemptedFollowerMutation(key, expectedFollowerRaw, persisted);
     });
   }
 
@@ -169,7 +237,22 @@
   // follower state inside its own short lock. Nothing else is held while that
   // lock is taken, and no lock is held while the user is deciding, so no cycle
   // is possible. If the follower half fails, the Friend Radar half is put back.
-  async function restoreValidatedBackup(validated, expectedCurrentRaw) {
+  function restoreStateUncertain(followerFailureKind) {
+    const result = {
+      ok: false,
+      failureKind: "BACKUP_RESTORE_ERROR",
+      reason: "RESTORE_STATE_UNCERTAIN",
+      rollbackSucceeded: false,
+    };
+    if (followerFailureKind) result.followerFailureKind = followerFailureKind;
+    return result;
+  }
+
+  async function restoreValidatedBackup(
+    validated,
+    expectedCurrentRaw,
+    expectedFollowerRaw
+  ) {
     const currentUid = determineCurrentUid();
     if (!currentUid.ok || currentUid.uid !== validated.ownerUid) {
       return {
@@ -191,18 +274,24 @@
           return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
         }
         const persisted = persistState(validated.ownerUid, validated.state);
-        if (!persisted.ok) return persisted;
-        const reloaded = loadState(validated.ownerUid);
-        if (!reloaded.ok) {
-          return {
-            ok: false,
-            failureKind: "PERSISTENCE_ERROR",
-            errorName: "RestoreVerificationError",
-            rollbackSucceeded: false,
-          };
+        // The pre-write comparison above already passed, so from here the write
+        // has been attempted and a failure no longer proves nothing was stored.
+        // One bounded re-read inside this lock is used only to prove that the
+        // bytes are still the pre-restore ones; anything else is uncertain.
+        if (!persisted.ok) {
+          return friendRadarRestoreWriteOutcome(
+            validated.ownerUid,
+            fresh.raw,
+            persisted
+          );
         }
+        const reloaded = loadState(validated.ownerUid);
+        if (!reloaded.ok) return restoreStateUncertain(null);
         if (reloaded.raw !== validated.stateSerialized) {
-          return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+          return friendRadarRestoreWriteOutcome(validated.ownerUid, fresh.raw, {
+            ok: false,
+            failureKind: "CONCURRENT_MODIFICATION",
+          });
         }
         return {
           ok: true,
@@ -224,10 +313,21 @@
     // the two module locks are never held at the same time.
     const followerWrite = await restoreFollowerStateFromBackup(
       validated.ownerUid,
-      validated.followerState
+      validated.followerState,
+      expectedFollowerRaw
     );
     if (followerWrite.ok) {
       return { ok: true, state: initial.state, followerRestored: true };
+    }
+
+    // Rolling Friend Radar back and calling the restore cancelled is only honest
+    // when the follower half is known not to have mutated. Once a follower
+    // mutation may already have landed, the pair is reported as uncertain and
+    // Friend Radar is left where the restore put it.
+    if (followerWrite.outcomeUnknown === true) {
+      return restoreStateUncertain(
+        followerWrite.failureKind || "UNKNOWN_FAILURE"
+      );
     }
 
     const rollback = await rollbackFriendRadarRestore(
@@ -242,6 +342,21 @@
       rollbackSucceeded: rollback.reason === "FOLLOWER_RESTORE_FAILED_ROLLED_BACK",
       followerFailureKind: followerWrite.failureKind || "UNKNOWN_FAILURE",
     };
+  }
+
+  // Runs inside the Friend Radar lock after persistState attempted the restore
+  // write. A single re-read proves non-mutation or nothing at all; it never
+  // retries and never turns a failed attempt into a success.
+  function friendRadarRestoreWriteOutcome(ownerUid, preRestoreRaw, failure) {
+    let observedRaw;
+    try {
+      observedRaw = GM_getValue(storageKey(ownerUid), null);
+    } catch (_) {
+      return restoreStateUncertain(null);
+    }
+    const normalized = typeof observedRaw === "string" ? observedRaw : null;
+    if (normalized === preRestoreRaw) return failure;
+    return restoreStateUncertain(null);
   }
 
   // Undoes this restore's Friend Radar write, and only this restore's write. The
@@ -270,7 +385,16 @@
     return state.latestSnapshot ? state.latestSnapshot.records.length : 0;
   }
 
-  function showRestorePreview(validated, currentLoaded) {
+  // Every other durable operation refuses to start while any of the three is in
+  // flight. Restore writes both module states, so it must obey the same gate at
+  // entry and again at the confirmation click, after the user wait.
+  function restoreBlockedByRunningOperation() {
+    return Boolean(
+      updateRunning || followerUpdateRunning || followerRemovalInFlight
+    );
+  }
+
+  function showRestorePreview(validated, currentLoaded, expectedFollowerRaw) {
     const body = showPanel("恢复备份", true);
     body.append(
       createElement(
@@ -319,7 +443,7 @@
     confirmButton.addEventListener("click", async () => {
       exportButton.disabled = true;
       confirmButton.disabled = true;
-      if (updateRunning) {
+      if (restoreBlockedByRunningOperation()) {
         showFailure("恢复备份失败", {
           failureKind: "UPDATE_ALREADY_RUNNING",
         });
@@ -327,7 +451,8 @@
       }
       const restored = await restoreValidatedBackup(
         validated,
-        currentLoaded.raw
+        currentLoaded.raw,
+        expectedFollowerRaw
       );
       if (!restored.ok) {
         showFailure("恢复备份失败", restored);
@@ -349,7 +474,7 @@
   }
 
   async function restoreBackup() {
-    if (updateRunning) {
+    if (restoreBlockedByRunningOperation()) {
       showFailure("恢复备份", {
         failureKind: "UPDATE_ALREADY_RUNNING",
       });
@@ -399,7 +524,19 @@
       showFailure("恢复备份", validated);
       return;
     }
-    showRestorePreview(validated, currentLoaded);
+    // The follower bytes the user is about to review become this restore's
+    // expected value, exactly as the Friend Radar raw already does. A v1 backup
+    // touches no follower state, so it neither needs nor reads the token.
+    let expectedFollowerRaw = null;
+    if (validated.followerCovered) {
+      const followerToken = currentFollowerRestoreToken(uidResult.uid);
+      if (!followerToken.ok) {
+        showFailure("恢复备份", followerToken);
+        return;
+      }
+      expectedFollowerRaw = followerToken.raw;
+    }
+    showRestorePreview(validated, currentLoaded, expectedFollowerRaw);
   }
 
   function backupExportError(backupStage, error) {

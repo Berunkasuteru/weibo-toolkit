@@ -3,7 +3,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.9.4";
+  const APP_VERSION = "0.9.5";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -116,6 +116,17 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.9.5": Object.freeze({
+      improved: Object.freeze([
+        "改进推广内容过滤在不同信息流结构下的识别与恢复行为",
+        "改进自动更新状态记录的一致性，避免不同更新尝试的结果被错误对应",
+      ]),
+      fixed: Object.freeze([
+        "修复部分内嵌推广模块可能导致正常微博整条被隐藏的问题",
+        "修复备份恢复与粉丝快照并发更新时可能覆盖较新本地状态或产生错误变化记录的问题",
+        "修复部分备份恢复失败情况下状态提示不够准确的问题",
+      ]),
+    }),
     "0.9.4": Object.freeze({
       improved: Object.freeze([
         "改进信息流页面增强的内部更新机制，减少无意义的重复处理和资源占用",

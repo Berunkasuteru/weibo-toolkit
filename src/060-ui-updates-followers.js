@@ -229,6 +229,54 @@
     appendUsageClearAction(body, owner.uid);
   }
 
+  // A restore can fail after one or both durable writes were already attempted,
+  // so it must never reuse the generic "failed before saving" note. Every reason
+  // below states what is actually known about local state, and nothing is
+  // appended that would contradict the reason line above it.
+  const RESTORE_PRE_WRITE_REASONS = Object.freeze([
+    "MALFORMED_JSON",
+    "INVALID_TOP_LEVEL",
+    "WRONG_BACKUP_FORMAT",
+    "MISSING_FOLLOWER_STATE",
+    "INVALID_FOLLOWER_STATE",
+    "UNSUPPORTED_BACKUP_VERSION",
+    "INVALID_OWNER_UID",
+    "OWNER_UID_MISMATCH",
+    "INVALID_EXPORTED_AT",
+    "INVALID_STATE",
+    "FILE_READ_ERROR",
+  ]);
+
+  const RESTORE_STATE_MESSAGES = Object.freeze({
+    FOLLOWER_RESTORE_FAILED_ROLLED_BACK:
+      "粉丝快照确认未被修改，关系雷达数据已还原为恢复前的内容。",
+    RESTORE_CONCURRENT_STATE_CHANGED:
+      "其他标签页写入的较新数据已被保留，未被本次恢复覆盖。",
+    RESTORE_STATE_UNCERTAIN:
+      "本地数据可能已被部分修改，且最终状态无法确认。请先导出当前数据并检查，再决定是否重试。",
+  });
+
+  function restoreStateMessage(reason) {
+    if (RESTORE_PRE_WRITE_REASONS.includes(reason)) {
+      return {
+        text: "本次失败发生在写入之前，关系雷达数据、粉丝快照和粉丝变化记录均未被更改。",
+        className: "wfr-muted",
+      };
+    }
+    const known = RESTORE_STATE_MESSAGES[reason];
+    if (known) {
+      return {
+        text: known,
+        className:
+          reason === "RESTORE_STATE_UNCERTAIN" ? "wfr-error" : "wfr-muted",
+      };
+    }
+    return {
+      text: RESTORE_STATE_MESSAGES.RESTORE_STATE_UNCERTAIN,
+      className: "wfr-error",
+    };
+  }
+
   function failureText(result) {
     if (result.failureKind === "BACKUP_RESTORE_ERROR") {
       const restoreMessages = {
@@ -239,8 +287,11 @@
         INVALID_FOLLOWER_STATE: "备份中的粉丝快照或粉丝变化记录无效，未恢复。",
         FOLLOWER_RESTORE_FAILED_ROLLED_BACK:
           "粉丝快照未能恢复，本次恢复已取消，关系雷达数据已回退到恢复前的状态。",
+        // Reached both when a rollback could not be confirmed and when a
+        // follower mutation may already have landed, so the wording must not
+        // assume a rollback was attempted.
         RESTORE_STATE_UNCERTAIN:
-          "恢复未能完成，且回退未能确认成功。本地数据可能处于不确定状态，请先导出并检查后再继续。",
+          "恢复未能完成，且最终状态无法确认。",
         RESTORE_CONCURRENT_STATE_CHANGED:
           "恢复未能完整完成；关系雷达数据在恢复过程中已被其他操作更新，因此没有回退这些较新的数据。请先导出并检查当前数据后再重试。",
         UNSUPPORTED_BACKUP_VERSION: "此备份版本不受支持。",
@@ -296,6 +347,13 @@
       );
       addLine(body, "失败阶段", result.exportStage);
       addLine(body, "错误类型", result.errorName);
+      return;
+    }
+    if (result.failureKind === "BACKUP_RESTORE_ERROR") {
+      const restoreState = restoreStateMessage(result.reason);
+      body.append(
+        createElement("p", restoreState.text, restoreState.className)
+      );
       return;
     }
     if (result.failureKind === "CONCURRENT_MODIFICATION") return;

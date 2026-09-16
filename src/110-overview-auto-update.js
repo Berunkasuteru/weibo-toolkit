@@ -189,11 +189,22 @@
           updateRunning = true;
           setLauncherStatus("关系雷达正在自动更新…");
           let result;
+          // An outcome is only ever written for an attempt the storage layer
+          // actually accepted, so a rejected attempt cannot leave an orphan
+          // result behind for a run that never happened.
           let attemptedAt = null;
+          let attemptRecorded = false;
           try {
             result = await performUpdate(null, () => {
-              attemptedAt = new Date().toISOString();
-              return saveLastAutomaticAttempt(uidResult.uid, attemptedAt);
+              const candidate = new Date().toISOString();
+              const saved = saveLastAutomaticAttempt(
+                uidResult.uid,
+                candidate
+              );
+              if (!saved.ok) return saved;
+              attemptedAt = candidate;
+              attemptRecorded = true;
+              return saved;
             });
           } catch (error) {
             result = {
@@ -204,16 +215,24 @@
           } finally {
             updateRunning = false;
           }
-          if (attemptedAt !== null) {
+          // Outcome metadata is advisory: a failed record never downgrades the
+          // durable scan result, but it must not be reported as a clean run.
+          const outcomeRecorded =
+            !attemptRecorded ||
             saveAutomaticOutcome(
               AUTO_OUTCOME_PREFIX,
               uidResult.uid,
               attemptedAt,
               result
-            );
-          }
+            ).ok;
           setLauncherStatus(
-            result.ok ? "关系雷达自动更新完成" : "关系雷达自动更新失败",
+            result.ok
+              ? outcomeRecorded
+                ? "关系雷达自动更新完成"
+                : "关系雷达自动更新完成，但结果记录未保存"
+              : outcomeRecorded
+                ? "关系雷达自动更新失败"
+                : "关系雷达自动更新失败，且结果记录未保存",
             AUTO_STATUS_DURATION_MS
           );
           refreshUnreadBadge();
@@ -303,7 +322,11 @@
           } finally {
             followerUpdateRunning = false;
           }
-          saveAutomaticOutcome(
+          // The attempt above is only reached once it is durably recorded, so
+          // this outcome always belongs to a real attempt; only its own
+          // persistence can fail, and that stays visible without changing the
+          // durable scan result.
+          const outcomeSaved = saveAutomaticOutcome(
             FOLLOWER_AUTO_OUTCOME_PREFIX,
             uidResult.uid,
             attemptedAt,
@@ -311,8 +334,12 @@
           );
           setLauncherStatus(
             result.ok
-              ? "粉丝快照自动更新完成"
-              : "粉丝快照自动更新失败",
+              ? outcomeSaved.ok
+                ? "粉丝快照自动更新完成"
+                : "粉丝快照自动更新完成，但结果记录未保存"
+              : outcomeSaved.ok
+                ? "粉丝快照自动更新失败"
+                : "粉丝快照自动更新失败，且结果记录未保存",
             AUTO_STATUS_DURATION_MS
           );
           return result;
@@ -429,10 +456,28 @@
     body.append(label);
     addLine(
       body,
+      "上次成功更新",
+      loaded.state.latestSnapshot === null
+        ? "—"
+        : formatTime(loaded.state.latestSnapshot.capturedAt)
+    );
+    addLine(
+      body,
       "上次自动尝试",
       lastAttempt.value === null ? "—" : formatTime(lastAttempt.value)
     );
-    addLine(body, "上次自动结果", describeAutomaticOutcome(lastOutcome.value));
+    addLine(
+      body,
+      "上次自动结果",
+      describeAutomaticOutcomeForAttempt(lastAttempt.value, lastOutcome.value)
+    );
+    body.append(
+      createElement(
+        "p",
+        "“自动尝试”记录开始请求的时间；“上次成功更新”记录快照完成并保存的时间，两者可能相差本次扫描耗时。",
+        "wfr-muted"
+      )
+    );
 
     const saveButton = createElement("button", "保存设置", "wfr-button wfr-primary");
     saveButton.type = "button";
@@ -505,6 +550,13 @@
     body.append(followerIntervalLabel);
     addLine(
       body,
+      "上次成功更新",
+      followerState.state.latestSnapshot === null
+        ? "—"
+        : formatTime(followerState.state.latestSnapshot.capturedAt)
+    );
+    addLine(
+      body,
       "上次自动尝试",
       followerLastAttempt.value === null
         ? "—"
@@ -513,7 +565,10 @@
     addLine(
       body,
       "上次自动结果",
-      describeAutomaticOutcome(followerLastOutcome.value)
+      describeAutomaticOutcomeForAttempt(
+        followerLastAttempt.value,
+        followerLastOutcome.value
+      )
     );
     body.append(
       createElement(

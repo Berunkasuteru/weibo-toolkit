@@ -344,6 +344,33 @@
       : "失败（" + detail + "）";
   }
 
+  const UNPAIRED_AUTOMATIC_OUTCOME_LABEL = "尚无对应结果记录";
+
+  // The attempt timestamp is the identity of one automatic run. An outcome
+  // record only describes the displayed attempt when it carries that exact
+  // token, so the two records are compared as strings with no tolerance: an
+  // attempt whose outcome never landed must never borrow an older result.
+  function resolveAutomaticAttemptOutcome(lastAttempt, lastOutcome) {
+    const attempt = typeof lastAttempt === "string" ? lastAttempt : null;
+    const outcome = isPlainObject(lastOutcome) ? lastOutcome : null;
+    if (attempt === null) {
+      // An outcome with no recorded attempt is leftover metadata, not a result
+      // that can be attributed to anything currently displayed.
+      return { paired: false, state: outcome === null ? "NONE" : "ORPHANED" };
+    }
+    if (outcome === null) return { paired: false, state: "MISSING" };
+    if (outcome.attemptedAt !== attempt) {
+      return { paired: false, state: "MISMATCHED" };
+    }
+    return { paired: true, state: "PAIRED", outcome };
+  }
+
+  function describeAutomaticOutcomeForAttempt(lastAttempt, lastOutcome) {
+    const resolved = resolveAutomaticAttemptOutcome(lastAttempt, lastOutcome);
+    if (resolved.paired) return describeAutomaticOutcome(resolved.outcome);
+    return resolved.state === "NONE" ? "—" : UNPAIRED_AUTOMATIC_OUTCOME_LABEL;
+  }
+
   function evaluateAutomaticUpdateEligibility(ownerUid, nowMilliseconds) {
     const interval = loadAutoInterval(ownerUid);
     if (!interval.ok) return interval;

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.9.4
+// @version      0.9.5
 // @description  Local-first Weibo toolkit for relationship tracking, follower tools, PM export, and optional page enhancements.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -922,7 +922,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.9.4";
+  const APP_VERSION = "0.9.5";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -1035,6 +1035,17 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.9.5": Object.freeze({
+      improved: Object.freeze([
+        "改进推广内容过滤在不同信息流结构下的识别与恢复行为",
+        "改进自动更新状态记录的一致性，避免不同更新尝试的结果被错误对应",
+      ]),
+      fixed: Object.freeze([
+        "修复部分内嵌推广模块可能导致正常微博整条被隐藏的问题",
+        "修复备份恢复与粉丝快照并发更新时可能覆盖较新本地状态或产生错误变化记录的问题",
+        "修复部分备份恢复失败情况下状态提示不够准确的问题",
+      ]),
+    }),
     "0.9.4": Object.freeze({
       improved: Object.freeze([
         "改进信息流页面增强的内部更新机制，减少无意义的重复处理和资源占用",
@@ -3113,6 +3124,16 @@
   async function performFollowerUpdate(onProgress, isCancelled, options = {}) {
     const ownerAtStart = determineCurrentUid();
     if (!ownerAtStart.ok) return ownerAtStart;
+    // Optimistic concurrency control for the whole scan. The durable follower
+    // bytes this scan will be diffed against are read before the first request,
+    // and the commit below refuses unless they are still exactly those bytes.
+    // Only exact identity is safe here: a backup restore may legitimately
+    // replace a newer snapshot with an older historical one, so comparing
+    // capturedAt would accept a baseline that was swapped underneath the scan.
+    // Nothing is written here, and no lock is held across the network.
+    const baseline = loadFollowerState(ownerAtStart.uid);
+    if (!baseline.ok) return baseline;
+    const scanStartFollowerRaw = baseline.raw;
     const scan = await scanFollowers(
       ownerAtStart.uid,
       onProgress,
@@ -3133,6 +3154,13 @@
       async () => {
         const fresh = loadFollowerState(ownerAtStart.uid);
         if (!fresh.ok) return fresh;
+        // The baseline this scan was computed against must still be the stored
+        // one. If it is not, the scan is discarded whole: no diff, no events, no
+        // snapshot write and no removal-pending consumption. Carrying no reason
+        // code keeps the follower failure text exactly the accurate one.
+        if (fresh.raw !== scanStartFollowerRaw) {
+          return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+        }
         if (fresh.state.latestSnapshot !== null) {
           const storedTime = Date.parse(fresh.state.latestSnapshot.capturedAt);
           const scanTime = Date.parse(scan.snapshot.capturedAt);
@@ -3488,42 +3516,44 @@
     return current?.parentElement === ancestor ? current : null;
   }
 
-  function resolvePageFeedCardParts(card) {
+  function pageFeedOuterArticles(card) {
     if (
       !hasClass(card, "wbpro-scroller-item") ||
       typeof card.querySelectorAll !== "function"
     ) {
-      return null;
+      return [];
     }
     const articles = [];
     for (const article of [
       ...elementChildren(card).filter((child) => child.tagName === "ARTICLE"),
       ...card.querySelectorAll("article"),
     ]) {
-      if (!articles.includes(article)) articles.push(article);
-    }
-    for (const article of articles) {
       if (
+        articles.includes(article) ||
         hasAncestorClassBefore(article, card, "retweet") ||
         hasAncestorClassBefore(article, card, "wbpro-feed-reText") ||
         typeof article.querySelectorAll !== "function"
       ) {
         continue;
       }
-      const headers = Array.from(article.querySelectorAll("header")).filter(
-        (candidate) =>
-          nearestAncestorTagBefore(candidate, card, "ARTICLE") === article &&
-          !hasAncestorClassBefore(candidate, article, "retweet") &&
-          !hasAncestorClassBefore(candidate, article, "wbpro-feed-reText")
-      );
-      const contents = Array.from(
-        article.querySelectorAll(".wbpro-feed-content")
-      ).filter(
-        (candidate) =>
-          nearestAncestorTagBefore(candidate, card, "ARTICLE") === article &&
-          !hasAncestorClassBefore(candidate, article, "retweet") &&
-          !hasAncestorClassBefore(candidate, article, "wbpro-feed-reText")
-      );
+      articles.push(article);
+    }
+    return articles;
+  }
+
+  function pageFeedOuterParts(card, article, selector) {
+    return Array.from(article.querySelectorAll(selector)).filter(
+      (candidate) =>
+        nearestAncestorTagBefore(candidate, card, "ARTICLE") === article &&
+        !hasAncestorClassBefore(candidate, article, "retweet") &&
+        !hasAncestorClassBefore(candidate, article, "wbpro-feed-reText")
+    );
+  }
+
+  function resolvePageFeedCardParts(card) {
+    for (const article of pageFeedOuterArticles(card)) {
+      const headers = pageFeedOuterParts(card, article, "header");
+      const contents = pageFeedOuterParts(card, article, ".wbpro-feed-content");
       for (const content of contents) {
         const contentBranch = directChildWithin(content, article);
         const header =
@@ -3533,6 +3563,21 @@
           ) || (headers.length === 1 ? headers[0] : null);
         if (header) return { card, article, header, content };
       }
+    }
+    return null;
+  }
+
+  // The promotion badge and the author controls beside it live in the outer
+  // header alone. Auto-expand still needs the body wrapper, but a promotion
+  // decision must not fail merely because ".wbpro-feed-content" is absent or
+  // renamed: an exact semantic tag in a resolvable outer header stays
+  // classifiable either way.
+  function resolvePageFeedPromotionHeader(card) {
+    const parts = resolvePageFeedCardParts(card);
+    if (parts) return parts.header;
+    for (const article of pageFeedOuterArticles(card)) {
+      const headers = pageFeedOuterParts(card, article, "header");
+      if (headers.length > 0) return headers[0];
     }
     return null;
   }
@@ -3575,9 +3620,9 @@
   }
 
   function classifyLatestRecommendedCard(card, strongMode = false) {
-    const parts = resolvePageFeedCardParts(card);
-    if (!parts) return false;
-    const tagMatch = pageFeedTagComponents(parts.header).some((component) => {
+    const header = resolvePageFeedPromotionHeader(card);
+    if (!header) return false;
+    const tagMatch = pageFeedTagComponents(header).some((component) => {
       const componentText = normalizedComponentText(component);
       const preciseMatch = componentText === "荐读";
       if (preciseMatch || !strongMode) return preciseMatch;
@@ -3588,7 +3633,7 @@
     if (tagMatch || !strongMode) return tagMatch;
     let hasFollowControl = false;
     let hasNegativeFeedbackSemantic = false;
-    walkElementSubtree(parts.header, (node) => {
+    walkElementSubtree(header, (node) => {
       if (
         node.hidden === true ||
         node.getAttribute?.("aria-hidden") === "true"
@@ -3655,8 +3700,13 @@
     }
   }
 
-  function cardContainsStrongTipsAd(card) {
+  // TipsAd is a third-party-derived module clue, not a card clue. A feed item
+  // that carries no ordinary outer post header is nothing but the ad module and
+  // stays disposable; an ad module embedded beside a real post must never take
+  // that post down with it, so there only the module itself is hidden.
+  function cardIsDisposableStrongTipsAdItem(card) {
     if (!card || !effectiveStrongFeedPromotionFilter()) return false;
+    if (resolvePageFeedPromotionHeader(card) !== null) return false;
     let containsTipsAd = false;
     walkElementSubtree(card, (node) => {
       if (!containsTipsAd && isStrongTipsAdModule(node)) {
@@ -3671,7 +3721,7 @@
     const strongMode = effectiveStrongFeedPromotionFilter();
     return Boolean(
       classifyLatestRecommendedCard(card, strongMode) ||
-        (strongMode && cardContainsStrongTipsAd(card))
+        (strongMode && cardIsDisposableStrongTipsAdItem(card))
     );
   }
 
@@ -6446,6 +6496,54 @@
     appendUsageClearAction(body, owner.uid);
   }
 
+  // A restore can fail after one or both durable writes were already attempted,
+  // so it must never reuse the generic "failed before saving" note. Every reason
+  // below states what is actually known about local state, and nothing is
+  // appended that would contradict the reason line above it.
+  const RESTORE_PRE_WRITE_REASONS = Object.freeze([
+    "MALFORMED_JSON",
+    "INVALID_TOP_LEVEL",
+    "WRONG_BACKUP_FORMAT",
+    "MISSING_FOLLOWER_STATE",
+    "INVALID_FOLLOWER_STATE",
+    "UNSUPPORTED_BACKUP_VERSION",
+    "INVALID_OWNER_UID",
+    "OWNER_UID_MISMATCH",
+    "INVALID_EXPORTED_AT",
+    "INVALID_STATE",
+    "FILE_READ_ERROR",
+  ]);
+
+  const RESTORE_STATE_MESSAGES = Object.freeze({
+    FOLLOWER_RESTORE_FAILED_ROLLED_BACK:
+      "粉丝快照确认未被修改，关系雷达数据已还原为恢复前的内容。",
+    RESTORE_CONCURRENT_STATE_CHANGED:
+      "其他标签页写入的较新数据已被保留，未被本次恢复覆盖。",
+    RESTORE_STATE_UNCERTAIN:
+      "本地数据可能已被部分修改，且最终状态无法确认。请先导出当前数据并检查，再决定是否重试。",
+  });
+
+  function restoreStateMessage(reason) {
+    if (RESTORE_PRE_WRITE_REASONS.includes(reason)) {
+      return {
+        text: "本次失败发生在写入之前，关系雷达数据、粉丝快照和粉丝变化记录均未被更改。",
+        className: "wfr-muted",
+      };
+    }
+    const known = RESTORE_STATE_MESSAGES[reason];
+    if (known) {
+      return {
+        text: known,
+        className:
+          reason === "RESTORE_STATE_UNCERTAIN" ? "wfr-error" : "wfr-muted",
+      };
+    }
+    return {
+      text: RESTORE_STATE_MESSAGES.RESTORE_STATE_UNCERTAIN,
+      className: "wfr-error",
+    };
+  }
+
   function failureText(result) {
     if (result.failureKind === "BACKUP_RESTORE_ERROR") {
       const restoreMessages = {
@@ -6456,8 +6554,11 @@
         INVALID_FOLLOWER_STATE: "备份中的粉丝快照或粉丝变化记录无效，未恢复。",
         FOLLOWER_RESTORE_FAILED_ROLLED_BACK:
           "粉丝快照未能恢复，本次恢复已取消，关系雷达数据已回退到恢复前的状态。",
+        // Reached both when a rollback could not be confirmed and when a
+        // follower mutation may already have landed, so the wording must not
+        // assume a rollback was attempted.
         RESTORE_STATE_UNCERTAIN:
-          "恢复未能完成，且回退未能确认成功。本地数据可能处于不确定状态，请先导出并检查后再继续。",
+          "恢复未能完成，且最终状态无法确认。",
         RESTORE_CONCURRENT_STATE_CHANGED:
           "恢复未能完整完成；关系雷达数据在恢复过程中已被其他操作更新，因此没有回退这些较新的数据。请先导出并检查当前数据后再重试。",
         UNSUPPORTED_BACKUP_VERSION: "此备份版本不受支持。",
@@ -6513,6 +6614,13 @@
       );
       addLine(body, "失败阶段", result.exportStage);
       addLine(body, "错误类型", result.errorName);
+      return;
+    }
+    if (result.failureKind === "BACKUP_RESTORE_ERROR") {
+      const restoreState = restoreStateMessage(result.reason);
+      body.append(
+        createElement("p", restoreState.text, restoreState.className)
+      );
       return;
     }
     if (result.failureKind === "CONCURRENT_MODIFICATION") return;
@@ -9429,6 +9537,33 @@
       : "失败（" + detail + "）";
   }
 
+  const UNPAIRED_AUTOMATIC_OUTCOME_LABEL = "尚无对应结果记录";
+
+  // The attempt timestamp is the identity of one automatic run. An outcome
+  // record only describes the displayed attempt when it carries that exact
+  // token, so the two records are compared as strings with no tolerance: an
+  // attempt whose outcome never landed must never borrow an older result.
+  function resolveAutomaticAttemptOutcome(lastAttempt, lastOutcome) {
+    const attempt = typeof lastAttempt === "string" ? lastAttempt : null;
+    const outcome = isPlainObject(lastOutcome) ? lastOutcome : null;
+    if (attempt === null) {
+      // An outcome with no recorded attempt is leftover metadata, not a result
+      // that can be attributed to anything currently displayed.
+      return { paired: false, state: outcome === null ? "NONE" : "ORPHANED" };
+    }
+    if (outcome === null) return { paired: false, state: "MISSING" };
+    if (outcome.attemptedAt !== attempt) {
+      return { paired: false, state: "MISMATCHED" };
+    }
+    return { paired: true, state: "PAIRED", outcome };
+  }
+
+  function describeAutomaticOutcomeForAttempt(lastAttempt, lastOutcome) {
+    const resolved = resolveAutomaticAttemptOutcome(lastAttempt, lastOutcome);
+    if (resolved.paired) return describeAutomaticOutcome(resolved.outcome);
+    return resolved.state === "NONE" ? "—" : UNPAIRED_AUTOMATIC_OUTCOME_LABEL;
+  }
+
   function evaluateAutomaticUpdateEligibility(ownerUid, nowMilliseconds) {
     const interval = loadAutoInterval(ownerUid);
     if (!interval.ok) return interval;
@@ -9734,27 +9869,95 @@
   // follower state lock, reads the current value there, and writes exactly what
   // the backup represents: the stored state, or nothing at all when the backup
   // explicitly recorded that no durable follower state existed.
-  async function restoreFollowerStateFromBackup(ownerUid, followerState) {
+  // Reads the exact follower bytes the user is about to review. Absence is a
+  // real reviewed value, so it is represented as null rather than as a failure.
+  function currentFollowerRestoreToken(ownerUid) {
+    try {
+      const raw = GM_getValue(followerStorageKey(ownerUid), null);
+      return { ok: true, raw: typeof raw === "string" ? raw : null };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "FOLLOWER_STATE_UNREADABLE",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  // Called only after a follower mutator was already attempted. A thrown write,
+  // a thrown delete or a failed verification does not prove the effect did not
+  // land, so one bounded re-read inside the still-held lock is used solely to
+  // prove non-mutation. It never upgrades a failed attempt to success and never
+  // retries the mutation.
+  function classifyAttemptedFollowerMutation(key, expectedRaw, failure) {
+    let observedRaw;
+    try {
+      observedRaw = GM_getValue(key, null);
+    } catch (_) {
+      return { ...failure, ok: false, mutationAttempted: true, outcomeUnknown: true };
+    }
+    const normalized = typeof observedRaw === "string" ? observedRaw : null;
+    if (normalized === expectedRaw) {
+      return { ...failure, ok: false, mutationAttempted: true, outcomeUnknown: false };
+    }
+    return { ...failure, ok: false, mutationAttempted: true, outcomeUnknown: true };
+  }
+
+  // The follower half obeys the same preview-time concurrency principle as the
+  // Friend Radar half: the bytes the user reviewed must still be the stored ones.
+  // The expected value is the preview token, never a read taken immediately
+  // before the write, which would always agree with itself.
+  async function restoreFollowerStateFromBackup(
+    ownerUid,
+    followerState,
+    expectedFollowerRaw
+  ) {
     return await withFollowerStateLock(ownerUid, async () => {
       const key = followerStorageKey(ownerUid);
+      let currentRaw;
+      try {
+        currentRaw = GM_getValue(key, null);
+      } catch (error) {
+        return {
+          ok: false,
+          mutationAttempted: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "FOLLOWER_STATE_UNREADABLE",
+          errorName: error && error.name ? String(error.name) : "Error",
+        };
+      }
+      const normalizedCurrent = typeof currentRaw === "string" ? currentRaw : null;
+      if (normalizedCurrent !== expectedFollowerRaw) {
+        return {
+          ok: false,
+          mutationAttempted: false,
+          failureKind: "CONCURRENT_MODIFICATION",
+        };
+      }
       if (followerState === null) {
         try {
           GM_deleteValue(key);
           if (GM_getValue(key, null) !== null) {
-            return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+            return classifyAttemptedFollowerMutation(key, expectedFollowerRaw, {
+              failureKind: "CONCURRENT_MODIFICATION",
+            });
           }
-          return { ok: true };
+          return { ok: true, mutationAttempted: true };
         } catch (error) {
-          return {
-            ok: false,
+          return classifyAttemptedFollowerMutation(key, expectedFollowerRaw, {
             failureKind: "PERSISTENCE_ERROR",
             errorName: error && error.name ? String(error.name) : "Error",
-          };
+          });
         }
       }
-      const fresh = GM_getValue(key, null);
-      const expectedRaw = typeof fresh === "string" ? fresh : null;
-      return persistFollowerState(ownerUid, followerState, expectedRaw);
+      const persisted = persistFollowerState(
+        ownerUid,
+        followerState,
+        expectedFollowerRaw
+      );
+      if (persisted.ok) return { ok: true, mutationAttempted: true };
+      return classifyAttemptedFollowerMutation(key, expectedFollowerRaw, persisted);
     });
   }
 
@@ -9763,7 +9966,22 @@
   // follower state inside its own short lock. Nothing else is held while that
   // lock is taken, and no lock is held while the user is deciding, so no cycle
   // is possible. If the follower half fails, the Friend Radar half is put back.
-  async function restoreValidatedBackup(validated, expectedCurrentRaw) {
+  function restoreStateUncertain(followerFailureKind) {
+    const result = {
+      ok: false,
+      failureKind: "BACKUP_RESTORE_ERROR",
+      reason: "RESTORE_STATE_UNCERTAIN",
+      rollbackSucceeded: false,
+    };
+    if (followerFailureKind) result.followerFailureKind = followerFailureKind;
+    return result;
+  }
+
+  async function restoreValidatedBackup(
+    validated,
+    expectedCurrentRaw,
+    expectedFollowerRaw
+  ) {
     const currentUid = determineCurrentUid();
     if (!currentUid.ok || currentUid.uid !== validated.ownerUid) {
       return {
@@ -9785,18 +10003,24 @@
           return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
         }
         const persisted = persistState(validated.ownerUid, validated.state);
-        if (!persisted.ok) return persisted;
-        const reloaded = loadState(validated.ownerUid);
-        if (!reloaded.ok) {
-          return {
-            ok: false,
-            failureKind: "PERSISTENCE_ERROR",
-            errorName: "RestoreVerificationError",
-            rollbackSucceeded: false,
-          };
+        // The pre-write comparison above already passed, so from here the write
+        // has been attempted and a failure no longer proves nothing was stored.
+        // One bounded re-read inside this lock is used only to prove that the
+        // bytes are still the pre-restore ones; anything else is uncertain.
+        if (!persisted.ok) {
+          return friendRadarRestoreWriteOutcome(
+            validated.ownerUid,
+            fresh.raw,
+            persisted
+          );
         }
+        const reloaded = loadState(validated.ownerUid);
+        if (!reloaded.ok) return restoreStateUncertain(null);
         if (reloaded.raw !== validated.stateSerialized) {
-          return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+          return friendRadarRestoreWriteOutcome(validated.ownerUid, fresh.raw, {
+            ok: false,
+            failureKind: "CONCURRENT_MODIFICATION",
+          });
         }
         return {
           ok: true,
@@ -9818,10 +10042,21 @@
     // the two module locks are never held at the same time.
     const followerWrite = await restoreFollowerStateFromBackup(
       validated.ownerUid,
-      validated.followerState
+      validated.followerState,
+      expectedFollowerRaw
     );
     if (followerWrite.ok) {
       return { ok: true, state: initial.state, followerRestored: true };
+    }
+
+    // Rolling Friend Radar back and calling the restore cancelled is only honest
+    // when the follower half is known not to have mutated. Once a follower
+    // mutation may already have landed, the pair is reported as uncertain and
+    // Friend Radar is left where the restore put it.
+    if (followerWrite.outcomeUnknown === true) {
+      return restoreStateUncertain(
+        followerWrite.failureKind || "UNKNOWN_FAILURE"
+      );
     }
 
     const rollback = await rollbackFriendRadarRestore(
@@ -9836,6 +10071,21 @@
       rollbackSucceeded: rollback.reason === "FOLLOWER_RESTORE_FAILED_ROLLED_BACK",
       followerFailureKind: followerWrite.failureKind || "UNKNOWN_FAILURE",
     };
+  }
+
+  // Runs inside the Friend Radar lock after persistState attempted the restore
+  // write. A single re-read proves non-mutation or nothing at all; it never
+  // retries and never turns a failed attempt into a success.
+  function friendRadarRestoreWriteOutcome(ownerUid, preRestoreRaw, failure) {
+    let observedRaw;
+    try {
+      observedRaw = GM_getValue(storageKey(ownerUid), null);
+    } catch (_) {
+      return restoreStateUncertain(null);
+    }
+    const normalized = typeof observedRaw === "string" ? observedRaw : null;
+    if (normalized === preRestoreRaw) return failure;
+    return restoreStateUncertain(null);
   }
 
   // Undoes this restore's Friend Radar write, and only this restore's write. The
@@ -9864,7 +10114,16 @@
     return state.latestSnapshot ? state.latestSnapshot.records.length : 0;
   }
 
-  function showRestorePreview(validated, currentLoaded) {
+  // Every other durable operation refuses to start while any of the three is in
+  // flight. Restore writes both module states, so it must obey the same gate at
+  // entry and again at the confirmation click, after the user wait.
+  function restoreBlockedByRunningOperation() {
+    return Boolean(
+      updateRunning || followerUpdateRunning || followerRemovalInFlight
+    );
+  }
+
+  function showRestorePreview(validated, currentLoaded, expectedFollowerRaw) {
     const body = showPanel("恢复备份", true);
     body.append(
       createElement(
@@ -9913,7 +10172,7 @@
     confirmButton.addEventListener("click", async () => {
       exportButton.disabled = true;
       confirmButton.disabled = true;
-      if (updateRunning) {
+      if (restoreBlockedByRunningOperation()) {
         showFailure("恢复备份失败", {
           failureKind: "UPDATE_ALREADY_RUNNING",
         });
@@ -9921,7 +10180,8 @@
       }
       const restored = await restoreValidatedBackup(
         validated,
-        currentLoaded.raw
+        currentLoaded.raw,
+        expectedFollowerRaw
       );
       if (!restored.ok) {
         showFailure("恢复备份失败", restored);
@@ -9943,7 +10203,7 @@
   }
 
   async function restoreBackup() {
-    if (updateRunning) {
+    if (restoreBlockedByRunningOperation()) {
       showFailure("恢复备份", {
         failureKind: "UPDATE_ALREADY_RUNNING",
       });
@@ -9993,7 +10253,19 @@
       showFailure("恢复备份", validated);
       return;
     }
-    showRestorePreview(validated, currentLoaded);
+    // The follower bytes the user is about to review become this restore's
+    // expected value, exactly as the Friend Radar raw already does. A v1 backup
+    // touches no follower state, so it neither needs nor reads the token.
+    let expectedFollowerRaw = null;
+    if (validated.followerCovered) {
+      const followerToken = currentFollowerRestoreToken(uidResult.uid);
+      if (!followerToken.ok) {
+        showFailure("恢复备份", followerToken);
+        return;
+      }
+      expectedFollowerRaw = followerToken.raw;
+    }
+    showRestorePreview(validated, currentLoaded, expectedFollowerRaw);
   }
 
   function backupExportError(backupStage, error) {
@@ -10411,11 +10683,22 @@
           updateRunning = true;
           setLauncherStatus("关系雷达正在自动更新…");
           let result;
+          // An outcome is only ever written for an attempt the storage layer
+          // actually accepted, so a rejected attempt cannot leave an orphan
+          // result behind for a run that never happened.
           let attemptedAt = null;
+          let attemptRecorded = false;
           try {
             result = await performUpdate(null, () => {
-              attemptedAt = new Date().toISOString();
-              return saveLastAutomaticAttempt(uidResult.uid, attemptedAt);
+              const candidate = new Date().toISOString();
+              const saved = saveLastAutomaticAttempt(
+                uidResult.uid,
+                candidate
+              );
+              if (!saved.ok) return saved;
+              attemptedAt = candidate;
+              attemptRecorded = true;
+              return saved;
             });
           } catch (error) {
             result = {
@@ -10426,16 +10709,24 @@
           } finally {
             updateRunning = false;
           }
-          if (attemptedAt !== null) {
+          // Outcome metadata is advisory: a failed record never downgrades the
+          // durable scan result, but it must not be reported as a clean run.
+          const outcomeRecorded =
+            !attemptRecorded ||
             saveAutomaticOutcome(
               AUTO_OUTCOME_PREFIX,
               uidResult.uid,
               attemptedAt,
               result
-            );
-          }
+            ).ok;
           setLauncherStatus(
-            result.ok ? "关系雷达自动更新完成" : "关系雷达自动更新失败",
+            result.ok
+              ? outcomeRecorded
+                ? "关系雷达自动更新完成"
+                : "关系雷达自动更新完成，但结果记录未保存"
+              : outcomeRecorded
+                ? "关系雷达自动更新失败"
+                : "关系雷达自动更新失败，且结果记录未保存",
             AUTO_STATUS_DURATION_MS
           );
           refreshUnreadBadge();
@@ -10525,7 +10816,11 @@
           } finally {
             followerUpdateRunning = false;
           }
-          saveAutomaticOutcome(
+          // The attempt above is only reached once it is durably recorded, so
+          // this outcome always belongs to a real attempt; only its own
+          // persistence can fail, and that stays visible without changing the
+          // durable scan result.
+          const outcomeSaved = saveAutomaticOutcome(
             FOLLOWER_AUTO_OUTCOME_PREFIX,
             uidResult.uid,
             attemptedAt,
@@ -10533,8 +10828,12 @@
           );
           setLauncherStatus(
             result.ok
-              ? "粉丝快照自动更新完成"
-              : "粉丝快照自动更新失败",
+              ? outcomeSaved.ok
+                ? "粉丝快照自动更新完成"
+                : "粉丝快照自动更新完成，但结果记录未保存"
+              : outcomeSaved.ok
+                ? "粉丝快照自动更新失败"
+                : "粉丝快照自动更新失败，且结果记录未保存",
             AUTO_STATUS_DURATION_MS
           );
           return result;
@@ -10651,10 +10950,28 @@
     body.append(label);
     addLine(
       body,
+      "上次成功更新",
+      loaded.state.latestSnapshot === null
+        ? "—"
+        : formatTime(loaded.state.latestSnapshot.capturedAt)
+    );
+    addLine(
+      body,
       "上次自动尝试",
       lastAttempt.value === null ? "—" : formatTime(lastAttempt.value)
     );
-    addLine(body, "上次自动结果", describeAutomaticOutcome(lastOutcome.value));
+    addLine(
+      body,
+      "上次自动结果",
+      describeAutomaticOutcomeForAttempt(lastAttempt.value, lastOutcome.value)
+    );
+    body.append(
+      createElement(
+        "p",
+        "“自动尝试”记录开始请求的时间；“上次成功更新”记录快照完成并保存的时间，两者可能相差本次扫描耗时。",
+        "wfr-muted"
+      )
+    );
 
     const saveButton = createElement("button", "保存设置", "wfr-button wfr-primary");
     saveButton.type = "button";
@@ -10727,6 +11044,13 @@
     body.append(followerIntervalLabel);
     addLine(
       body,
+      "上次成功更新",
+      followerState.state.latestSnapshot === null
+        ? "—"
+        : formatTime(followerState.state.latestSnapshot.capturedAt)
+    );
+    addLine(
+      body,
       "上次自动尝试",
       followerLastAttempt.value === null
         ? "—"
@@ -10735,7 +11059,10 @@
     addLine(
       body,
       "上次自动结果",
-      describeAutomaticOutcome(followerLastOutcome.value)
+      describeAutomaticOutcomeForAttempt(
+        followerLastAttempt.value,
+        followerLastOutcome.value
+      )
     );
     body.append(
       createElement(
