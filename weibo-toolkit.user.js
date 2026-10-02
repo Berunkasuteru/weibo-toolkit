@@ -1,0 +1,15007 @@
+// ==UserScript==
+// @name         Weibo Toolkit - Friend Radar
+// @namespace    local.weibo-toolkit
+// @version      0.10.0
+// @description  Local-first Weibo toolkit with private friend notes, relationship tracking, follower tools, PM export, and optional page enhancements.
+// @match        https://weibo.com/*
+// @match        https://api.weibo.com/chat*
+// @license      MPL-2.0
+// @grant        GM_registerMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        unsafeWindow
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  if (isPrivateMessageSurface()) {
+    installPrivateMessageExportModule();
+    return;
+  }
+
+  function isPrivateMessageSurface() {
+    return (
+      typeof location !== "undefined" &&
+      location.origin === "https://api.weibo.com" &&
+      typeof location.pathname === "string" &&
+      location.pathname.startsWith("/chat")
+    );
+  }
+
+  function normalizePrivateMessageId(value) {
+    if (typeof value === "number") {
+      return Number.isSafeInteger(value) && value > 0 ? String(value) : null;
+    }
+    if (typeof value === "string") {
+      const candidate = value.trim();
+      return /^[1-9]\d*$/.test(candidate) ? candidate : null;
+    }
+    return null;
+  }
+
+  function comparePrivateMessageIds(left, right) {
+    return left.length === right.length
+      ? left.localeCompare(right)
+      : left.length - right.length;
+  }
+
+  function decrementPrivateMessageId(value) {
+    try {
+      const result = BigInt(value) - 1n;
+      return result > 0n ? result.toString() : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function registerPrivateMessageCursor(seenCursors, cursor) {
+    if (seenCursors.has(cursor)) throw new Error("REPEATED_CURSOR");
+    seenCursors.add(cursor);
+  }
+
+  function privateMessageParticipantChanged(expectedUid, currentUid) {
+    const expected = normalizePrivateMessageId(expectedUid);
+    const current = normalizePrivateMessageId(currentUid);
+    return !expected || !current || expected !== current;
+  }
+
+  function privateMessageLongRunBoundary(
+    successfulPages,
+    restInterval = 100,
+    emergencyFuse = 5000
+  ) {
+    if (
+      !Number.isSafeInteger(successfulPages) ||
+      successfulPages <= 0
+    ) {
+      return null;
+    }
+    if (successfulPages >= emergencyFuse) return "SAFETY_FUSE";
+    if (successfulPages % restInterval === 0) return "AUTO_REST";
+    return null;
+  }
+
+  function privateMessageSafetyFuseTermination(kind, action) {
+    if (action === "cancel") return "CANCELLED";
+    if (action === "export" && kind === "SAFETY_FUSE") return "SAFETY_FUSE";
+    return "INVALID";
+  }
+
+  function classifyPrivateMessageSender(senderId, ownerUid, participantUid) {
+    const sender = normalizePrivateMessageId(senderId);
+    if (!sender) return null;
+    if (sender === ownerUid) return "A";
+    if (sender === participantUid) return "B";
+    return null;
+  }
+
+  function normalizePrivateMessageText(value) {
+    if (typeof value !== "string" || value.length === 0) return "";
+    const template = document.createElement("template");
+    template.innerHTML = value.replace(/<br\s*\/?>/gi, "\n");
+    return (template.content.textContent || "").replace(/\r\n?/g, "\n");
+  }
+
+  function escapePrivateMessageLineField(value) {
+    let escaped = "";
+    for (const character of String(value).replace(/\r\n?/g, "\n")) {
+      const code = character.codePointAt(0);
+      if (character === "\\") escaped += "\\\\";
+      else if (character === "\t") escaped += "\\t";
+      else if (character === "\n") escaped += "\\n";
+      else if (code < 0x20 || code === 0x7f) {
+        escaped += `\\x${code.toString(16).toUpperCase().padStart(2, "0")}`;
+      } else escaped += character;
+    }
+    return escaped;
+  }
+
+  function safePrivateMessageTypeCode(value) {
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
+      return value.trim();
+    }
+    return "未知";
+  }
+
+  function privateMessageCompactMarkers(message) {
+    const markers = [];
+    if (Array.isArray(message.pic_infos) && message.pic_infos.length > 0) {
+      markers.push(`I${message.pic_infos.length}`);
+    }
+    if (Array.isArray(message.url_objects) && message.url_objects.length > 0) {
+      markers.push("L");
+    }
+    if (
+      Array.isArray(message.additional_messages) &&
+      message.additional_messages.length > 0
+    ) {
+      markers.push("X:add");
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(message, "recall_status") &&
+      message.recall_status !== null &&
+      String(message.recall_status) !== "0"
+    ) {
+      markers.push("X:recall");
+    }
+
+    const dmType = safePrivateMessageTypeCode(message.dm_type);
+    const subType = safePrivateMessageTypeCode(message.sub_type);
+    const mediaType = safePrivateMessageTypeCode(message.media_type);
+    if (dmType !== "1") {
+      markers.push(`X:dm=${dmType}`);
+    }
+    if (subType !== "0") {
+      markers.push(`X:sub=${subType}`);
+    }
+    if (!["0", "1"].includes(mediaType)) {
+      markers.push(`X:media=${mediaType}`);
+    } else if (mediaType === "1" && !markers.some((marker) => /^I\d+$/.test(marker))) {
+      markers.push("X:media=1");
+    }
+    return [...new Set(markers)];
+  }
+
+  function parsePrivateMessageTimestamp(value) {
+    if (
+      !(
+        (typeof value === "string" && value.trim()) ||
+        (typeof value === "number" && Number.isFinite(value))
+      )
+    ) {
+      return { source: "时间不可用", compact: false };
+    }
+    const source = String(value).replace(/[\r\n]+/g, " ").trim();
+    const months = {
+      Jan: "01", Feb: "02", Mar: "03", Apr: "04", May: "05", Jun: "06",
+      Jul: "07", Aug: "08", Sep: "09", Oct: "10", Nov: "11", Dec: "12",
+    };
+    const weibo = source.match(
+      /^(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+[+-]\d{4}\s+(\d{4})$/
+    );
+    if (weibo) {
+      return {
+        source,
+        compact: true,
+        date: `${weibo[6]}-${months[weibo[1]]}-${weibo[2].padStart(2, "0")}`,
+        minute: `${weibo[3]}:${weibo[4]}`,
+        second: `${weibo[3]}:${weibo[4]}:${weibo[5]}`,
+      };
+    }
+    const iso = source.match(
+      /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/
+    );
+    if (iso) {
+      return {
+        source,
+        compact: true,
+        date: `${iso[1]}-${iso[2]}-${iso[3]}`,
+        minute: `${iso[4]}:${iso[5]}`,
+        second: `${iso[4]}:${iso[5]}:${iso[6] || "00"}`,
+      };
+    }
+    return { source, compact: false };
+  }
+
+  function normalizePrivateMessageRecord(message, ownerUid, participantUid) {
+    const direction = classifyPrivateMessageSender(
+      message.sender_id,
+      ownerUid,
+      participantUid
+    );
+    if (!direction) throw new Error("UNEXPECTED_SENDER");
+    const body = normalizePrivateMessageText(message.text);
+    const markers = privateMessageCompactMarkers(message);
+    return {
+      speaker: direction,
+      timestamp: parsePrivateMessageTimestamp(message.created_at),
+      body,
+      markers,
+    };
+  }
+
+  function privateMessageFilename(exportedAt) {
+    const timestamp = exportedAt
+      .toISOString()
+      .replace(/[-:]/g, "")
+      .replace("T", "-")
+      .replace(/\.\d{3}Z$/, "");
+    return `微博私信_${timestamp}.md`;
+  }
+
+  function validatePrivateMessagePage(data, expectedCursor, seenIds) {
+    if (!data || typeof data !== "object" || !Array.isArray(data.direct_messages)) {
+      throw new Error("UNEXPECTED_SCHEMA");
+    }
+    const messages = data.direct_messages;
+    if (messages.length === 0) {
+      return { messages, nextCursor: null, naturalEnd: true };
+    }
+    const ids = [];
+    const withinPage = new Set();
+    for (const message of messages) {
+      if (!message || typeof message !== "object" || Array.isArray(message)) {
+        throw new Error("UNEXPECTED_SCHEMA");
+      }
+      const id = normalizePrivateMessageId(message.id);
+      const sender = normalizePrivateMessageId(message.sender_id);
+      if (!id || !sender) throw new Error("UNEXPECTED_SCHEMA");
+      if (
+        Object.prototype.hasOwnProperty.call(message, "mid") &&
+        !normalizePrivateMessageId(message.mid)
+      ) {
+        throw new Error("UNEXPECTED_SCHEMA");
+      }
+      if (withinPage.has(id) || seenIds.has(id)) throw new Error("DUPLICATE_MESSAGE");
+      if (expectedCursor !== "0" && comparePrivateMessageIds(id, expectedCursor) > 0) {
+        throw new Error("PAGINATION_NOT_OLDER");
+      }
+      withinPage.add(id);
+      ids.push(id);
+    }
+    for (let index = 1; index < ids.length; index += 1) {
+      if (comparePrivateMessageIds(ids[index], ids[index - 1]) >= 0) {
+        throw new Error("MESSAGE_ORDER_UNEXPECTED");
+      }
+    }
+    const oldest = ids[ids.length - 1];
+    const nextCursor = decrementPrivateMessageId(oldest);
+    if (!nextCursor) throw new Error("PAGINATION_CURSOR_INVALID");
+    if (
+      expectedCursor !== "0" &&
+      comparePrivateMessageIds(nextCursor, expectedCursor) >= 0
+    ) {
+      throw new Error("PAGINATION_NOT_PROGRESSING");
+    }
+    return { messages, ids, nextCursor, naturalEnd: false };
+  }
+
+  function privateMessageAi3TimeToken(record, useSeconds, context) {
+    if (!record.timestamp.compact) {
+      context.date = null;
+      context.hour = null;
+      context.minute = null;
+      return `@T:${escapePrivateMessageLineField(record.timestamp.source)}`;
+    }
+    const exactTime = useSeconds
+      ? record.timestamp.second
+      : record.timestamp.minute;
+    const [hour, minute, second] = exactTime.split(":");
+    let token;
+    if (context.date !== record.timestamp.date) {
+      token = `@${record.timestamp.date} ${exactTime}`;
+    } else if (context.hour !== hour) {
+      token = `@${exactTime}`;
+    } else if (context.minute !== minute) {
+      token = exactTime.slice(3);
+    } else if (useSeconds) {
+      token = `:${second}`;
+    } else {
+      // A second record in the same minute would have made `useSeconds` true
+      // for both. Keep this branch explicit rather than relying on that global
+      // counting invariant for parseability.
+      token = minute;
+    }
+    context.date = record.timestamp.date;
+    context.hour = hour;
+    context.minute = minute;
+    return token;
+  }
+
+  function renderPrivateMessageAi3Record(record, timeToken) {
+    const speakerAndFlags = [record.speaker, ...record.markers].join("|");
+    return `${timeToken}\t${speakerAndFlags}\t${escapePrivateMessageLineField(record.body)}`;
+  }
+
+  function buildPrivateMessageMarkdown(records, termination) {
+    const compactDates = records
+      .map((record) => record.timestamp)
+      .filter((timestamp) => timestamp.compact)
+      .map((timestamp) => timestamp.date);
+    const allDatesKnown = compactDates.length === records.length;
+    const range =
+      records.length > 0 && allDatesKnown
+        ? `${compactDates[0]}~${compactDates[compactDates.length - 1]}`
+        : "未知";
+    const minuteCounts = new Map();
+    for (const record of records) {
+      if (!record.timestamp.compact) continue;
+      const key = `${record.timestamp.date}|${record.timestamp.minute}`;
+      minuteCounts.set(key, (minuteCounts.get(key) || 0) + 1);
+    }
+    const blocks = [
+      "# 微博私信｜AI分析版",
+      "FORMAT=WEIBO_PM_AI_3",
+      "P=A,B",
+      "IDENTITY_MAPPING=OMITTED",
+      "T=@date/time anchor;MM[:SS]=same hour;:SS=same minute",
+      "C=I<n>:图片数;L:链接/卡片;X:特殊或未支持消息",
+      `N=${records.length}`,
+      `RANGE=${range}`,
+      `END=${termination}`,
+      "SCOPE=仅包含本次导出时微博当前接口可访问并返回的该会话消息；已删除、撤回、不可访问或未被接口返回的内容可能缺失。",
+      "",
+    ];
+    const timeContext = { date: null, hour: null, minute: null };
+    for (const record of records) {
+      const minuteKey = record.timestamp.compact
+        ? `${record.timestamp.date}|${record.timestamp.minute}`
+        : "";
+      const useSeconds =
+        record.timestamp.compact && minuteCounts.get(minuteKey) > 1;
+      blocks.push(
+        renderPrivateMessageAi3Record(
+          record,
+          privateMessageAi3TimeToken(record, useSeconds, timeContext)
+        )
+      );
+    }
+    return `${blocks.join("\n").trimEnd()}\n`;
+  }
+
+  function privateMessageConversationChanged(expectedParticipantUid) {
+    const current = privateMessageConversationContext();
+    return (
+      !current.ok ||
+      privateMessageParticipantChanged(
+        expectedParticipantUid,
+        current.participantUid
+      )
+    );
+  }
+
+  function privateMessageConversationContext() {
+    const selected = document.querySelector(".sessionlist.active");
+    const ownerUid = normalizePrivateMessageId(
+      document.querySelector(".user .left .hidden, .user .hidden")?.textContent || ""
+    );
+    const participantUid = normalizePrivateMessageId(
+      selected?.querySelector(".hidden")?.textContent || ""
+    );
+    const participantName = selected?.querySelector(".username")?.textContent?.trim() || "";
+    const ordinaryAvatar = selected?.querySelector(".avatar.radius-c");
+    const messageSurface = document.querySelector(".right-container .message");
+    const composer = document.querySelector(".right-container textarea");
+    if (
+      !selected ||
+      !ownerUid ||
+      !participantUid ||
+      ownerUid === participantUid ||
+      !participantName ||
+      !ordinaryAvatar ||
+      !messageSurface ||
+      !composer
+    ) {
+      return { ok: false, reason: "UNSUPPORTED_CONVERSATION" };
+    }
+    return {
+      ok: true,
+      ownerUid,
+      participantUid,
+      participantName: participantName.replace(/[\r\n]+/g, " ").trim(),
+      messageSurface,
+    };
+  }
+
+  function installPrivateMessageExportModule() {
+    const ENDPOINT = "/webim/2/direct_messages/conversation.json";
+    const PAGE_SIZE = 100;
+    const REQUEST_DELAY_MS = 750;
+    const AUTO_REST_PAGES = 100;
+    const AUTO_REST_MS = 5000;
+    // Final pathological-loop fuse: 5,000 proven 15-message pages is a
+    // theoretical 75,000 records, not a supported-history guarantee.
+    const MAX_PM_HISTORY_REQUESTS = 5000;
+    const SOURCE = "209678993";
+    const ROOT_ID = "wfr-pm-export-root";
+    let generation = 0;
+    let task = null;
+    let root = null;
+    let scheduled = false;
+    let controlParticipantUid = null;
+
+    function setUi(mode, text) {
+      if (!root) return;
+      const button = root.querySelector("button");
+      const status = root.querySelector("span");
+      const checkpoint = root.querySelector(".wfr-pm-export-checkpoint");
+      if (!button || !status || !checkpoint) return;
+      const disabled = mode === "disabled";
+      const buttonText = mode === "running" ? "取消" : "导出 Markdown";
+      const statusText = text || "";
+      if (button.disabled !== disabled) button.disabled = disabled;
+      if (button.textContent !== buttonText) button.textContent = buttonText;
+      if (button.hidden !== (mode === "checkpoint")) {
+        button.hidden = mode === "checkpoint";
+      }
+      if (checkpoint.hidden !== (mode !== "checkpoint")) {
+        checkpoint.hidden = mode !== "checkpoint";
+      }
+      if (status.textContent !== statusText) status.textContent = statusText;
+      if (root.dataset.mode !== mode) root.dataset.mode = mode;
+    }
+
+    // The File System Access API lives on the page realm. Userscript sandboxes do
+    // not always mirror it, so the page window is preferred and the sandbox
+    // window is the fallback. No new @grant is required: unsafeWindow is already
+    // requested by this script.
+    function privateMessagePickerWindow() {
+      try {
+        if (
+          typeof unsafeWindow !== "undefined" &&
+          unsafeWindow &&
+          typeof unsafeWindow.showSaveFilePicker === "function"
+        ) {
+          return unsafeWindow;
+        }
+      } catch (_) {
+        // A blocked page realm simply means the picker is unavailable.
+      }
+      try {
+        if (
+          typeof window !== "undefined" &&
+          window &&
+          typeof window.showSaveFilePicker === "function"
+        ) {
+          return window;
+        }
+      } catch (_) {
+        // Same: unavailable, never fatal.
+      }
+      return null;
+    }
+
+    function ensureControl() {
+      scheduled = false;
+      const context = privateMessageConversationContext();
+      const messageSurface = document.querySelector(".right-container .message");
+      if (!messageSurface) {
+        root = null;
+        controlParticipantUid = null;
+        return;
+      }
+      const existing = document.getElementById(ROOT_ID);
+      if (existing && existing.parentNode !== messageSurface) existing.remove();
+      root = document.getElementById(ROOT_ID);
+      if (!root) {
+        root = document.createElement("div");
+        root.id = ROOT_ID;
+        root.className = "wfr-pm-export-root";
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "wfr-pm-export-button";
+        const status = document.createElement("span");
+        status.className = "wfr-pm-export-status";
+        const checkpoint = document.createElement("div");
+        checkpoint.className = "wfr-pm-export-checkpoint";
+        checkpoint.hidden = true;
+        for (const [action, text] of [
+          ["export", "导出当前已读取"],
+          ["cancel", "取消"],
+        ]) {
+          const choice = document.createElement("button");
+          choice.type = "button";
+          choice.className = "wfr-pm-export-choice";
+          choice.dataset.action = action;
+          choice.textContent = text;
+          choice.addEventListener("click", () => handleCheckpointAction(action));
+          checkpoint.append(choice);
+        }
+        button.addEventListener("click", () => {
+          if (task) cancelExport();
+          else void beginExport();
+        });
+        root.append(button, status, checkpoint);
+        messageSurface.append(root);
+      }
+      if (task?.cancelled) setUi("disabled", "正在取消…");
+      else if (task?.checkpoint) setUi("checkpoint", task.progress);
+      else if (task) setUi("running", task.progress);
+      else if (context.ok) {
+        const status =
+          controlParticipantUid === context.participantUid
+            ? root.querySelector("span")?.textContent || ""
+            : "";
+        controlParticipantUid = context.participantUid;
+        setUi("idle", status);
+      } else {
+        controlParticipantUid = null;
+        setUi("disabled", "仅支持当前普通单聊");
+      }
+    }
+
+    function scheduleEnsure() {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(ensureControl);
+    }
+
+    function requestUrl(participantUid, cursor) {
+      const url = new URL(ENDPOINT, location.origin);
+      url.searchParams.set("convert_emoji", "1");
+      url.searchParams.set("count", String(PAGE_SIZE));
+      url.searchParams.set("max_id", cursor);
+      url.searchParams.set("uid", participantUid);
+      url.searchParams.set("is_include_group", "0");
+      url.searchParams.set("from_contacts", "1");
+      url.searchParams.set("source", SOURCE);
+      url.searchParams.set("t", String(Date.now()));
+      return url;
+    }
+
+    async function requestPage(session, cursor, controller) {
+      const response = await fetch(requestUrl(session.participantUid, cursor).href, {
+        method: "GET",
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+        redirect: "follow",
+        signal: controller.signal,
+      });
+      const contentType = response.headers.get("content-type") || "";
+      const body = await response.text();
+      if (!response.ok) throw new Error(response.status === 401 ? "LOGIN_REQUIRED" : "HTTP_ERROR");
+      if (!/(?:application|text)\/[^;]*json/i.test(contentType)) {
+        throw new Error("UNEXPECTED_CONTENT_TYPE");
+      }
+      let data;
+      try {
+        data = JSON.parse(body);
+      } catch (_) {
+        throw new Error("NON_JSON_RESPONSE");
+      }
+      if (String(data?.error_code || "") === "21301") {
+        throw new Error("LOGIN_REQUIRED");
+      }
+      return data;
+    }
+
+    function throwIfStale(session, token) {
+      if (!task || task.token !== token || generation !== token) {
+        throw new Error("USER_CANCELLED");
+      }
+      if (privateMessageConversationChanged(session.participantUid)) {
+        throw new Error("CONVERSATION_CHANGED");
+      }
+      const owner = normalizePrivateMessageId(
+        document.querySelector(".user .left .hidden, .user .hidden")?.textContent || ""
+      );
+      if (owner !== session.ownerUid) throw new Error("ACCOUNT_CHANGED");
+    }
+
+    function waitForSafetyFuse() {
+      return new Promise((resolve) => {
+        task.controller = null;
+        task.checkpoint = { kind: "SAFETY_FUSE", resolve };
+        task.progress = `已读取 ${task.recordsRead} 条 · 达到绝对安全上限`;
+        setUi("checkpoint", task.progress);
+      });
+    }
+
+    function waitForAutomaticRest(session, token, delayMs = AUTO_REST_MS) {
+      throwIfStale(session, token);
+      const activeTask = task;
+      activeTask.controller = null;
+      activeTask.resting = true;
+      activeTask.progress = `已读取 ${activeTask.recordsRead} 条 · 长对话短暂休息中…`;
+      setUi("running", activeTask.progress);
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          activeTask.restCancel = null;
+          activeTask.resting = false;
+          try {
+            throwIfStale(session, token);
+            activeTask.progress = `正在读取：${activeTask.recordsRead} 条 · ${activeTask.pagesRead} 页`;
+            setUi("running", activeTask.progress);
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        }, delayMs);
+        activeTask.restCancel = () => {
+          clearTimeout(timeout);
+          activeTask.restCancel = null;
+          activeTask.resting = false;
+          reject(new Error("USER_CANCELLED"));
+        };
+      });
+    }
+
+    function handleCheckpointAction(action) {
+      const checkpoint = task?.checkpoint;
+      if (!checkpoint) return;
+      const outcome = privateMessageSafetyFuseTermination(
+        checkpoint.kind,
+        action
+      );
+      if (outcome === "INVALID") return;
+      task.checkpoint = null;
+      if (outcome === "CANCELLED") {
+        generation += 1;
+        task.cancelled = true;
+        setUi("disabled", "正在取消…");
+      } else {
+        setUi("disabled", "正在生成 Markdown…");
+      }
+      checkpoint.resolve(outcome);
+    }
+
+    async function collectHistory(session, token) {
+      const seenIds = new Set();
+      const seenCursors = new Set(["0"]);
+      const newestToOldest = [];
+      let cursor = "0";
+      for (
+        let requestNumber = 1;
+        requestNumber <= MAX_PM_HISTORY_REQUESTS;
+        requestNumber += 1
+      ) {
+        throwIfStale(session, token);
+        if (requestNumber > 1) {
+          await new Promise((resolve) => setTimeout(resolve, REQUEST_DELAY_MS));
+          throwIfStale(session, token);
+        }
+        const controller = new AbortController();
+        task.controller = controller;
+        const data = await requestPage(session, cursor, controller);
+        throwIfStale(session, token);
+        const page = validatePrivateMessagePage(data, cursor, seenIds);
+        if (page.naturalEnd) {
+          return {
+            records: newestToOldest.reverse(),
+            termination: "NATURAL_END",
+          };
+        }
+        for (let index = 0; index < page.messages.length; index += 1) {
+          const message = page.messages[index];
+          const id = page.ids[index];
+          const record = normalizePrivateMessageRecord(
+            message,
+            session.ownerUid,
+            session.participantUid
+          );
+          seenIds.add(id);
+          newestToOldest.push(record);
+        }
+        registerPrivateMessageCursor(seenCursors, page.nextCursor);
+        cursor = page.nextCursor;
+        task.pagesRead = requestNumber;
+        task.recordsRead = newestToOldest.length;
+        task.progress = `正在读取：${newestToOldest.length} 条 · ${requestNumber} 页`;
+        setUi("running", task.progress);
+        const boundary = privateMessageLongRunBoundary(
+          requestNumber,
+          AUTO_REST_PAGES,
+          MAX_PM_HISTORY_REQUESTS
+        );
+        if (boundary === "AUTO_REST") {
+          await waitForAutomaticRest(session, token);
+          throwIfStale(session, token);
+        } else if (boundary === "SAFETY_FUSE") {
+          const outcome = await waitForSafetyFuse();
+          if (outcome === "CANCELLED") throw new Error("USER_CANCELLED");
+          if (outcome === "SAFETY_FUSE") {
+            return {
+              records: newestToOldest.reverse(),
+              termination: outcome,
+            };
+          }
+        }
+      }
+      throw new Error("REQUEST_CEILING");
+    }
+
+    function downloadMarkdown(markdown, filename) {
+      const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = filename;
+      link.hidden = true;
+      document.body.append(link);
+      try {
+        link.click();
+      } finally {
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      }
+    }
+
+    // Opened only once the Markdown exists, so no writable stream is left open
+    // across the whole PM network read.
+    async function writeMarkdownToChosenFile(fileHandle, markdown) {
+      let writable;
+      try {
+        writable = await fileHandle.createWritable();
+      } catch (_) {
+        throw new Error("FILE_WRITE_FAILED");
+      }
+      try {
+        await writable.write(markdown);
+        await writable.close();
+      } catch (_) {
+        try {
+          await writable.abort();
+        } catch (__) {
+          // The write already failed; cleanup errors add nothing.
+        }
+        throw new Error("FILE_WRITE_FAILED");
+      }
+    }
+
+    // One action, best available save behavior. Where the browser offers a save
+    // picker the user picks the destination first; everywhere else the original
+    // browser-download path runs unchanged.
+    //
+    // Ordering matters: the picker is requested directly from the click, before
+    // any network work, because the user activation would otherwise be gone by
+    // the time a long conversation finished reading.
+    async function beginExport() {
+      const picker = privateMessagePickerWindow();
+      if (picker === null) {
+        await startExport();
+        return;
+      }
+      const context = privateMessageConversationContext();
+      if (!context.ok) {
+        setUi("disabled", "仅支持当前普通单聊");
+        return;
+      }
+      const startedAt = new Date();
+      let fileHandle;
+      try {
+        fileHandle = await picker.showSaveFilePicker.call(picker, {
+          suggestedName: privateMessageFilename(startedAt),
+          types: [
+            {
+              description: "Markdown",
+              accept: { "text/markdown": [".md"] },
+            },
+          ],
+        });
+      } catch (error) {
+        // Cancelling is a normal outcome, not an export failure, and nothing is
+        // written to Downloads instead.
+        setUi(
+          "idle",
+          error?.name === "AbortError" ? "已取消" : "未能选择保存位置，未开始导出"
+        );
+        return;
+      }
+      await startExport({ fileHandle, startedAt });
+    }
+
+    function failureText(code) {
+      const messages = {
+        LOGIN_REQUIRED: "登录状态异常",
+        HTTP_ERROR: "读取失败，未生成文件",
+        UNEXPECTED_CONTENT_TYPE: "返回类型发生变化",
+        NON_JSON_RESPONSE: "返回内容不是有效 JSON",
+        UNEXPECTED_SCHEMA: "返回结构发生变化",
+        DUPLICATE_MESSAGE: "检测到重复消息，已停止",
+        MESSAGE_ORDER_UNEXPECTED: "消息顺序无法可靠确认",
+        PAGINATION_CURSOR_INVALID: "分页游标无效",
+        PAGINATION_NOT_PROGRESSING: "分页未继续向更早历史移动",
+        PAGINATION_NOT_OLDER: "分页返回了超出历史边界的消息",
+        REPEATED_CURSOR: "检测到重复分页状态",
+        UNEXPECTED_SENDER: "消息发送者不属于当前单聊双方",
+        CONVERSATION_CHANGED: "当前会话已切换，导出已停止",
+        ACCOUNT_CHANGED: "登录账号发生变化，导出已停止",
+        REQUEST_CEILING: "达到安全请求上限，未生成文件",
+        FILE_WRITE_FAILED: "导出已读取完成，但写入所选文件失败",
+        USER_CANCELLED: "已取消",
+        AbortError: "已取消",
+      };
+      return messages[code] || "导出失败，未生成文件";
+    }
+
+    async function startExport(options = {}) {
+      const context = privateMessageConversationContext();
+      if (!context.ok) {
+        setUi("disabled", "仅支持当前普通单聊");
+        return;
+      }
+      const token = ++generation;
+      const session = {
+        ownerUid: context.ownerUid,
+        participantUid: context.participantUid,
+        participantName: context.participantName,
+        // A chosen-location run keeps the moment the picker was opened, so the
+        // written file matches the name the picker suggested.
+        startedAt: options.startedAt || new Date(),
+      };
+      task = {
+        token,
+        controller: null,
+        checkpoint: null,
+        resting: false,
+        restCancel: null,
+        pagesRead: 0,
+        recordsRead: 0,
+        progress: "正在读取：0 条 · 0 页",
+      };
+      setUi("running", task.progress);
+      try {
+        const result = await collectHistory(session, token);
+        throwIfStale(session, token);
+        // One formatter, one filename rule: both destinations write exactly the
+        // same bytes.
+        const markdown = buildPrivateMessageMarkdown(
+          result.records,
+          result.termination
+        );
+        const filename = privateMessageFilename(session.startedAt);
+        if (options.fileHandle) {
+          await writeMarkdownToChosenFile(options.fileHandle, markdown);
+        } else {
+          downloadMarkdown(markdown, filename);
+        }
+        const characterCount = [...markdown].length;
+        const bytes = new Blob([markdown]).size;
+        const size =
+          bytes >= 1024 * 1024
+            ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+            : `${Math.ceil(bytes / 1024)} KB`;
+        setUi(
+          "idle",
+          `${result.termination === "NATURAL_END" ? "已导出" : "已导出当前已读取"} ${result.records.length.toLocaleString()} 条 · ${characterCount.toLocaleString()} 字符 · ${size}`
+        );
+      } catch (error) {
+        const code =
+          error?.name === "AbortError"
+            ? "AbortError"
+            : error?.message || error?.name;
+        if (task?.token === token) {
+          const visible = privateMessageConversationContext();
+          if (visible.ok) controlParticipantUid = visible.participantUid;
+          setUi("idle", failureText(code));
+        }
+      } finally {
+        if (task?.token === token) task = null;
+        scheduleEnsure();
+      }
+    }
+
+    function cancelExport() {
+      if (!task) return;
+      if (task.checkpoint) {
+        handleCheckpointAction("cancel");
+        return;
+      }
+      generation += 1;
+      task.cancelled = true;
+      task.restCancel?.();
+      task.controller?.abort();
+      setUi("disabled", "正在取消…");
+    }
+
+    const style = document.createElement("style");
+    style.id = "wfr-pm-export-style";
+    style.textContent = `
+      .wfr-pm-export-root { position: absolute; top: 10px; right: 58px; z-index: 20; display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; max-width: 520px; font: 12px/1.3 system-ui, sans-serif; }
+      .wfr-pm-export-button { padding: 5px 9px; border: 1px solid #d9d9d9; border-radius: 5px; background: #fff; color: #333; cursor: pointer; }
+      .wfr-pm-export-button:hover:not(:disabled) { border-color: #ff8200; color: #ff8200; }
+      .wfr-pm-export-button:disabled { opacity: .55; cursor: default; }
+      .wfr-pm-export-button[hidden] { display: none; }
+      .wfr-pm-export-status { max-width: 260px; color: #777; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .wfr-pm-export-checkpoint { display: inline-flex; align-items: center; gap: 5px; }
+      .wfr-pm-export-checkpoint[hidden] { display: none; }
+      .wfr-pm-export-choice { padding: 4px 7px; border: 1px solid #d9d9d9; border-radius: 5px; background: #fff; color: #333; cursor: pointer; }
+    `;
+    document.head.append(style);
+    ensureControl();
+    const observer = new MutationObserver(scheduleEnsure);
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  const ENDPOINT = "/ajax/friendships/friends";
+  const REQUEST_DELAY_MS = 750;
+  const OBJECT_URL_REVOKE_DELAY_MS = 1000;
+  const MAX_REQUESTS = 100;
+  const APP_VERSION = "0.10.0";
+  const SCHEMA_VERSION = 1;
+  const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
+  const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
+  const FOLLOWER_SNAPSHOT_STORAGE_PREFIX =
+    "weiboToolkit.followerSnapshot.v1.";
+  const FOLLOWER_PAGE_SIZE = 20;
+  const FOLLOWER_REQUEST_DELAY_MS = 500;
+  const FOLLOWER_MAX_DATA_PAGES = 100;
+  const FOLLOWER_MAX_TERMINAL_VERIFICATION_REQUESTS = 1;
+  const FOLLOWER_COMPLETION = "COMPLETE_API_VISIBLE";
+  const FOLLOWER_REMOVE_ENDPOINT = "/ajax/profile/destroyFollowers";
+  // Temporary reconciliation state for removals this Toolkit itself performed and
+  // validated. It is not a removal history: it holds only a UID and the moment
+  // the success was validated, it is consumed by the next successful Snapshot,
+  // and it expires on its own.
+  const FOLLOWER_REMOVAL_PENDING_SCHEMA_VERSION = 1;
+  const FOLLOWER_REMOVAL_PENDING_STORAGE_PREFIX =
+    "weiboToolkit.followerRemovalPending.v1.";
+  const FOLLOWER_REMOVAL_PENDING_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  const FOLLOWER_FILTER_STATE = Object.freeze({
+    TRUE: "TRUE",
+    FALSE: "FALSE",
+    UNKNOWN: "UNKNOWN",
+  });
+  const FOLLOWER_EVENT = Object.freeze({
+    VISIBLE_FOLLOWER_ADDED: "VISIBLE_FOLLOWER_ADDED",
+    VISIBLE_FOLLOWER_DISAPPEARED: "VISIBLE_FOLLOWER_DISAPPEARED",
+  });
+  const FOLLOWER_EVENT_LABELS = Object.freeze({
+    [FOLLOWER_EVENT.VISIBLE_FOLLOWER_ADDED]: "新增到API可见粉丝",
+    [FOLLOWER_EVENT.VISIBLE_FOLLOWER_DISAPPEARED]:
+      "从API可见粉丝中消失",
+  });
+  const BACKUP_FORMAT = "weibo-toolkit.friend-radar";
+  // v1 carried Friend Radar durable state only. v2 adds the Follower Snapshot
+  // durable state as a sibling field; v3 adds the user's hand-written Friend
+  // Notes the same way. Each version covers exactly the modules it names, so v1
+  // and v2 files stay restorable forever and never touch what they predate.
+  const BACKUP_VERSION = 3;
+  const SUPPORTED_BACKUP_VERSIONS = Object.freeze([1, 2, 3]);
+  const BACKUP_MIME = "application/json;charset=utf-8";
+  const AUTO_INTERVAL_PREFIX = "weiboToolkit.friendRadar.autoInterval.v1.";
+  const AUTO_ATTEMPT_PREFIX = "weiboToolkit.friendRadar.autoAttempt.v1.";
+  const AUTO_OUTCOME_PREFIX = "weiboToolkit.friendRadar.autoOutcome.v1.";
+  const FOLLOWER_AUTO_INTERVAL_PREFIX =
+    "weiboToolkit.followerSnapshot.autoInterval.v1.";
+  const FOLLOWER_AUTO_ATTEMPT_PREFIX =
+    "weiboToolkit.followerSnapshot.autoAttempt.v1.";
+  const FOLLOWER_AUTO_OUTCOME_PREFIX =
+    "weiboToolkit.followerSnapshot.autoOutcome.v1.";
+  const AUTO_STARTUP_DELAY_MS = 5000;
+  const AUTO_ATTEMPT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+  const AUTO_STATUS_DURATION_MS = 5000;
+  const AUTO_INTERVAL_HOURS = Object.freeze([0, 24, 48, 72, 168, 360]);
+  const LAUNCHER_LABEL = "Weibo Toolkit";
+  // Toolkit-level appearance preference, deliberately outside the versioned
+  // Friend Radar state and outside backup v1.
+  const THEME_KEY = "weiboToolkit.theme.v1";
+  const DEFAULT_THEME = "system";
+  const HIDE_HOT_SEARCH_KEY = "weiboToolkit.page.hideHotSearch.v1";
+  const HIDE_RIGHT_SIDEBAR_KEY = "weiboToolkit.page.hideRightSidebar.v1";
+  const HIDE_TOP_RECOMMEND_KEY = "weiboToolkit.page.hideTopRecommend.v1";
+  const HIDE_TOP_VIDEO_KEY = "weiboToolkit.page.hideTopVideo.v1";
+  const PREFER_LATEST_FEED_KEY = "weiboToolkit.page.preferLatestFeed.v1";
+  const HIDE_LATEST_RECOMMENDED_KEY =
+    "weiboToolkit.page.hideLatestRecommended.v1";
+  const STRONG_FEED_PROMOTION_FILTER_KEY =
+    "weiboToolkit.page.strongFeedPromotionFilter.v1";
+  const AUTO_EXPAND_LONG_POSTS_KEY =
+    "weiboToolkit.page.autoExpandLongPosts.v1";
+  const SHOW_PROFILE_EXTRAS_KEY =
+    "weiboToolkit.page.showProfileExtras.v1";
+  const PROFILE_VISIT_STORAGE_PREFIX =
+    "weiboToolkit.profileVisits.v1.";
+  const CHANGELOG_SEEN_VERSION_KEY =
+    "weiboToolkit.ui.lastSeenChangelogVersion.v1";
+  const USAGE_ENABLED_KEY = "weiboToolkit.usage.enabled.v1";
+  const USAGE_CORNER_KEY = "weiboToolkit.usage.corner.v1";
+  const USAGE_STORAGE_PREFIX = "weiboToolkit.usage.v1.";
+  const USAGE_LOCK_PREFIX = "weibo-toolkit-usage-state-";
+  const USAGE_STATE_VERSION = 1;
+  const USAGE_INACTIVITY_MS = 60 * 1000;
+  const USAGE_HEARTBEAT_MS = 10 * 1000;
+  const USAGE_MAX_HEARTBEAT_GAP_MS = 15 * 1000;
+  const USAGE_FLUSH_MS = 20 * 1000;
+  const USAGE_POST_DWELL_MS = 800;
+  const USAGE_POST_VISIBILITY_RATIO = 0.5;
+  const USAGE_RETENTION_DAYS = 90;
+  const USAGE_CORNER_ID = "wfr-usage-corner";
+  const LATEST_FEED_SESSION_MARKER =
+    "weiboToolkit.page.latestFeedNormalized.v1";
+  const PAGE_PREFERENCE_STYLE_ID = "wfr-page-preferences-style";
+  const LATEST_RECOMMENDED_HIDDEN_CLASS =
+    "wfr-latest-recommended-hidden";
+  const STRONG_FEED_PROMOTION_HIDDEN_CLASS =
+    "wfr-strong-feed-promotion-hidden";
+  const STRONG_FEED_PROMOTION_TAG_TEXTS = Object.freeze([
+    "荐读",
+    "广告",
+    "推荐",
+    "推广",
+  ]);
+  const AUTO_EXPAND_INTERSECTION_RATIO = 0.25;
+  const PROFILE_EXTRAS_ID = "wfr-profile-extras";
+  const WEIBO_MAIN_ORIGIN = "https://weibo.com";
+  const AUTO_CHANGELOG_FROM_VERSION = "0.8.1";
+  const PROFILE_TAB_LABELS = Object.freeze([
+    "精选",
+    "微博",
+    "视频",
+    "音频",
+    "相册",
+  ]);
+  const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.10.0": Object.freeze({
+      added: Object.freeze([
+        "新增友人档案：为账号写私人备注、添加标签，并按昵称、UID、备注或标签搜索",
+        "新增可选主页和信息流友人档案；点击作者旁的书签即可查看、添加或编辑",
+        "备份升级为 Backup v3，包含友人档案；恢复旧 v1/v2 备份不会影响已有档案",
+      ]),
+      improved: Object.freeze([
+        "友人卡片默认先查看，主动编辑后才显示表单；没有实际修改时可直接关闭",
+        "信息流入口使用轻量书签，支持无评语纯转发的昵称位置；卡片过高时内部滚动",
+      ]),
+      fixed: Object.freeze([
+        "保护跨标签编辑与同页草稿，避免较新的备注被静默覆盖",
+        "信息流节点复用时重新校验作者；原微博消失后有修改的草稿停靠在窗口内",
+        "输入法组词期间的回车不会添加标签或触发保存",
+      ]),
+    }),
+    "0.9.5": Object.freeze({
+      improved: Object.freeze([
+        "改进推广内容过滤在不同信息流结构下的识别与恢复行为",
+        "改进自动更新状态记录的一致性，避免不同更新尝试的结果被错误对应",
+      ]),
+      fixed: Object.freeze([
+        "修复部分内嵌推广模块可能导致正常微博整条被隐藏的问题",
+        "修复备份恢复与粉丝快照并发更新时可能覆盖较新本地状态或产生错误变化记录的问题",
+        "修复部分备份恢复失败情况下状态提示不够准确的问题",
+      ]),
+    }),
+    "0.9.4": Object.freeze({
+      improved: Object.freeze([
+        "改进信息流页面增强的内部更新机制，减少无意义的重复处理和资源占用",
+      ]),
+      fixed: Object.freeze([
+        "修复推广过滤在部分页面结构下可能反复触发自身更新的问题",
+        "修复首页与个人主页快速切换时，信息流页面增强可能未能重新绑定的问题",
+        "修复微博信息流容器被重新创建后，页面增强可能继续停留在旧容器的问题",
+      ]),
+    }),
+    "0.9.3": Object.freeze({
+      improved: Object.freeze([
+        "优化原创长微博自动展开时机：滚动过程中不再展开，并优先在当前阅读位置稳定后处理",
+        "隐藏信息流推广内容时改进虚拟列表布局处理，减少被隐藏卡片留下大块空白",
+      ]),
+      fixed: Object.freeze([
+        "修复长微博在已经划过后从页面上方迟到展开，导致当前阅读位置明显位移的问题",
+        "修复部分推广卡片隐藏后仍保留原有虚拟列表高度、形成大面积空白的问题",
+      ]),
+    }),
+    "0.9.2": Object.freeze({
+      improved: Object.freeze([
+        "自动展开调整为“自动展开原创长微博”，并支持首页、“最新微博”和数字 UID 个人主页；转发微博保持折叠",
+        "改进信息流推广内容识别，并增强对当前微博卡片结构和虚拟列表复用的适配",
+      ]),
+      fixed: Object.freeze([
+        "修复页面加载时信息流尚未挂载，导致推广过滤或自动展开可能需要切换设置后才会启动的问题",
+        "修复正常滚动和虚拟列表复用过程中，新出现的推广卡片或原创长微博可能漏处理的问题",
+      ]),
+    }),
+    "0.9.1": Object.freeze({
+      added: Object.freeze([
+        "新增可选“强力规则”，可进一步尝试隐藏推荐、广告等推广标签和明确广告模块",
+        "新增“自动展开长微博”，可在首页和“最新微博”中自动展开进入视野的外层长微博",
+      ]),
+      improved: Object.freeze([
+        "“页面设置”整理为“浏览体验”，并分为“信息流 / 增强 / 净化”三个页签",
+        "整理页面功能与启动任务的生命周期边界，减少互相干扰",
+      ]),
+    }),
+    "0.9.0": Object.freeze({
+      improved: Object.freeze([
+        "项目源码拆分为可维护的有序源码片段，发布脚本仍保持单文件",
+        "新增可复现构建与源码/发布文件一致性校验",
+      ]),
+    }),
+    "0.8.3": Object.freeze({
+      improved: Object.freeze([
+        "“隐藏荐读”现在同时支持首页和“最新微博”",
+      ]),
+      fixed: Object.freeze([
+        "修复首页中明确标记为“荐读”的内容不会被该设置隐藏的问题",
+      ]),
+    }),
+    "0.8.2": Object.freeze({
+      improved: Object.freeze([
+        "项目说明改为中文主导，安装、隐私与功能边界更清晰",
+        "新增公开核心回归测试，便于验证关键数据语义与导出安全",
+      ]),
+    }),
+    "0.8.1": Object.freeze({
+      added: Object.freeze([
+        "最新微博可隐藏明确标记为“荐读”的内容",
+        "个人主页可显示 Toolkit 本地小档案",
+        "新增“微博计步器”，可在本地查看网页版活跃时间和浏览数量",
+      ]),
+      improved: Object.freeze(["新增版本更新提示，可查看历史更新记录"]),
+    }),
+    "0.8.0": Object.freeze({
+      added: Object.freeze([
+        "新增默认关闭的“页面设置”",
+        "每个标签页可优先一次进入按时间排序的“最新微博”",
+        "可独立隐藏微博热搜、整个右侧栏、顶部推荐或顶部视频入口",
+      ]),
+    }),
+    "0.7.1": Object.freeze({
+      improved: Object.freeze([
+        "自动更新设置可显示最近一次自动尝试的成功、失败或安全跳过结果",
+        "粉丝体检筛选布局更清晰，并支持公开微博数上限",
+      ]),
+      fixed: Object.freeze([
+        "粉丝快照自动更新不再依据不可靠的接口总数提前放弃扫描",
+      ]),
+    }),
+    "0.7.0": Object.freeze({
+      added: Object.freeze([
+        "新增粉丝快照与中性的粉丝变化记录",
+        "新增本地粉丝体检筛选",
+        "支持逐个或最多 50 个一批、逐项确认并顺序执行的移除粉丝操作",
+        "备份升级为 v2，可包含粉丝快照和粉丝变化记录",
+        "私信 Markdown 导出可在支持的浏览器中先选择保存位置",
+      ]),
+    }),
+    "0.6.0": Object.freeze({
+      added: Object.freeze([
+        "可将当前普通一对一私信会话导出为紧凑的 Markdown 对话记录",
+        "支持顺序读取较长历史、进度显示、取消和分页完整性校验",
+      ]),
+    }),
+    "0.5.2": Object.freeze({
+      improved: Object.freeze([
+        "Toolkit 外观可选择跟随系统、浅色或深色",
+        "改善浅色模式下的启动器可读性，并集中显示自动更新与外观设置",
+      ]),
+    }),
+    "0.5.1": Object.freeze({
+      added: Object.freeze([
+        "启动器新增未读事件提示，并可查看关系概览",
+        "关系事件可导出为 CSV 或 Markdown",
+      ]),
+      improved: Object.freeze([
+        "用户脚本菜单简化为一个“打开工具箱”入口",
+        "Toolkit 自有界面支持跟随系统深色外观",
+      ]),
+    }),
+    "0.5.0": Object.freeze({
+      added: Object.freeze([
+        "新增备份恢复：验证账号和文件后预览并完整替换本地关系雷达状态",
+        "新增默认关闭的页面打开时自动更新，可选择多个固定间隔",
+      ]),
+    }),
+    "0.4.0": Object.freeze({
+      added: Object.freeze([
+        "立即更新时显示当前页、请求数和已验证记录数",
+        "新增事件详情和按 UID 归并的个人关系时间线",
+        "事件列表可按昵称或 UID 搜索",
+      ]),
+    }),
+    "0.3.2": Object.freeze({
+      improved: Object.freeze([
+        "单次关系雷达扫描请求上限从 30 提高到 100",
+        "达到请求上限时显示已请求、已读取和接口报告总数",
+      ]),
+    }),
+    "0.3.1": Object.freeze({
+      improved: Object.freeze(["在用户脚本元数据中明确标注 MPL-2.0 许可"]),
+    }),
+    "0.3.0": Object.freeze({
+      added: Object.freeze([
+        "关系雷达可按稳定 UID 保存可见关注快照并比较后续变化",
+        "记录新增、消失、关注你的状态变化和昵称变化",
+        "提供独立的 Weibo Toolkit 启动器和用户脚本菜单入口",
+        "可手动导出当前账号的本地 JSON 备份",
+      ]),
+    }),
+  });
+  const THEME_VALUES = Object.freeze(["system", "light", "dark"]);
+  const THEME_CHOICES = Object.freeze([
+    ["system", "跟随系统"],
+    ["light", "浅色"],
+    ["dark", "深色"],
+  ]);
+
+  const EVENT = Object.freeze({
+    VISIBLE_FOLLOWING_ADDED: "VISIBLE_FOLLOWING_ADDED",
+    VISIBLE_FOLLOWING_DISAPPEARED: "VISIBLE_FOLLOWING_DISAPPEARED",
+    FOLLOW_ME_GAINED: "FOLLOW_ME_GAINED",
+    FOLLOW_ME_LOST: "FOLLOW_ME_LOST",
+    SCREEN_NAME_CHANGED: "SCREEN_NAME_CHANGED",
+  });
+
+  const EVENT_LABELS = Object.freeze({
+    [EVENT.VISIBLE_FOLLOWING_ADDED]: "出现在你的可见关注列表",
+    [EVENT.VISIBLE_FOLLOWING_DISAPPEARED]: "从你的可见关注列表消失",
+    [EVENT.FOLLOW_ME_GAINED]: "开始关注你",
+    [EVENT.FOLLOW_ME_LOST]: "停止关注你",
+    [EVENT.SCREEN_NAME_CHANGED]: "昵称已更改",
+  });
+
+  const FAILURE_LABELS = Object.freeze({
+    UID_UNAVAILABLE: "无法可靠识别当前登录账号",
+    ACCOUNT_CHANGED_DURING_SCAN: "扫描期间登录账号发生变化",
+    STALE_SCAN: "扫描结果早于当前已保存快照",
+    LOGIN_REQUIRED: "登录已失效，请重新登录",
+    HTTP_ERROR: "接口返回 HTTP 错误",
+    CHALLENGE_OR_UNEXPECTED_RESPONSE: "收到验证页面或意外 HTML",
+    NON_JSON_RESPONSE: "接口未返回有效 JSON",
+    UNEXPECTED_CONTENT_TYPE: "接口响应类型异常",
+    UNEXPECTED_SCHEMA: "接口数据结构异常",
+    PAGINATION_FAILURE: "分页链不可信",
+    NETWORK_ERROR: "网络请求失败",
+    PERSISTENCE_ERROR: "本地保存失败",
+    CONCURRENT_MODIFICATION:
+      "检测到另一个微博标签页正在修改关系雷达数据，本次操作未保存。请在其中一个标签页重新操作。",
+    STORAGE_ERROR: "本地状态无法读取",
+    BACKUP_EXPORT_ERROR: "备份导出失败",
+    BACKUP_RESTORE_ERROR: "备份恢复失败",
+    EVENT_EXPORT_ERROR: "事件导出失败",
+    UPDATE_ALREADY_RUNNING: "更新正在进行",
+    STATE_LOCK_UNAVAILABLE:
+      "暂时无法安全地保存本地数据，本次操作未保存。请稍后重试。",
+    UNKNOWN_FAILURE: "未知失败",
+  });
+
+  const hasOwn = (value, key) =>
+    Object.prototype.hasOwnProperty.call(value, key);
+
+  let updateRunning = false;
+  let followerUpdateRunning = false;
+  let followerCancelRequested = false;
+  let followerRemovalInFlight = false;
+  let panelRoot = null;
+  let launcherButton = null;
+  let launcherLabel = null;
+  let launcherBadge = null;
+  let launcherStatusTimer = null;
+  let currentTheme = DEFAULT_THEME;
+  let pageCleanupPreferences = null;
+  let pagePreferenceStyleNode = null;
+  let preferLatestFeed = false;
+  let pageRouteHookInstalled = false;
+  let pageRouteSyncScheduled = false;
+  let latestFeedNavigationPending = false;
+  let latestRecommendedObserver = null;
+  let latestRecommendedRoot = null;
+  let latestRecommendedDiscoveryObserver = null;
+  let latestRecommendedDiscoveryHost = null;
+  let longPostIntersectionObserver = null;
+  let longPostObservedControls = new Set();
+  let longPostClickedControlStates = new WeakMap();
+  let profileExtrasObserver = null;
+  let profileExtrasObservedMain = null;
+  let profileExtrasObservedHost = null;
+  let profileExtrasDiscoveryTimer = null;
+  let profileExtrasDiscoveryCount = 0;
+  let profileExtrasEnsureScheduled = false;
+  let activeProfileContext = null;
+  let activeProfileNicknamePopover = null;
+  let usageEnabledPreference = false;
+  let usageCornerPreference = false;
+  let usageRuntimeOwnerUid = null;
+  let usageState = null;
+  let usageSessionOwnerUid = null;
+  let usageSessionActiveSeconds = 0;
+  let usageSessionPostIds = new Set();
+  let usagePendingActiveSeconds = 0;
+  let usagePendingPostIds = new Set();
+  let usageLastActivityMonotonic = Number.NEGATIVE_INFINITY;
+  let usageLastHeartbeatMonotonic = null;
+  let usageHeartbeatTimer = null;
+  let usageFlushTimer = null;
+  let usageFlushInFlight = null;
+  let usageListenersInstalled = false;
+  let usageFeedRoot = null;
+  let usageFeedObserver = null;
+  let usageIntersectionObserver = null;
+  let usageFeedDiscoveryTimer = null;
+  let usageFeedDiscoveryCount = 0;
+  let usageCardStates = new Map();
+  let usageCornerButton = null;
+  let panelDismissHandler = null;
+
+  function normalizeStableUid(value) {
+    if (typeof value === "number") {
+      return Number.isSafeInteger(value) && value > 0 ? String(value) : null;
+    }
+    if (typeof value === "string") {
+      const candidate = value.trim();
+      return /^[1-9]\d*$/.test(candidate) ? candidate : null;
+    }
+    return null;
+  }
+
+  function normalizeNonNegativeInteger(value) {
+    if (typeof value === "number") {
+      return Number.isSafeInteger(value) && value >= 0 ? value : null;
+    }
+    if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+      const parsed = Number(value.trim());
+      return Number.isSafeInteger(parsed) ? parsed : null;
+    }
+    return null;
+  }
+
+  function determineCurrentUid() {
+    try {
+      if (typeof unsafeWindow !== "undefined" && unsafeWindow.$CONFIG) {
+        const uid = normalizeStableUid(unsafeWindow.$CONFIG.uid);
+        if (uid !== null) {
+          return { ok: true, uid, method: "unsafeWindow.$CONFIG.uid" };
+        }
+      }
+    } catch (_) {
+      // A blocked or missing page global is not evidence of an authenticated UID.
+    }
+    return { ok: false, failureKind: "UID_UNAVAILABLE" };
+  }
+
+  function delay(milliseconds) {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  }
+
+  function buildRequestUrl(ownerUid, page) {
+    const url = new URL(ENDPOINT, location.origin);
+    url.searchParams.set("uid", ownerUid);
+    url.searchParams.set("page", String(page));
+    return url;
+  }
+
+  function looksLikeLoginUrl(url) {
+    try {
+      const parsed = new URL(url);
+      return (
+        parsed.hostname === "passport.weibo.com" ||
+        /(^|\/)login(?:\/|$)/i.test(parsed.pathname)
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function looksLikeHtml(contentType, body) {
+    return (
+      /text\/html|application\/xhtml\+xml/i.test(contentType) ||
+      /^\s*(?:<!doctype\s+html|<html\b)/i.test(body)
+    );
+  }
+
+  async function requestFollowingPage(ownerUid, page) {
+    const url = buildRequestUrl(ownerUid, page);
+    let response;
+    try {
+      response = await fetch(url.href, {
+        method: "GET",
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+        redirect: "follow",
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "NETWORK_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+
+    const contentType = response.headers.get("content-type") || "unavailable";
+    let body;
+    try {
+      body = await response.text();
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "NETWORK_ERROR",
+        httpStatus: response.status,
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+
+    let data = null;
+    let validJson = false;
+    try {
+      data = JSON.parse(body);
+      validJson = true;
+    } catch (_) {
+      // Classified below without treating malformed input as an empty result.
+    }
+
+    if (looksLikeLoginUrl(response.url) || response.status === 401) {
+      return { ok: false, failureKind: "LOGIN_REQUIRED", httpStatus: response.status };
+    }
+    if (!response.ok) {
+      return { ok: false, failureKind: "HTTP_ERROR", httpStatus: response.status };
+    }
+    if (looksLikeHtml(contentType, body)) {
+      return {
+        ok: false,
+        failureKind: "CHALLENGE_OR_UNEXPECTED_RESPONSE",
+        httpStatus: response.status,
+      };
+    }
+    if (!validJson) {
+      return { ok: false, failureKind: "NON_JSON_RESPONSE", httpStatus: response.status };
+    }
+    if (!/(?:application|text)\/[^;]*json/i.test(contentType)) {
+      return {
+        ok: false,
+        failureKind: "UNEXPECTED_CONTENT_TYPE",
+        httpStatus: response.status,
+      };
+    }
+    return { ok: true, data };
+  }
+
+  function validateAndConvertUser(user) {
+    if (!user || typeof user !== "object" || Array.isArray(user)) {
+      return { ok: false, reason: "USER_RECORD_NOT_OBJECT" };
+    }
+
+    const requiredFields = [
+      "id",
+      "idstr",
+      "screen_name",
+      "following",
+      "follow_me",
+      "remark",
+    ];
+    for (const field of requiredFields) {
+      if (!hasOwn(user, field)) {
+        return { ok: false, reason: `MISSING_USER_FIELD:${field}` };
+      }
+    }
+
+    const id = normalizeStableUid(user.id);
+    const idstr = normalizeStableUid(user.idstr);
+    if (id === null || idstr === null || id !== idstr) {
+      return { ok: false, reason: "UNUSABLE_OR_CONFLICTING_STABLE_UID" };
+    }
+    if (typeof user.screen_name !== "string") {
+      return { ok: false, reason: "INVALID_SCREEN_NAME" };
+    }
+    if (typeof user.following !== "boolean") {
+      return { ok: false, reason: "INVALID_FOLLOWING_VALUE" };
+    }
+    if (typeof user.follow_me !== "boolean") {
+      return { ok: false, reason: "INVALID_FOLLOW_ME_VALUE" };
+    }
+    if (typeof user.remark !== "string" && user.remark !== null) {
+      return { ok: false, reason: "INVALID_REMARK_VALUE" };
+    }
+
+    return {
+      ok: true,
+      record: {
+        uid: idstr,
+        screenName: user.screen_name,
+        following: user.following,
+        followsMe: user.follow_me,
+        remark: user.remark,
+      },
+    };
+  }
+
+  function validatePageData(data) {
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      return { ok: false, reason: "TOP_LEVEL_NOT_OBJECT" };
+    }
+    if (hasOwn(data, "ok") && ![1, "1", true].includes(data.ok)) {
+      return { ok: false, reason: "API_OK_INDICATOR_NOT_SUCCESS" };
+    }
+    if (!Array.isArray(data.users)) {
+      return { ok: false, reason: "USERS_ARRAY_MISSING_OR_INVALID" };
+    }
+    if (!hasOwn(data, "total_number")) {
+      return { ok: false, reason: "TOTAL_NUMBER_MISSING" };
+    }
+    if (!hasOwn(data, "previous_cursor") || !hasOwn(data, "next_cursor")) {
+      return { ok: false, reason: "CURSOR_FIELD_MISSING" };
+    }
+    return { ok: true };
+  }
+
+  function reportScanProgress(onProgress, progress) {
+    if (typeof onProgress !== "function") return;
+    try {
+      onProgress(progress);
+    } catch (_) {
+      // Progress presentation is advisory only and must never affect the scan.
+    }
+  }
+
+  async function scanFollowing(ownerUid, onProgress, beforeFirstRequest) {
+    const recordsByUid = new Map();
+    const seenNextCursors = new Set();
+    const seenPaginationStates = new Set();
+    let reportedTotal = null;
+    let previousPageNextCursor = null;
+    let requestsMade = 0;
+
+    for (let page = 1; page <= MAX_REQUESTS; page += 1) {
+      if (requestsMade === 0 && typeof beforeFirstRequest === "function") {
+        const permission = beforeFirstRequest();
+        if (!permission.ok) {
+          return { ...permission, requestsMade: 0, failedPage: page };
+        }
+      }
+      if (requestsMade > 0) await delay(REQUEST_DELAY_MS);
+      requestsMade += 1;
+
+      const response = await requestFollowingPage(ownerUid, page);
+      if (!response.ok) {
+        return { ...response, requestsMade, failedPage: page };
+      }
+
+      const validation = validatePageData(response.data);
+      if (!validation.ok) {
+        return {
+          ok: false,
+          failureKind: "UNEXPECTED_SCHEMA",
+          reason: validation.reason,
+          requestsMade,
+          failedPage: page,
+        };
+      }
+
+      const pageTotal = normalizeNonNegativeInteger(response.data.total_number);
+      const previousCursor = normalizeNonNegativeInteger(
+        response.data.previous_cursor
+      );
+      const nextCursor = normalizeNonNegativeInteger(response.data.next_cursor);
+      if (pageTotal === null) {
+        return {
+          ok: false,
+          failureKind: "UNEXPECTED_SCHEMA",
+          reason: "INVALID_TOTAL_NUMBER",
+          requestsMade,
+          failedPage: page,
+        };
+      }
+      if (previousCursor === null || nextCursor === null) {
+        return {
+          ok: false,
+          failureKind: "PAGINATION_FAILURE",
+          reason: "INVALID_CURSOR_VALUE",
+          requestsMade,
+          failedPage: page,
+        };
+      }
+      if (reportedTotal === null) reportedTotal = pageTotal;
+      if (reportedTotal !== pageTotal) {
+        return {
+          ok: false,
+          failureKind: "PAGINATION_FAILURE",
+          reason: "TOTAL_NUMBER_CHANGED",
+          requestsMade,
+          failedPage: page,
+        };
+      }
+      if (
+        (page === 1 && previousCursor !== 0) ||
+        (page > 1 && previousCursor !== previousPageNextCursor)
+      ) {
+        return {
+          ok: false,
+          failureKind: "PAGINATION_FAILURE",
+          reason: "PREVIOUS_CURSOR_CHAIN_BROKEN",
+          requestsMade,
+          failedPage: page,
+        };
+      }
+
+      const paginationState = `${page}:${previousCursor}:${nextCursor}`;
+      if (seenPaginationStates.has(paginationState)) {
+        return {
+          ok: false,
+          failureKind: "PAGINATION_FAILURE",
+          reason: "REPEATED_PAGINATION_STATE",
+          requestsMade,
+          failedPage: page,
+        };
+      }
+      seenPaginationStates.add(paginationState);
+
+      for (let index = 0; index < response.data.users.length; index += 1) {
+        const converted = validateAndConvertUser(response.data.users[index]);
+        if (!converted.ok) {
+          return {
+            ok: false,
+            failureKind: "UNEXPECTED_SCHEMA",
+            reason: converted.reason,
+            requestsMade,
+            failedPage: page,
+            failedRecordIndex: index,
+          };
+        }
+        if (recordsByUid.has(converted.record.uid)) {
+          return {
+            ok: false,
+            failureKind: "PAGINATION_FAILURE",
+            reason: "DUPLICATE_STABLE_UID",
+            requestsMade,
+            failedPage: page,
+          };
+        }
+        recordsByUid.set(converted.record.uid, converted.record);
+      }
+
+      reportScanProgress(onProgress, {
+        page,
+        requestsMade,
+        visibleRecordsCollected: recordsByUid.size,
+        reportedTotal,
+      });
+
+      if (nextCursor === 0) {
+        if (recordsByUid.size > reportedTotal) {
+          return {
+            ok: false,
+            failureKind: "PAGINATION_FAILURE",
+            reason: "VISIBLE_COUNT_EXCEEDS_REPORTED_TOTAL",
+            requestsMade,
+            failedPage: page,
+          };
+        }
+        const records = [...recordsByUid.values()].sort((a, b) =>
+          a.uid.localeCompare(b.uid)
+        );
+        return {
+          ok: true,
+          requestsMade,
+          snapshot: {
+            capturedAt: new Date().toISOString(),
+            reportedTotal,
+            visibleCount: records.length,
+            unresolvedRelationCount: reportedTotal - records.length,
+            records,
+          },
+        };
+      }
+
+      const cursorKey = String(nextCursor);
+      if (seenNextCursors.has(cursorKey)) {
+        return {
+          ok: false,
+          failureKind: "PAGINATION_FAILURE",
+          reason: "REPEATED_NEXT_CURSOR",
+          requestsMade,
+          failedPage: page,
+        };
+      }
+      seenNextCursors.add(cursorKey);
+      previousPageNextCursor = nextCursor;
+    }
+
+    return {
+      ok: false,
+      failureKind: "PAGINATION_FAILURE",
+      reason: "HARD_REQUEST_CEILING_REACHED",
+      requestsMade,
+      visibleRecordsCollected: recordsByUid.size,
+      reportedTotal,
+    };
+  }
+
+  function storageKey(ownerUid) {
+    return `${STORAGE_PREFIX}${ownerUid}`;
+  }
+
+  function emptyState(ownerUid) {
+    return {
+      schemaVersion: SCHEMA_VERSION,
+      ownerUid,
+      latestSnapshot: null,
+      events: [],
+    };
+  }
+
+  function isPlainObject(value) {
+    return Boolean(value && typeof value === "object" && !Array.isArray(value));
+  }
+
+  function isValidStoredRecord(record) {
+    return Boolean(
+      isPlainObject(record) &&
+        typeof record.uid === "string" &&
+        normalizeStableUid(record.uid) === record.uid &&
+        typeof record.screenName === "string" &&
+        typeof record.following === "boolean" &&
+        typeof record.followsMe === "boolean" &&
+        (typeof record.remark === "string" || record.remark === null)
+    );
+  }
+
+  function isValidStoredSnapshot(snapshot) {
+    if (
+      !isPlainObject(snapshot) ||
+      typeof snapshot.capturedAt !== "string" ||
+      !Number.isFinite(Date.parse(snapshot.capturedAt)) ||
+      !Number.isSafeInteger(snapshot.reportedTotal) ||
+      snapshot.reportedTotal < 0 ||
+      !Number.isSafeInteger(snapshot.visibleCount) ||
+      snapshot.visibleCount < 0 ||
+      !Number.isSafeInteger(snapshot.unresolvedRelationCount) ||
+      snapshot.unresolvedRelationCount < 0 ||
+      !Array.isArray(snapshot.records) ||
+      snapshot.visibleCount !== snapshot.records.length ||
+      snapshot.reportedTotal - snapshot.visibleCount !==
+        snapshot.unresolvedRelationCount
+    ) {
+      return false;
+    }
+
+    const seenUids = new Set();
+    for (const record of snapshot.records) {
+      if (!isValidStoredRecord(record) || seenUids.has(record.uid)) return false;
+      seenUids.add(record.uid);
+    }
+    return true;
+  }
+
+  function isValidStoredEvent(event) {
+    if (
+      !isPlainObject(event) ||
+      typeof event.id !== "string" ||
+      event.id.length === 0 ||
+      !Object.values(EVENT).includes(event.type) ||
+      typeof event.detectedAt !== "string" ||
+      !Number.isFinite(Date.parse(event.detectedAt)) ||
+      typeof event.subjectUid !== "string" ||
+      normalizeStableUid(event.subjectUid) !== event.subjectUid ||
+      typeof event.displayName !== "string" ||
+      typeof event.read !== "boolean" ||
+      !isPlainObject(event.previous) ||
+      !isPlainObject(event.current)
+    ) {
+      return false;
+    }
+
+    if (event.type === EVENT.VISIBLE_FOLLOWING_ADDED) {
+      return event.previous.visible === false && event.current.visible === true;
+    }
+    if (event.type === EVENT.VISIBLE_FOLLOWING_DISAPPEARED) {
+      return event.previous.visible === true && event.current.visible === false;
+    }
+    if (event.type === EVENT.FOLLOW_ME_GAINED) {
+      return event.previous.followsMe === false && event.current.followsMe === true;
+    }
+    if (event.type === EVENT.FOLLOW_ME_LOST) {
+      return event.previous.followsMe === true && event.current.followsMe === false;
+    }
+    return (
+      typeof event.previous.screenName === "string" &&
+      typeof event.current.screenName === "string"
+    );
+  }
+
+  function isValidStoredState(state, ownerUid) {
+    return Boolean(
+      isPlainObject(state) &&
+        state.schemaVersion === SCHEMA_VERSION &&
+        state.ownerUid === ownerUid &&
+        (state.latestSnapshot === null ||
+          isValidStoredSnapshot(state.latestSnapshot)) &&
+        Array.isArray(state.events) &&
+        state.events.every(isValidStoredEvent)
+    );
+  }
+
+  function loadState(ownerUid) {
+    try {
+      const key = storageKey(ownerUid);
+      const raw = GM_getValue(key, null);
+      if (raw === null || typeof raw === "undefined") {
+        return { ok: true, state: emptyState(ownerUid), raw: null };
+      }
+      if (typeof raw !== "string") {
+        return { ok: false, failureKind: "STORAGE_ERROR", reason: "STATE_NOT_STRING" };
+      }
+      const state = JSON.parse(raw);
+      if (!isValidStoredState(state, ownerUid)) {
+        return { ok: false, failureKind: "STORAGE_ERROR", reason: "STATE_SCHEMA_INVALID" };
+      }
+      return { ok: true, state, raw };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  // Cross-tab serialization for the Friend Radar durable state, mirroring the
+  // follower one. GM storage has no atomic compare-and-swap, so the check inside
+  // persistState below is an integrity check only: this lock is what actually
+  // serializes tabs. It is owner-scoped and held only for local storage work —
+  // never across a scan, a delay, or a UI wait.
+  const FRIEND_RADAR_STATE_LOCK_PREFIX = "weibo-toolkit-friend-radar-state-";
+
+  function friendRadarStateLockUnavailable(reason, error) {
+    const result = {
+      ok: false,
+      failureKind: "STATE_LOCK_UNAVAILABLE",
+      reason,
+    };
+    if (error) result.errorName = error.name ? String(error.name) : "Error";
+    return result;
+  }
+
+  async function withFriendRadarStateLock(ownerUid, transaction) {
+    const lockManager = pageLockManager();
+    if (lockManager === null) {
+      return friendRadarStateLockUnavailable("LOCK_UNAVAILABLE");
+    }
+    try {
+      return await lockManager.request.call(
+        lockManager,
+        FRIEND_RADAR_STATE_LOCK_PREFIX + ownerUid,
+        { mode: "exclusive" },
+        async (lock) => {
+          if (lock === null) {
+            return friendRadarStateLockUnavailable("LOCK_NOT_ACQUIRED");
+          }
+          return await transaction();
+        }
+      );
+    } catch (error) {
+      return friendRadarStateLockUnavailable("LOCK_REQUEST_FAILED", error);
+    }
+  }
+
+  // Unlocked helper: callers must already hold the Friend Radar state lock. It
+  // writes exact bytes (or restores absence) so a rollback reproduces the prior
+  // value rather than a re-serialization of it.
+  function writeFriendRadarRaw(ownerUid, raw) {
+    const key = storageKey(ownerUid);
+    try {
+      if (raw === null) {
+        GM_deleteValue(key);
+        return GM_getValue(key, null) === null;
+      }
+      GM_setValue(key, raw);
+      return GM_getValue(key, null) === raw;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function persistState(ownerUid, state) {
+    const key = storageKey(ownerUid);
+    const serialized = JSON.stringify(state);
+    try {
+      GM_setValue(key, serialized);
+      const verified = GM_getValue(key, null);
+      if (verified !== serialized) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  function snapshotMap(snapshot) {
+    return new Map(snapshot.records.map((record) => [record.uid, record]));
+  }
+
+  function makeEvent(type, detectedAt, subjectUid, displayName, previous, current, index) {
+    return {
+      id: `${detectedAt}:${index + 1}:${type}:${subjectUid}`,
+      type,
+      detectedAt,
+      subjectUid,
+      displayName,
+      read: false,
+      previous,
+      current,
+    };
+  }
+
+  function diffSnapshots(previousSnapshot, currentSnapshot) {
+    const previous = snapshotMap(previousSnapshot);
+    const current = snapshotMap(currentSnapshot);
+    const events = [];
+    const detectedAt = currentSnapshot.capturedAt;
+
+    const addedUids = [...current.keys()]
+      .filter((uid) => !previous.has(uid))
+      .sort();
+    for (const uid of addedUids) {
+      const record = current.get(uid);
+      events.push(
+        makeEvent(
+          EVENT.VISIBLE_FOLLOWING_ADDED,
+          detectedAt,
+          uid,
+          record.screenName,
+          { visible: false },
+          { visible: true },
+          events.length
+        )
+      );
+    }
+
+    const disappearedUids = [...previous.keys()]
+      .filter((uid) => !current.has(uid))
+      .sort();
+    for (const uid of disappearedUids) {
+      const record = previous.get(uid);
+      events.push(
+        makeEvent(
+          EVENT.VISIBLE_FOLLOWING_DISAPPEARED,
+          detectedAt,
+          uid,
+          record.screenName,
+          { visible: true },
+          { visible: false },
+          events.length
+        )
+      );
+    }
+
+    const sharedUids = [...current.keys()]
+      .filter((uid) => previous.has(uid))
+      .sort();
+    for (const uid of sharedUids) {
+      const before = previous.get(uid);
+      const after = current.get(uid);
+
+      if (before.screenName !== after.screenName) {
+        events.push(
+          makeEvent(
+            EVENT.SCREEN_NAME_CHANGED,
+            detectedAt,
+            uid,
+            after.screenName,
+            { screenName: before.screenName },
+            { screenName: after.screenName },
+            events.length
+          )
+        );
+      }
+      if (before.followsMe === false && after.followsMe === true) {
+        events.push(
+          makeEvent(
+            EVENT.FOLLOW_ME_GAINED,
+            detectedAt,
+            uid,
+            after.screenName,
+            { followsMe: false },
+            { followsMe: true },
+            events.length
+          )
+        );
+      } else if (before.followsMe === true && after.followsMe === false) {
+        events.push(
+          makeEvent(
+            EVENT.FOLLOW_ME_LOST,
+            detectedAt,
+            uid,
+            after.screenName,
+            { followsMe: true },
+            { followsMe: false },
+            events.length
+          )
+        );
+      }
+    }
+
+    return events;
+  }
+
+  function prepareSuccessfulUpdate(ownerUid, previousState, snapshot) {
+    if (previousState.ownerUid !== ownerUid) {
+      return { ok: false, failureKind: "STORAGE_ERROR", reason: "OWNER_UID_MISMATCH" };
+    }
+    const baselineCreated = previousState.latestSnapshot === null;
+    const newEvents = baselineCreated
+      ? []
+      : diffSnapshots(previousState.latestSnapshot, snapshot);
+    return {
+      ok: true,
+      baselineCreated,
+      newEvents,
+      state: {
+        schemaVersion: SCHEMA_VERSION,
+        ownerUid,
+        latestSnapshot: snapshot,
+        events: [...previousState.events, ...newEvents],
+      },
+    };
+  }
+
+  function markAllEventsRead(state) {
+    return {
+      ...state,
+      events: state.events.map((event) => ({ ...event, read: true })),
+    };
+  }
+
+  // Unread is derived from events[].read on demand. No unread counter is persisted,
+  // and nothing here may change read state.
+  function countUnreadEvents(events) {
+    return events.filter((event) => !event.read).length;
+  }
+
+  function formatUnreadBadge(unreadEventCount) {
+    if (!Number.isSafeInteger(unreadEventCount) || unreadEventCount <= 0) {
+      return null;
+    }
+    return unreadEventCount > 99 ? "99+" : String(unreadEventCount);
+  }
+
+  // Read-only derivation over the already validated snapshot and stored events.
+  // Current counts describe the latest snapshot; historical counts are event
+  // occurrences, so one UID can contribute several times to the same type.
+  function deriveRelationshipOverview(state) {
+    const historicalEventCounts = {};
+    for (const type of Object.values(EVENT)) historicalEventCounts[type] = 0;
+    for (const event of state.events) {
+      if (hasOwn(historicalEventCounts, event.type)) {
+        historicalEventCounts[event.type] += 1;
+      }
+    }
+
+    const snapshot = state.latestSnapshot;
+    let current = null;
+    if (snapshot !== null) {
+      // Every snapshot record is an account the user follows, so "one-way" is
+      // exactly the visible records not observed as following back.
+      const mutual = snapshot.records.filter((record) => record.followsMe).length;
+      current = {
+        capturedAt: snapshot.capturedAt,
+        visibleFollowing: snapshot.visibleCount,
+        mutual,
+        oneWay: snapshot.visibleCount - mutual,
+      };
+    }
+
+    return {
+      hasBaseline: snapshot !== null,
+      current,
+      totalEvents: state.events.length,
+      unreadEvents: countUnreadEvents(state.events),
+      historicalEventCounts,
+    };
+  }
+
+  function checkScanFreshness(state, snapshot) {
+    if (state.latestSnapshot === null) return { ok: true };
+    const storedTime = Date.parse(state.latestSnapshot.capturedAt);
+    const scanTime = Date.parse(snapshot.capturedAt);
+    if (!Number.isFinite(storedTime) || !Number.isFinite(scanTime)) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "INVALID_SNAPSHOT_TIMESTAMP",
+      };
+    }
+    if (storedTime > scanTime) {
+      return { ok: false, failureKind: "STALE_SCAN" };
+    }
+    return { ok: true };
+  }
+
+  async function performUpdate(onProgress, beforeFirstRequest) {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) return uidResult;
+
+    const scan = await scanFollowing(
+      uidResult.uid,
+      onProgress,
+      beforeFirstRequest
+    );
+    if (!scan.ok) return scan;
+
+    const currentUid = determineCurrentUid();
+    if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
+      return { ok: false, failureKind: "ACCOUNT_CHANGED_DURING_SCAN" };
+    }
+
+    // The scan is finished before the lock is taken. Everything below is a short
+    // local transaction over state read inside the lock, so a state another tab
+    // committed meanwhile is seen by the freshness check instead of overwritten.
+    const committed = await withFriendRadarStateLock(
+      uidResult.uid,
+      async () => {
+        const loaded = loadState(uidResult.uid);
+        if (!loaded.ok) return loaded;
+
+        const freshness = checkScanFreshness(loaded.state, scan.snapshot);
+        if (!freshness.ok) return freshness;
+
+        const prepared = prepareSuccessfulUpdate(
+          uidResult.uid,
+          loaded.state,
+          scan.snapshot
+        );
+        if (!prepared.ok) return prepared;
+
+        const persisted = persistState(uidResult.uid, prepared.state);
+        if (!persisted.ok) return persisted;
+        return { ok: true, prepared };
+      }
+    );
+    if (!committed.ok) return committed;
+    const prepared = committed.prepared;
+
+    return {
+      ok: true,
+      ownerUid: uidResult.uid,
+      snapshot: scan.snapshot,
+      requestsMade: scan.requestsMade,
+      baselineCreated: prepared.baselineCreated,
+      newEvents: prepared.newEvents,
+      totalStoredEvents: prepared.state.events.length,
+    };
+  }
+
+  function normalizeFollowerOptionalBoolean(value) {
+    return typeof value === "boolean" ? value : null;
+  }
+
+  function normalizeFollowerOptionalCount(value) {
+    return normalizeNonNegativeInteger(value);
+  }
+
+  function normalizeFollowerOptionalVerifiedType(value) {
+    if (typeof value === "number" && Number.isSafeInteger(value)) return value;
+    if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
+      const parsed = Number(value.trim());
+      return Number.isSafeInteger(parsed) ? parsed : null;
+    }
+    return null;
+  }
+
+  function normalizeFollowerOptionalDate(value) {
+    if (typeof value !== "string") return null;
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
+  }
+
+  function normalizeFollowerOptionalString(value) {
+    return typeof value === "string" ? value : null;
+  }
+
+  function normalizeFollowerRecord(user) {
+    if (!isPlainObject(user)) {
+      return { ok: false, reason: "USER_RECORD_NOT_OBJECT" };
+    }
+    if (!hasOwn(user, "id") || !hasOwn(user, "idstr")) {
+      return { ok: false, reason: "MEMBERSHIP_IDENTIFIER_MISSING" };
+    }
+    const id = normalizeStableUid(user.id);
+    const idstr = normalizeStableUid(user.idstr);
+    if (id === null || idstr === null || id !== idstr) {
+      return { ok: false, reason: "UNUSABLE_OR_CONFLICTING_STABLE_UID" };
+    }
+    const sourceText =
+      isPlainObject(user.origin_source_info) &&
+      typeof user.origin_source_info.text === "string"
+        ? user.origin_source_info.text
+        : null;
+    return {
+      ok: true,
+      record: {
+        uid: idstr,
+        screenName: normalizeFollowerOptionalString(user.screen_name),
+        ownerFollowing: normalizeFollowerOptionalBoolean(user.following),
+        followMe: normalizeFollowerOptionalBoolean(user.follow_me),
+        followersCount: normalizeFollowerOptionalCount(user.followers_count),
+        friendsCount: normalizeFollowerOptionalCount(user.friends_count),
+        statusesCount: normalizeFollowerOptionalCount(user.statuses_count),
+        createdAt: normalizeFollowerOptionalDate(user.created_at),
+        verified: normalizeFollowerOptionalBoolean(user.verified),
+        verifiedType: normalizeFollowerOptionalVerifiedType(user.verified_type),
+        sourceText,
+        optionalMetadataConflict: false,
+      },
+    };
+  }
+
+  const FOLLOWER_OPTIONAL_RECORD_FIELDS = Object.freeze([
+    "screenName",
+    "ownerFollowing",
+    "followMe",
+    "followersCount",
+    "friendsCount",
+    "statusesCount",
+    "createdAt",
+    "verified",
+    "verifiedType",
+    "sourceText",
+  ]);
+
+  function mergeFollowerRecords(existing, incoming) {
+    let conflictObserved = existing.record.optionalMetadataConflict;
+    for (const field of FOLLOWER_OPTIONAL_RECORD_FIELDS) {
+      if (existing.conflicts.has(field)) continue;
+      const before = existing.record[field];
+      const after = incoming[field];
+      if (before === null) {
+        existing.record[field] = after;
+      } else if (after !== null && before !== after) {
+        existing.record[field] = null;
+        existing.conflicts.add(field);
+        conflictObserved = true;
+      }
+    }
+    existing.record.optionalMetadataConflict = conflictObserved;
+    return conflictObserved;
+  }
+
+  function buildFollowerRequestUrl(ownerUid, page) {
+    const url = new URL(ENDPOINT, location.origin);
+    url.searchParams.set("uid", ownerUid);
+    url.searchParams.set("relate", "fans");
+    url.searchParams.set("type", "fans");
+    url.searchParams.set("fansSortType", "followTime");
+    url.searchParams.set("count", String(FOLLOWER_PAGE_SIZE));
+    url.searchParams.set("page", String(page));
+    return url;
+  }
+
+  async function requestFollowerPage(ownerUid, page) {
+    const url = buildFollowerRequestUrl(ownerUid, page);
+    let response;
+    try {
+      response = await fetch(url.href, {
+        method: "GET",
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+        redirect: "follow",
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "NETWORK_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+    const contentType = response.headers.get("content-type") || "unavailable";
+    let body;
+    try {
+      body = await response.text();
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "NETWORK_ERROR",
+        httpStatus: response.status,
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+    let data = null;
+    let validJson = false;
+    try {
+      data = JSON.parse(body);
+      validJson = true;
+    } catch (_) {
+      // Classified below.
+    }
+    if (looksLikeLoginUrl(response.url) || response.status === 401) {
+      return { ok: false, failureKind: "LOGIN_REQUIRED", httpStatus: response.status };
+    }
+    if (!response.ok || response.status !== 200) {
+      return { ok: false, failureKind: "HTTP_ERROR", httpStatus: response.status };
+    }
+    if (looksLikeHtml(contentType, body)) {
+      return {
+        ok: false,
+        failureKind: "CHALLENGE_OR_UNEXPECTED_RESPONSE",
+        httpStatus: response.status,
+      };
+    }
+    if (!validJson) {
+      return {
+        ok: false,
+        failureKind: "NON_JSON_RESPONSE",
+        httpStatus: response.status,
+      };
+    }
+    if (!/(?:application|text)\/[^;]*json/i.test(contentType)) {
+      return {
+        ok: false,
+        failureKind: "UNEXPECTED_CONTENT_TYPE",
+        httpStatus: response.status,
+      };
+    }
+    return { ok: true, data };
+  }
+
+  function createFollowerTriStateTracker() {
+    return { anyTrue: false, observedFalse: 0, unknown: false };
+  }
+
+  function observeFollowerTriState(tracker, data, field) {
+    if (!hasOwn(data, field) || typeof data[field] !== "boolean") {
+      tracker.unknown = true;
+      return;
+    }
+    if (data[field] === true) tracker.anyTrue = true;
+    else tracker.observedFalse += 1;
+  }
+
+  function finishFollowerTriState(tracker) {
+    if (tracker.anyTrue) return FOLLOWER_FILTER_STATE.TRUE;
+    if (!tracker.unknown && tracker.observedFalse > 0) {
+      return FOLLOWER_FILTER_STATE.FALSE;
+    }
+    return FOLLOWER_FILTER_STATE.UNKNOWN;
+  }
+
+  function createFollowerTotalTracker() {
+    return { observed: false, invalid: false, conflict: false, value: null };
+  }
+
+  function observeFollowerTotal(tracker, data, field) {
+    if (!hasOwn(data, field)) return;
+    const value = normalizeNonNegativeInteger(data[field]);
+    if (value === null) {
+      tracker.invalid = true;
+      return;
+    }
+    if (!tracker.observed) {
+      tracker.observed = true;
+      tracker.value = value;
+    } else if (tracker.value !== value) {
+      tracker.conflict = true;
+    }
+  }
+
+  function finishFollowerTotal(tracker) {
+    return tracker.observed && !tracker.invalid && !tracker.conflict
+      ? tracker.value
+      : null;
+  }
+
+  function validateFollowerPageData(data, page) {
+    if (!isPlainObject(data)) {
+      return { ok: false, reason: "TOP_LEVEL_NOT_OBJECT" };
+    }
+    if (!hasOwn(data, "ok") || ![1, "1", true].includes(data.ok)) {
+      return { ok: false, reason: "API_OK_INDICATOR_NOT_SUCCESS" };
+    }
+    if (!Array.isArray(data.users)) {
+      return { ok: false, reason: "USERS_ARRAY_MISSING_OR_INVALID" };
+    }
+    const previousCursor = hasOwn(data, "previous_cursor")
+      ? normalizeNonNegativeInteger(data.previous_cursor)
+      : null;
+    const nextCursor = hasOwn(data, "next_cursor")
+      ? normalizeNonNegativeInteger(data.next_cursor)
+      : null;
+    if (previousCursor === null || nextCursor === null) {
+      return { ok: false, reason: "INVALID_CURSOR_VALUE" };
+    }
+    if (page === 1 && previousCursor !== 0) {
+      return { ok: false, reason: "FIRST_PAGE_PREVIOUS_CURSOR_NOT_ZERO" };
+    }
+    const nextPage = hasOwn(data, "next_page")
+      ? normalizeNonNegativeInteger(data.next_page)
+      : null;
+    if (hasOwn(data, "next_page") && nextPage === null) {
+      return { ok: false, reason: "INVALID_NEXT_PAGE_VALUE" };
+    }
+    return { ok: true, previousCursor, nextCursor, nextPage };
+  }
+
+  function reportFollowerScanProgress(onProgress, progress) {
+    if (typeof onProgress !== "function") return;
+    try {
+      onProgress(progress);
+    } catch (_) {
+      // Presentation cannot affect scan integrity.
+    }
+  }
+
+  async function scanFollowers(ownerUid, onProgress, isCancelled, options = {}) {
+    const recordsByUid = new Map();
+    const seenPaginationStates = new Set();
+    const hasFilteredFans = createFollowerTriStateTracker();
+    const sinkStrategy = createFollowerTriStateTracker();
+    const totalNumber = createFollowerTotalTracker();
+    const displayTotalNumber = createFollowerTotalTracker();
+    const followersCount = createFollowerTotalTracker();
+    let requestsMade = 0;
+    let dataPagesRead = 0;
+    let terminalVerificationRequests = 0;
+    let rawRecordCount = 0;
+    let crossPageDuplicateCount = 0;
+    let optionalMetadataConflictObserved = false;
+    let previousPageWasNonempty = false;
+    const finalRequestPage =
+      FOLLOWER_MAX_DATA_PAGES + FOLLOWER_MAX_TERMINAL_VERIFICATION_REQUESTS;
+
+    for (let page = 1; page <= finalRequestPage; page += 1) {
+      if (typeof isCancelled === "function" && isCancelled()) {
+        return { ok: false, failureKind: "FOLLOWER_SCAN_CANCELLED", requestsMade };
+      }
+      if (requestsMade > 0) await delay(FOLLOWER_REQUEST_DELAY_MS);
+      if (typeof isCancelled === "function" && isCancelled()) {
+        return { ok: false, failureKind: "FOLLOWER_SCAN_CANCELLED", requestsMade };
+      }
+      const ownerBeforeRequest = determineCurrentUid();
+      if (!ownerBeforeRequest.ok || ownerBeforeRequest.uid !== ownerUid) {
+        return {
+          ok: false,
+          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+          requestsMade,
+          failedPage: page,
+        };
+      }
+
+      requestsMade += 1;
+      const request = await requestFollowerPage(ownerUid, page);
+      if (!request.ok) return { ...request, requestsMade, failedPage: page };
+      if (typeof isCancelled === "function" && isCancelled()) {
+        return { ok: false, failureKind: "FOLLOWER_SCAN_CANCELLED", requestsMade };
+      }
+      const validation = validateFollowerPageData(request.data, page);
+      if (!validation.ok) {
+        return {
+          ok: false,
+          failureKind: "PAGINATION_FAILURE",
+          reason: validation.reason,
+          requestsMade,
+          failedPage: page,
+        };
+      }
+      const paginationState =
+        String(validation.previousCursor) +
+        ":" +
+        String(validation.nextCursor) +
+        ":" +
+        String(request.data.users.length);
+      if (seenPaginationStates.has(paginationState)) {
+        return {
+          ok: false,
+          failureKind: "PAGINATION_FAILURE",
+          reason: "REPEATED_PAGINATION_STATE",
+          requestsMade,
+          failedPage: page,
+        };
+      }
+      seenPaginationStates.add(paginationState);
+
+      observeFollowerTriState(
+        hasFilteredFans,
+        request.data,
+        "has_filtered_fans"
+      );
+      observeFollowerTriState(
+        sinkStrategy,
+        request.data,
+        "use_sink_stragety"
+      );
+      observeFollowerTotal(totalNumber, request.data, "total_number");
+      observeFollowerTotal(
+        displayTotalNumber,
+        request.data,
+        "display_total_number"
+      );
+      observeFollowerTotal(followersCount, request.data, "followers_count");
+
+      if (request.data.users.length === 0) {
+        terminalVerificationRequests += 1;
+        if (!previousPageWasNonempty || validation.nextCursor !== 0) {
+          return {
+            ok: false,
+            failureKind: "PAGINATION_FAILURE",
+            reason: "UNEXPECTED_TERMINAL_PAGE",
+            requestsMade,
+            failedPage: page,
+          };
+        }
+        const hasFilteredFansState = finishFollowerTriState(hasFilteredFans);
+        const sinkStrategyState = finishFollowerTriState(sinkStrategy);
+        const records = [...recordsByUid.values()]
+          .map((entry) => entry.record)
+          .sort((left, right) => left.uid.localeCompare(right.uid));
+        return {
+          ok: true,
+          requestsMade,
+          snapshot: {
+            schemaVersion: FOLLOWER_SNAPSHOT_SCHEMA_VERSION,
+            ownerUid,
+            capturedAt: new Date().toISOString(),
+            completion: FOLLOWER_COMPLETION,
+            pageSizeRequested: FOLLOWER_PAGE_SIZE,
+            dataPagesRead,
+            terminalVerificationRequests,
+            requestsMade,
+            rawRecordCount,
+            uniqueRecordCount: records.length,
+            crossPageDuplicateCount,
+            hasFilteredFansState,
+            sinkStrategyState,
+            filteredVisibilityObserved:
+              hasFilteredFansState === FOLLOWER_FILTER_STATE.TRUE ||
+              sinkStrategyState === FOLLOWER_FILTER_STATE.TRUE,
+            optionalMetadataConflictObserved,
+            totalNumber: finishFollowerTotal(totalNumber),
+            displayTotalNumber: finishFollowerTotal(displayTotalNumber),
+            followersCount: finishFollowerTotal(followersCount),
+            terminalEvidence: {
+              page,
+              recordCount: 0,
+              previousCursor: validation.previousCursor,
+              nextCursor: validation.nextCursor,
+              nextPage: validation.nextPage,
+            },
+            records,
+          },
+        };
+      }
+
+      if (page > FOLLOWER_MAX_DATA_PAGES) {
+        return {
+          ok: false,
+          failureKind: "PAGINATION_FAILURE",
+          reason: "FOLLOWER_SAFETY_CEILING_REACHED",
+          requestsMade,
+          failedPage: page,
+          visibleRecordsCollected: recordsByUid.size,
+        };
+      }
+
+      dataPagesRead += 1;
+      previousPageWasNonempty = true;
+      const pageUids = new Set();
+      rawRecordCount += request.data.users.length;
+      for (let index = 0; index < request.data.users.length; index += 1) {
+        const normalized = normalizeFollowerRecord(request.data.users[index]);
+        if (!normalized.ok) {
+          return {
+            ok: false,
+            failureKind: "UNEXPECTED_SCHEMA",
+            reason: normalized.reason,
+            requestsMade,
+            failedPage: page,
+            failedRecordIndex: index,
+          };
+        }
+        if (pageUids.has(normalized.record.uid)) {
+          return {
+            ok: false,
+            failureKind: "PAGINATION_FAILURE",
+            reason: "UNEXPECTED_WITHIN_PAGE_DUPLICATE",
+            requestsMade,
+            failedPage: page,
+          };
+        }
+        pageUids.add(normalized.record.uid);
+        const existing = recordsByUid.get(normalized.record.uid);
+        if (existing) {
+          crossPageDuplicateCount += 1;
+          if (mergeFollowerRecords(existing, normalized.record)) {
+            optionalMetadataConflictObserved = true;
+          }
+        } else {
+          recordsByUid.set(normalized.record.uid, {
+            record: normalized.record,
+            conflicts: new Set(),
+          });
+        }
+      }
+      reportFollowerScanProgress(onProgress, {
+        page,
+        requestsMade,
+        rawRecordCount,
+        uniqueRecordCount: recordsByUid.size,
+        crossPageDuplicateCount,
+      });
+    }
+
+    return {
+      ok: false,
+      failureKind: "PAGINATION_FAILURE",
+      reason: "FOLLOWER_SAFETY_CEILING_REACHED",
+      requestsMade,
+      visibleRecordsCollected: recordsByUid.size,
+    };
+  }
+
+  function followerStorageKey(ownerUid) {
+    return FOLLOWER_SNAPSHOT_STORAGE_PREFIX + ownerUid;
+  }
+
+  function emptyFollowerState(ownerUid) {
+    return {
+      schemaVersion: FOLLOWER_SNAPSHOT_SCHEMA_VERSION,
+      ownerUid,
+      latestSnapshot: null,
+      events: [],
+    };
+  }
+
+  function isValidFollowerOptionalValue(value, type) {
+    return value === null || typeof value === type;
+  }
+
+  function isValidFollowerStoredRecord(record) {
+    return Boolean(
+      isPlainObject(record) &&
+        typeof record.uid === "string" &&
+        normalizeStableUid(record.uid) === record.uid &&
+        isValidFollowerOptionalValue(record.screenName, "string") &&
+        isValidFollowerOptionalValue(record.ownerFollowing, "boolean") &&
+        isValidFollowerOptionalValue(record.followMe, "boolean") &&
+        (record.followersCount === null ||
+          (Number.isSafeInteger(record.followersCount) &&
+            record.followersCount >= 0)) &&
+        (record.friendsCount === null ||
+          (Number.isSafeInteger(record.friendsCount) &&
+            record.friendsCount >= 0)) &&
+        (record.statusesCount === null ||
+          (Number.isSafeInteger(record.statusesCount) &&
+            record.statusesCount >= 0)) &&
+        (record.createdAt === null ||
+          (typeof record.createdAt === "string" &&
+            Number.isFinite(Date.parse(record.createdAt)))) &&
+        isValidFollowerOptionalValue(record.verified, "boolean") &&
+        (record.verifiedType === null ||
+          Number.isSafeInteger(record.verifiedType)) &&
+        isValidFollowerOptionalValue(record.sourceText, "string") &&
+        typeof record.optionalMetadataConflict === "boolean"
+    );
+  }
+
+  function isValidFollowerFilterState(value) {
+    return Object.values(FOLLOWER_FILTER_STATE).includes(value);
+  }
+
+  function isValidFollowerStoredSnapshot(snapshot) {
+    if (
+      !isPlainObject(snapshot) ||
+      snapshot.schemaVersion !== FOLLOWER_SNAPSHOT_SCHEMA_VERSION ||
+      typeof snapshot.ownerUid !== "string" ||
+      normalizeStableUid(snapshot.ownerUid) !== snapshot.ownerUid ||
+      typeof snapshot.capturedAt !== "string" ||
+      !Number.isFinite(Date.parse(snapshot.capturedAt)) ||
+      snapshot.completion !== FOLLOWER_COMPLETION ||
+      snapshot.pageSizeRequested !== FOLLOWER_PAGE_SIZE ||
+      !Number.isSafeInteger(snapshot.dataPagesRead) ||
+      snapshot.dataPagesRead < 1 ||
+      snapshot.dataPagesRead > FOLLOWER_MAX_DATA_PAGES ||
+      snapshot.terminalVerificationRequests !== 1 ||
+      !Number.isSafeInteger(snapshot.requestsMade) ||
+      snapshot.requestsMade !==
+        snapshot.dataPagesRead + snapshot.terminalVerificationRequests ||
+      !Number.isSafeInteger(snapshot.rawRecordCount) ||
+      snapshot.rawRecordCount < 1 ||
+      !Number.isSafeInteger(snapshot.uniqueRecordCount) ||
+      snapshot.uniqueRecordCount < 1 ||
+      !Number.isSafeInteger(snapshot.crossPageDuplicateCount) ||
+      snapshot.crossPageDuplicateCount < 0 ||
+      snapshot.rawRecordCount - snapshot.uniqueRecordCount !==
+        snapshot.crossPageDuplicateCount ||
+      !isValidFollowerFilterState(snapshot.hasFilteredFansState) ||
+      !isValidFollowerFilterState(snapshot.sinkStrategyState) ||
+      typeof snapshot.filteredVisibilityObserved !== "boolean" ||
+      snapshot.filteredVisibilityObserved !==
+        (snapshot.hasFilteredFansState === FOLLOWER_FILTER_STATE.TRUE ||
+          snapshot.sinkStrategyState === FOLLOWER_FILTER_STATE.TRUE) ||
+      typeof snapshot.optionalMetadataConflictObserved !== "boolean" ||
+      !isPlainObject(snapshot.terminalEvidence) ||
+      !Number.isSafeInteger(snapshot.terminalEvidence.page) ||
+      snapshot.terminalEvidence.page !== snapshot.dataPagesRead + 1 ||
+      snapshot.terminalEvidence.recordCount !== 0 ||
+      !Number.isSafeInteger(snapshot.terminalEvidence.previousCursor) ||
+      snapshot.terminalEvidence.previousCursor < 0 ||
+      snapshot.terminalEvidence.nextCursor !== 0 ||
+      !(
+        snapshot.terminalEvidence.nextPage === null ||
+        (Number.isSafeInteger(snapshot.terminalEvidence.nextPage) &&
+          snapshot.terminalEvidence.nextPage >= 0)
+      ) ||
+      !Array.isArray(snapshot.records) ||
+      snapshot.records.length !== snapshot.uniqueRecordCount
+    ) {
+      return false;
+    }
+    for (const field of ["totalNumber", "displayTotalNumber", "followersCount"]) {
+      if (
+        snapshot[field] !== null &&
+        (!Number.isSafeInteger(snapshot[field]) || snapshot[field] < 0)
+      ) {
+        return false;
+      }
+    }
+    const seen = new Set();
+    for (const record of snapshot.records) {
+      if (!isValidFollowerStoredRecord(record) || seen.has(record.uid)) {
+        return false;
+      }
+      seen.add(record.uid);
+    }
+    return true;
+  }
+
+  function isValidFollowerStoredEvent(event) {
+    return Boolean(
+      isPlainObject(event) &&
+        typeof event.id === "string" &&
+        event.id.length > 0 &&
+        Object.values(FOLLOWER_EVENT).includes(event.type) &&
+        typeof event.uid === "string" &&
+        normalizeStableUid(event.uid) === event.uid &&
+        typeof event.observedAt === "string" &&
+        Number.isFinite(Date.parse(event.observedAt)) &&
+        isValidFollowerOptionalValue(event.displayName, "string")
+    );
+  }
+
+  function isValidFollowerStoredState(state, ownerUid) {
+    return Boolean(
+      isPlainObject(state) &&
+        state.schemaVersion === FOLLOWER_SNAPSHOT_SCHEMA_VERSION &&
+        state.ownerUid === ownerUid &&
+        (state.latestSnapshot === null ||
+          (isValidFollowerStoredSnapshot(state.latestSnapshot) &&
+            state.latestSnapshot.ownerUid === ownerUid)) &&
+        Array.isArray(state.events) &&
+        state.events.every(isValidFollowerStoredEvent)
+    );
+  }
+
+  function loadFollowerState(ownerUid) {
+    try {
+      const key = followerStorageKey(ownerUid);
+      const raw = GM_getValue(key, null);
+      if (raw === null || typeof raw === "undefined") {
+        return { ok: true, state: emptyFollowerState(ownerUid), raw: null };
+      }
+      if (typeof raw !== "string") {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "FOLLOWER_STATE_NOT_STRING",
+        };
+      }
+      const state = JSON.parse(raw);
+      if (!isValidFollowerStoredState(state, ownerUid)) {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "FOLLOWER_STATE_SCHEMA_INVALID",
+        };
+      }
+      return { ok: true, state, raw };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function persistFollowerState(ownerUid, state, expectedRaw) {
+    const key = followerStorageKey(ownerUid);
+    const serialized = JSON.stringify(state);
+    try {
+      const currentRaw = GM_getValue(key, null);
+      if (currentRaw !== expectedRaw) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      GM_setValue(key, serialized);
+      if (GM_getValue(key, null) !== serialized) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  // Cross-tab serialization for the follower state's local read-modify-write
+  // transactions. GM_getValue/GM_setValue offer no atomic compare-and-swap, so
+  // the check-then-set inside persistFollowerState is an integrity check, not a
+  // cross-tab guarantee: this lock is what actually serializes tabs.
+  //
+  // The lock is owner-scoped, so two accounts never block each other, and it is
+  // held only for local storage work. Network scanning, follower-removal POSTs
+  // and batch pacing all stay outside it.
+  const FOLLOWER_STATE_LOCK_PREFIX = "weibo-toolkit-follower-state-";
+
+  function followerStateLockUnavailable(reason, error) {
+    const result = {
+      ok: false,
+      failureKind: "STATE_LOCK_UNAVAILABLE",
+      reason,
+    };
+    if (error) result.errorName = error.name ? String(error.name) : "Error";
+    return result;
+  }
+
+  // The transaction body must stay short and purely local. It is awaited while
+  // the lock is held, so it must never fetch, wait, or open UI.
+  async function withFollowerStateLock(ownerUid, transaction) {
+    const lockManager = pageLockManager();
+    if (lockManager === null) {
+      return followerStateLockUnavailable("LOCK_UNAVAILABLE");
+    }
+    try {
+      return await lockManager.request.call(
+        lockManager,
+        FOLLOWER_STATE_LOCK_PREFIX + ownerUid,
+        { mode: "exclusive" },
+        async (lock) => {
+          if (lock === null) {
+            return followerStateLockUnavailable("LOCK_NOT_ACQUIRED");
+          }
+          return await transaction();
+        }
+      );
+    } catch (error) {
+      return followerStateLockUnavailable("LOCK_REQUEST_FAILED", error);
+    }
+  }
+
+  function followerRemovalPendingKey(ownerUid) {
+    return FOLLOWER_REMOVAL_PENDING_STORAGE_PREFIX + ownerUid;
+  }
+
+  function isValidFollowerRemovalPendingEntry(entry) {
+    return Boolean(
+      isPlainObject(entry) &&
+        typeof entry.confirmedAt === "number" &&
+        Number.isFinite(entry.confirmedAt)
+    );
+  }
+
+  function isValidFollowerRemovalPendingState(state, ownerUid) {
+    if (
+      !isPlainObject(state) ||
+      state.schemaVersion !== FOLLOWER_REMOVAL_PENDING_SCHEMA_VERSION ||
+      state.ownerUid !== ownerUid ||
+      !isPlainObject(state.pending)
+    ) {
+      return false;
+    }
+    for (const uid of Object.keys(state.pending)) {
+      if (
+        normalizeStableUid(uid) !== uid ||
+        !isValidFollowerRemovalPendingEntry(state.pending[uid])
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Unreadable or malformed reconciliation state is treated as "nothing pending".
+  // It must never block a removal or a Snapshot: the worst consequence is one
+  // ordinary, neutral disappearance event.
+  function loadFollowerRemovalPending(ownerUid) {
+    try {
+      const raw = GM_getValue(followerRemovalPendingKey(ownerUid), null);
+      if (raw === null || typeof raw !== "string") return { pending: {}, raw: null };
+      const state = JSON.parse(raw);
+      if (!isValidFollowerRemovalPendingState(state, ownerUid)) {
+        return { pending: {}, raw };
+      }
+      return { pending: state.pending, raw };
+    } catch (_) {
+      return { pending: {}, raw: null };
+    }
+  }
+
+  function saveFollowerRemovalPending(ownerUid, pending) {
+    try {
+      const key = followerRemovalPendingKey(ownerUid);
+      if (Object.keys(pending).length === 0) {
+        GM_deleteValue(key);
+        return { ok: true };
+      }
+      GM_setValue(
+        key,
+        JSON.stringify({
+          schemaVersion: FOLLOWER_REMOVAL_PENDING_SCHEMA_VERSION,
+          ownerUid,
+          pending,
+        })
+      );
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function prunedFollowerRemovalPending(pending, nowMs) {
+    const kept = {};
+    for (const uid of Object.keys(pending)) {
+      const entry = pending[uid];
+      if (nowMs - entry.confirmedAt < FOLLOWER_REMOVAL_PENDING_TTL_MS) {
+        kept[uid] = entry;
+      }
+    }
+    return kept;
+  }
+
+  // Unlocked helper: the caller must already hold the follower state lock. The
+  // read happens here, inside the transaction, so a concurrently recorded UID is
+  // merged instead of overwritten.
+  function mergeConfirmedFollowerRemoval(ownerUid, canonicalUid, nowMs) {
+    const loaded = loadFollowerRemovalPending(ownerUid);
+    const pending = prunedFollowerRemovalPending(loaded.pending, nowMs);
+    pending[canonicalUid] = { confirmedAt: nowMs };
+    return saveFollowerRemovalPending(ownerUid, pending);
+  }
+
+  // Called only after a removal response has been fully validated as successful.
+  // A failure here is deliberately non-fatal: the Weibo mutation already
+  // succeeded, so an unavailable lock only costs the later event suppression,
+  // and the disappearance is then reported by ordinary neutral semantics.
+  async function recordConfirmedFollowerRemoval(ownerUid, uid, nowMs) {
+    const canonicalUid = normalizeStableUid(uid);
+    if (canonicalUid === null || canonicalUid !== uid) return { ok: false };
+    return await withFollowerStateLock(ownerUid, async () =>
+      mergeConfirmedFollowerRemoval(ownerUid, canonicalUid, nowMs)
+    );
+  }
+
+  function followerFilteringFingerprint(snapshot) {
+    if (
+      snapshot.hasFilteredFansState === FOLLOWER_FILTER_STATE.UNKNOWN ||
+      snapshot.sinkStrategyState === FOLLOWER_FILTER_STATE.UNKNOWN
+    ) {
+      return null;
+    }
+    return (
+      snapshot.hasFilteredFansState + "/" + snapshot.sinkStrategyState
+    );
+  }
+
+  function makeFollowerEvent(type, record, observedAt, index) {
+    return {
+      id:
+        observedAt +
+        ":" +
+        String(index + 1) +
+        ":" +
+        type +
+        ":" +
+        record.uid,
+      type,
+      uid: record.uid,
+      observedAt,
+      displayName: record.screenName,
+    };
+  }
+
+  function diffFollowerSnapshots(previousSnapshot, currentSnapshot) {
+    const previousFingerprint = followerFilteringFingerprint(previousSnapshot);
+    const currentFingerprint = followerFilteringFingerprint(currentSnapshot);
+    if (
+      previousFingerprint === null ||
+      currentFingerprint === null ||
+      previousFingerprint !== currentFingerprint
+    ) {
+      return {
+        events: [],
+        suppressed: true,
+        reason: "FILTERING_FINGERPRINT_CHANGED_OR_UNKNOWN",
+      };
+    }
+    const previous = new Map(
+      previousSnapshot.records.map((record) => [record.uid, record])
+    );
+    const current = new Map(
+      currentSnapshot.records.map((record) => [record.uid, record])
+    );
+    const events = [];
+    const added = [...current.keys()]
+      .filter((uid) => !previous.has(uid))
+      .sort();
+    for (const uid of added) {
+      events.push(
+        makeFollowerEvent(
+          FOLLOWER_EVENT.VISIBLE_FOLLOWER_ADDED,
+          current.get(uid),
+          currentSnapshot.capturedAt,
+          events.length
+        )
+      );
+    }
+    const disappeared = [...previous.keys()]
+      .filter((uid) => !current.has(uid))
+      .sort();
+    for (const uid of disappeared) {
+      events.push(
+        makeFollowerEvent(
+          FOLLOWER_EVENT.VISIBLE_FOLLOWER_DISAPPEARED,
+          previous.get(uid),
+          currentSnapshot.capturedAt,
+          events.length
+        )
+      );
+    }
+    return { events, suppressed: false, reason: null };
+  }
+
+  // Reconciliation runs only for a fully validated successful Snapshot.
+  //
+  // A pending UID that is absent from the new Snapshot is consumed, because the
+  // Toolkit already has direct evidence for why it left: it sent the removal for
+  // that exact UID and Weibo validated it. Its ordinary disappearance event is
+  // dropped and no replacement event is invented.
+  //
+  // A pending UID still present in the new Snapshot is kept: API membership may
+  // simply not be reflected yet, and nothing is fabricated either way.
+  //
+  // When event generation is globally suppressed (filtering fingerprint changed
+  // or unknown), an absent pending UID is still consumed. No ordinary event would
+  // have been emitted for it anyway, so keeping the marker would only let it
+  // suppress an unrelated future disappearance. The existing fingerprint guard
+  // itself is untouched.
+  function reconcileFollowerRemovalPending(pending, snapshot, disappearedUids, nowMs) {
+    const live = prunedFollowerRemovalPending(pending, nowMs);
+    const present = new Set(snapshot.records.map((record) => record.uid));
+    const suppressedUids = new Set();
+    const remaining = {};
+    for (const uid of Object.keys(live)) {
+      if (present.has(uid)) {
+        remaining[uid] = live[uid];
+        continue;
+      }
+      if (disappearedUids.has(uid)) suppressedUids.add(uid);
+    }
+    return {
+      pending: remaining,
+      suppressedUids,
+      changed: Object.keys(remaining).length !== Object.keys(pending).length,
+    };
+  }
+
+  function prepareSuccessfulFollowerUpdate(
+    ownerUid,
+    previousState,
+    snapshot,
+    pendingRemovals = {},
+    nowMs = Date.now()
+  ) {
+    if (previousState.ownerUid !== ownerUid || snapshot.ownerUid !== ownerUid) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "FOLLOWER_OWNER_UID_MISMATCH",
+      };
+    }
+    const baselineCreated = previousState.latestSnapshot === null;
+    const diff = baselineCreated
+      ? { events: [], suppressed: false, reason: null }
+      : diffFollowerSnapshots(previousState.latestSnapshot, snapshot);
+    const disappearedUids = new Set(
+      diff.events
+        .filter(
+          (event) => event.type === FOLLOWER_EVENT.VISIBLE_FOLLOWER_DISAPPEARED
+        )
+        .map((event) => event.uid)
+    );
+    const reconciled = reconcileFollowerRemovalPending(
+      pendingRemovals,
+      snapshot,
+      disappearedUids,
+      nowMs
+    );
+    const keptEvents = diff.events.filter(
+      (event) => !reconciled.suppressedUids.has(event.uid)
+    );
+    return {
+      ok: true,
+      baselineCreated,
+      newEvents: keptEvents,
+      eventsSuppressed: diff.suppressed,
+      eventsSuppressedReason: diff.reason,
+      reconciledRemovalUids: [...reconciled.suppressedUids].sort(),
+      pendingRemovals: reconciled.pending,
+      pendingRemovalsChanged: reconciled.changed,
+      state: {
+        schemaVersion: FOLLOWER_SNAPSHOT_SCHEMA_VERSION,
+        ownerUid,
+        latestSnapshot: snapshot,
+        events: [...previousState.events, ...keptEvents],
+      },
+    };
+  }
+
+  async function performFollowerUpdate(onProgress, isCancelled, options = {}) {
+    const ownerAtStart = determineCurrentUid();
+    if (!ownerAtStart.ok) return ownerAtStart;
+    // Optimistic concurrency control for the whole scan. The durable follower
+    // bytes this scan will be diffed against are read before the first request,
+    // and the commit below refuses unless they are still exactly those bytes.
+    // Only exact identity is safe here: a backup restore may legitimately
+    // replace a newer snapshot with an older historical one, so comparing
+    // capturedAt would accept a baseline that was swapped underneath the scan.
+    // Nothing is written here, and no lock is held across the network.
+    const baseline = loadFollowerState(ownerAtStart.uid);
+    if (!baseline.ok) return baseline;
+    const scanStartFollowerRaw = baseline.raw;
+    const scan = await scanFollowers(
+      ownerAtStart.uid,
+      onProgress,
+      isCancelled,
+      options
+    );
+    if (!scan.ok) return scan;
+    const ownerAfterScan = determineCurrentUid();
+    if (!ownerAfterScan.ok || ownerAfterScan.uid !== ownerAtStart.uid) {
+      return { ok: false, failureKind: "ACCOUNT_CHANGED_DURING_SCAN" };
+    }
+    // The whole scan is finished before the lock is taken. Everything below is a
+    // short local transaction over freshly read state: nothing computed before
+    // the lock is written back, so a removal another tab confirmed meanwhile is
+    // merged rather than erased.
+    const committed = await withFollowerStateLock(
+      ownerAtStart.uid,
+      async () => {
+        const fresh = loadFollowerState(ownerAtStart.uid);
+        if (!fresh.ok) return fresh;
+        // The baseline this scan was computed against must still be the stored
+        // one. If it is not, the scan is discarded whole: no diff, no events, no
+        // snapshot write and no removal-pending consumption. Carrying no reason
+        // code keeps the follower failure text exactly the accurate one.
+        if (fresh.raw !== scanStartFollowerRaw) {
+          return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+        }
+        if (fresh.state.latestSnapshot !== null) {
+          const storedTime = Date.parse(fresh.state.latestSnapshot.capturedAt);
+          const scanTime = Date.parse(scan.snapshot.capturedAt);
+          if (!Number.isFinite(storedTime) || storedTime > scanTime) {
+            return {
+              ok: false,
+              failureKind: "STALE_SCAN",
+              reason: "FOLLOWER_STALE_SCAN",
+            };
+          }
+        }
+        const pendingBefore = loadFollowerRemovalPending(ownerAtStart.uid);
+        const prepared = prepareSuccessfulFollowerUpdate(
+          ownerAtStart.uid,
+          fresh.state,
+          scan.snapshot,
+          pendingBefore.pending,
+          Date.now()
+        );
+        if (!prepared.ok) return prepared;
+        const persisted = persistFollowerState(
+          ownerAtStart.uid,
+          prepared.state,
+          fresh.raw
+        );
+        if (!persisted.ok) return persisted;
+        // Only a persisted successful Snapshot may consume reconciliation state,
+        // and it is stored separately from the Snapshot itself.
+        if (prepared.pendingRemovalsChanged) {
+          saveFollowerRemovalPending(
+            ownerAtStart.uid,
+            prepared.pendingRemovals
+          );
+        }
+        return { ok: true, prepared };
+      }
+    );
+    if (!committed.ok) return committed;
+    const prepared = committed.prepared;
+    return {
+      ok: true,
+      ownerUid: ownerAtStart.uid,
+      snapshot: scan.snapshot,
+      requestsMade: scan.requestsMade,
+      baselineCreated: prepared.baselineCreated,
+      newEvents: prepared.newEvents,
+      eventsSuppressed: prepared.eventsSuppressed,
+      eventsSuppressedReason: prepared.eventsSuppressedReason,
+      reconciledRemovalUids: prepared.reconciledRemovalUids,
+      totalStoredEvents: prepared.state.events.length,
+    };
+  }
+  let pageFeedReconcileHandle = null;
+  let pageFeedReconcileUsesAnimationFrame = false;
+  const PAGE_FEED_ROOT_DISCOVERY_DELAY_MS = 250;
+  const PAGE_FEED_ROOT_DISCOVERY_MAX_ATTEMPTS = 20;
+  const AUTO_EXPAND_SCROLL_IDLE_MS = 120;
+  const AUTO_EXPAND_VIEWPORT_INTENT_MS = 280;
+  const AUTO_EXPAND_POINTER_FAST_IDLE_MS = 120;
+  const AUTO_EXPAND_SAFE_ZONE_TOP_RATIO = 0.35;
+  const AUTO_EXPAND_SAFE_ZONE_BOTTOM_RATIO = 0.85;
+  const AUTO_EXPAND_GEOMETRY_STABLE_DELTA_PX = 8;
+  let pageFeedRootDiscoveryTimer = null;
+  let pageFeedRootDiscoveryAttempts = 0;
+  let pageFeedRootDiscoveryRouteKey = null;
+  let autoExpandScrollTargets = [];
+  let autoExpandScrollIdleTimer = null;
+  let autoExpandScrollEpoch = 0;
+  let autoExpandExpandedEpoch = -1;
+  let autoExpandScrollIsIdle = false;
+  let autoExpandPointerTarget = null;
+  let autoExpandPointerKnown = false;
+  let autoExpandPointerX = 0;
+  let autoExpandPointerY = 0;
+  let autoExpandViewportIntentTimer = null;
+  let autoExpandDominantCandidate = null;
+  let autoExpandViewportIntentGeneration = 0;
+  let autoExpandGeometryFrameHandle = null;
+  let autoExpandGeometryCandidate = null;
+  let autoExpandGeometryGeneration = 0;
+
+  function createElement(tag, text, className) {
+    const element = document.createElement(tag);
+    if (typeof text === "string") element.textContent = text;
+    if (className) element.className = className;
+    return element;
+  }
+
+  function normalizeTheme(value) {
+    return THEME_VALUES.includes(value) ? value : DEFAULT_THEME;
+  }
+
+  function loadTheme() {
+    try {
+      return normalizeTheme(GM_getValue(THEME_KEY, DEFAULT_THEME));
+    } catch (_) {
+      // Appearance is cosmetic: an unreadable preference must never block the UI.
+      return DEFAULT_THEME;
+    }
+  }
+
+  function saveTheme(theme) {
+    try {
+      GM_setValue(THEME_KEY, theme);
+      if (GM_getValue(THEME_KEY, null) !== theme) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  function loadPageCleanupPreference(key) {
+    try {
+      return GM_getValue(key, false) === true;
+    } catch (_) {
+      // A missing or unreadable page preference must preserve Weibo's own UI.
+      return false;
+    }
+  }
+
+  function loadPageCleanupPreferences() {
+    return {
+      hideHotSearch: loadPageCleanupPreference(HIDE_HOT_SEARCH_KEY),
+      hideRightSidebar: loadPageCleanupPreference(HIDE_RIGHT_SIDEBAR_KEY),
+      hideTopRecommend: loadPageCleanupPreference(HIDE_TOP_RECOMMEND_KEY),
+      hideTopVideo: loadPageCleanupPreference(HIDE_TOP_VIDEO_KEY),
+      hideLatestRecommended: loadPageCleanupPreference(
+        HIDE_LATEST_RECOMMENDED_KEY
+      ),
+      strongFeedPromotionFilter: loadPageCleanupPreference(
+        STRONG_FEED_PROMOTION_FILTER_KEY
+      ),
+      autoExpandLongPosts: loadPageCleanupPreference(
+        AUTO_EXPAND_LONG_POSTS_KEY
+      ),
+      showProfileExtras: loadPageCleanupPreference(SHOW_PROFILE_EXTRAS_KEY),
+      showProfileFriendNotes: loadPageCleanupPreference(
+        SHOW_PROFILE_FRIEND_NOTES_KEY
+      ),
+      showFeedFriendNotes: loadPageCleanupPreference(
+        SHOW_FEED_FRIEND_NOTES_KEY
+      ),
+    };
+  }
+
+  function savePageCleanupPreference(key, value) {
+    try {
+      GM_setValue(key, value);
+      if (GM_getValue(key, null) !== value) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  function buildPageCleanupCss(preferences) {
+    const selectors = [];
+    const rules = [];
+    if (preferences.hideHotSearch) selectors.push(".hotBand");
+    if (preferences.hideRightSidebar) selectors.push("#__sidebar");
+    if (preferences.hideTopRecommend) {
+      selectors.push('.woo-tab-nav > a[href="/hot"]');
+    }
+    if (preferences.hideTopVideo) {
+      selectors.push('.woo-tab-nav > a[href="/tv"]');
+    }
+    if (preferences.hideLatestRecommended) {
+      rules.push(
+        `.wbpro-scroller-item.${LATEST_RECOMMENDED_HIDDEN_CLASS} {`,
+        "  height: 1px !important;",
+        "  min-height: 1px !important;",
+        "  max-height: 1px !important;",
+        "  margin-block: 0 !important;",
+        "  padding-block: 0 !important;",
+        "  border-block-width: 0 !important;",
+        "  overflow: hidden !important;",
+        "  visibility: hidden !important;",
+        "  pointer-events: none !important;",
+        "}"
+      );
+      if (preferences.strongFeedPromotionFilter) {
+        selectors.push(`.${STRONG_FEED_PROMOTION_HIDDEN_CLASS}`);
+      }
+    }
+    if (selectors.length > 0) {
+      rules.unshift(
+        selectors.join(",\n") + " { display: none !important; }"
+      );
+    }
+    return rules.join("\n");
+  }
+
+  function applyPageCleanupStyles() {
+    const css = buildPageCleanupCss(pageCleanupPreferences);
+    if (css !== "") {
+      if (pagePreferenceStyleNode === null) {
+        const style = document.createElement("style");
+        style.id = PAGE_PREFERENCE_STYLE_ID;
+        document.head.append(style);
+        pagePreferenceStyleNode = style;
+      }
+      pagePreferenceStyleNode.textContent = css;
+      return;
+    }
+    if (pagePreferenceStyleNode && pagePreferenceStyleNode.parentNode) {
+      pagePreferenceStyleNode.parentNode.removeChild(pagePreferenceStyleNode);
+    }
+    pagePreferenceStyleNode = null;
+  }
+
+  function resolveLatestFeedUrl() {
+    const owner = determineCurrentUid();
+    if (!owner.ok) return null;
+    const uid = normalizeStableUid(owner.uid);
+    if (uid === null || uid !== owner.uid) return null;
+    const target = new URL("/mygroups", WEIBO_MAIN_ORIGIN);
+    target.searchParams.set("gid", "11000" + uid);
+    return target.href;
+  }
+
+  function isCanonicalWeiboHome() {
+    if (typeof location === "undefined") return false;
+    return (
+      location.origin === WEIBO_MAIN_ORIGIN &&
+      location.pathname === "/"
+    );
+  }
+
+  function isLatestFeedRoute() {
+    if (
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN
+    ) {
+      return false;
+    }
+    const target = resolveLatestFeedUrl();
+    if (target === null) return false;
+    if (location.pathname === "/") return true;
+    if (
+      location.pathname !== "/mygroups" ||
+      typeof location.href !== "string"
+    ) {
+      return false;
+    }
+    try {
+      const currentUrl = new URL(location.href);
+      const targetUrl = new URL(target);
+      return (
+        currentUrl.searchParams.get("gid") ===
+        targetUrl.searchParams.get("gid")
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function canonicalPageEnhancementLatestUid() {
+    if (
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN ||
+      location.pathname !== "/mygroups" ||
+      typeof location.href !== "string"
+    ) {
+      return null;
+    }
+    try {
+      const gid = new URL(location.href).searchParams.get("gid");
+      const match = /^11000([1-9]\d*)$/.exec(gid || "");
+      return match ? match[1] : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function isPageEnhancementFeedRoute() {
+    if (
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN ||
+      typeof location.pathname !== "string"
+    ) {
+      return false;
+    }
+    if (location.pathname === "/") return true;
+    const routeUid = canonicalPageEnhancementLatestUid();
+    if (routeUid === null) return false;
+    const configured = determineCurrentUid();
+    return !configured.ok || configured.uid === routeUid;
+  }
+
+  function isAutoExpandLongPostRoute() {
+    if (isPageEnhancementFeedRoute()) return true;
+    return Boolean(
+      typeof location !== "undefined" &&
+        location.origin === WEIBO_MAIN_ORIGIN &&
+        typeof location.pathname === "string" &&
+        /^\/u\/[1-9]\d*\/?$/.test(location.pathname)
+    );
+  }
+
+  function promotionFilterIsActiveForRoute() {
+    return Boolean(
+      pageCleanupPreferences.hideLatestRecommended &&
+        isPageEnhancementFeedRoute()
+    );
+  }
+
+  function autoExpandIsActiveForRoute() {
+    return Boolean(
+      pageCleanupPreferences.autoExpandLongPosts &&
+        isAutoExpandLongPostRoute()
+    );
+  }
+
+  function pageFeedFeaturesAreActiveForRoute() {
+    return (
+      promotionFilterIsActiveForRoute() ||
+      autoExpandIsActiveForRoute() ||
+      feedFriendNotesActiveForRoute()
+    );
+  }
+
+  function elementChildren(node) {
+    return node && node.children ? Array.from(node.children) : [];
+  }
+
+  function hasClass(node, className) {
+    return Boolean(
+      node && node.classList && node.classList.contains(className)
+    );
+  }
+
+  function normalizeLatestRecommendedBadgeText(value) {
+    return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  }
+
+  function nearestAncestorTagBefore(node, boundary, tagName) {
+    for (let current = node?.parentElement; current && current !== boundary; ) {
+      if (current.tagName === tagName) return current;
+      current = current.parentElement;
+    }
+    return null;
+  }
+
+  function directChildWithin(node, ancestor) {
+    let current = node;
+    while (current?.parentElement && current.parentElement !== ancestor) {
+      current = current.parentElement;
+    }
+    return current?.parentElement === ancestor ? current : null;
+  }
+
+  function pageFeedOuterArticles(card) {
+    if (
+      !hasClass(card, "wbpro-scroller-item") ||
+      typeof card.querySelectorAll !== "function"
+    ) {
+      return [];
+    }
+    const articles = [];
+    for (const article of [
+      ...elementChildren(card).filter((child) => child.tagName === "ARTICLE"),
+      ...card.querySelectorAll("article"),
+    ]) {
+      if (
+        articles.includes(article) ||
+        hasAncestorClassBefore(article, card, "retweet") ||
+        hasAncestorClassBefore(article, card, "wbpro-feed-reText") ||
+        typeof article.querySelectorAll !== "function"
+      ) {
+        continue;
+      }
+      articles.push(article);
+    }
+    return articles;
+  }
+
+  function pageFeedOuterParts(card, article, selector) {
+    return Array.from(article.querySelectorAll(selector)).filter(
+      (candidate) =>
+        nearestAncestorTagBefore(candidate, card, "ARTICLE") === article &&
+        !hasAncestorClassBefore(candidate, article, "retweet") &&
+        !hasAncestorClassBefore(candidate, article, "wbpro-feed-reText")
+    );
+  }
+
+  function resolvePageFeedCardParts(card) {
+    for (const article of pageFeedOuterArticles(card)) {
+      const headers = pageFeedOuterParts(card, article, "header");
+      const contents = pageFeedOuterParts(card, article, ".wbpro-feed-content");
+      for (const content of contents) {
+        const contentBranch = directChildWithin(content, article);
+        const header =
+          headers.find(
+            (candidate) =>
+              directChildWithin(candidate, article) === contentBranch
+          ) || (headers.length === 1 ? headers[0] : null);
+        if (header) return { card, article, header, content };
+      }
+    }
+    return null;
+  }
+
+  // The promotion badge and the author controls beside it live in the outer
+  // header alone. Auto-expand still needs the body wrapper, but a promotion
+  // decision must not fail merely because ".wbpro-feed-content" is absent or
+  // renamed: an exact semantic tag in a resolvable outer header stays
+  // classifiable either way.
+  function resolvePageFeedPromotionHeader(card) {
+    const parts = resolvePageFeedCardParts(card);
+    if (parts) return parts.header;
+    for (const article of pageFeedOuterArticles(card)) {
+      const headers = pageFeedOuterParts(card, article, "header");
+      if (headers.length > 0) return headers[0];
+    }
+    return null;
+  }
+
+  function normalizedComponentText(node) {
+    const ownText = normalizeLatestRecommendedBadgeText(node?.textContent);
+    if (ownText !== "") return ownText;
+    const leafTexts = [];
+    walkElementSubtree(node, (descendant) => {
+      if (descendant !== node && elementChildren(descendant).length === 0) {
+        const text = normalizeLatestRecommendedBadgeText(
+          descendant.textContent
+        );
+        if (text !== "") leafTexts.push(text);
+      }
+    });
+    return normalizeLatestRecommendedBadgeText(leafTexts.join(" "));
+  }
+
+  function pageFeedTagComponents(header) {
+    const components = [];
+    walkElementSubtree(header, (node) => {
+      if (
+        node !== header &&
+        elementClassTokens(node).some((token) =>
+          token.startsWith("wbpro-tag")
+        )
+      ) {
+        components.push(node);
+      }
+    });
+    return components;
+  }
+
+  function effectiveStrongFeedPromotionFilter() {
+    return Boolean(
+      promotionFilterIsActiveForRoute() &&
+        pageCleanupPreferences.strongFeedPromotionFilter
+    );
+  }
+
+  function classifyLatestRecommendedCard(card, strongMode = false) {
+    const header = resolvePageFeedPromotionHeader(card);
+    if (!header) return false;
+    const tagMatch = pageFeedTagComponents(header).some((component) => {
+      const componentText = normalizedComponentText(component);
+      const preciseMatch = componentText === "荐读";
+      if (preciseMatch || !strongMode) return preciseMatch;
+      return STRONG_FEED_PROMOTION_TAG_TEXTS.some((token) =>
+        componentText.includes(token)
+      );
+    });
+    if (tagMatch || !strongMode) return tagMatch;
+    let hasFollowControl = false;
+    let hasNegativeFeedbackSemantic = false;
+    walkElementSubtree(header, (node) => {
+      if (
+        node.hidden === true ||
+        node.getAttribute?.("aria-hidden") === "true"
+      ) {
+        return;
+      }
+      const text = normalizeLatestRecommendedBadgeText(node.textContent);
+      const role = node.getAttribute?.("role");
+      if (
+        (node.tagName === "A" ||
+          node.tagName === "BUTTON" ||
+          role === "button") &&
+        (text === "关注" || text === "+关注")
+      ) {
+        hasFollowControl = true;
+      }
+      const title = normalizeLatestRecommendedBadgeText(
+        node.getAttribute?.("title")
+      );
+      const accessibleLabel = normalizeLatestRecommendedBadgeText(
+        node.getAttribute?.("aria-label")
+      );
+      if (title === "负反馈" || accessibleLabel === "负反馈") {
+        hasNegativeFeedbackSemantic = true;
+      }
+    });
+    return hasFollowControl && hasNegativeFeedbackSemantic;
+  }
+
+  function setToolkitClass(node, className, enabled) {
+    if (!node || !node.classList) return false;
+    const hasClassName = node.classList.contains(className);
+    if (Boolean(enabled) === hasClassName) return false;
+    if (enabled) node.classList.add(className);
+    else node.classList.remove(className);
+    return true;
+  }
+
+  function elementClassTokens(node) {
+    if (!node || !node.classList) return [];
+    try {
+      const tokens = Array.from(node.classList).filter(
+        (token) => typeof token === "string" && token !== ""
+      );
+      if (tokens.length > 0) return tokens;
+    } catch (_) {
+      // Fall back to a string className in minimal/legacy DOM implementations.
+    }
+    return typeof node.className === "string"
+      ? node.className.split(/\s+/).filter(Boolean)
+      : [];
+  }
+
+  function isStrongTipsAdModule(node) {
+    return elementClassTokens(node).some((token) => token.startsWith("TipsAd"));
+  }
+
+  function walkElementSubtree(node, callback) {
+    const element = node && node.nodeType === 1 ? node : node?.parentElement;
+    if (!element) return;
+    callback(element);
+    for (const child of elementChildren(element)) {
+      walkElementSubtree(child, callback);
+    }
+  }
+
+  // TipsAd is a third-party-derived module clue, not a card clue. A feed item
+  // that carries no ordinary outer post header is nothing but the ad module and
+  // stays disposable; an ad module embedded beside a real post must never take
+  // that post down with it, so there only the module itself is hidden.
+  function cardIsDisposableStrongTipsAdItem(card) {
+    if (!card || !effectiveStrongFeedPromotionFilter()) return false;
+    if (resolvePageFeedPromotionHeader(card) !== null) return false;
+    let containsTipsAd = false;
+    walkElementSubtree(card, (node) => {
+      if (!containsTipsAd && isStrongTipsAdModule(node)) {
+        containsTipsAd = true;
+      }
+    });
+    return containsTipsAd;
+  }
+
+  function shouldCollapsePageFeedCard(card) {
+    if (!promotionFilterIsActiveForRoute()) return false;
+    const strongMode = effectiveStrongFeedPromotionFilter();
+    return Boolean(
+      classifyLatestRecommendedCard(card, strongMode) ||
+        (strongMode && cardIsDisposableStrongTipsAdItem(card))
+    );
+  }
+
+  function applyLatestRecommendedVisibility(card) {
+    setToolkitClass(
+      card,
+      LATEST_RECOMMENDED_HIDDEN_CLASS,
+      shouldCollapsePageFeedCard(card)
+    );
+  }
+
+  function applyStrongTipsAdVisibility(node) {
+    if (!node || !node.classList) return;
+    const shouldHide = Boolean(
+      isStrongTipsAdModule(node) &&
+        effectiveStrongFeedPromotionFilter() &&
+        latestRecommendedRoot &&
+        latestRecommendedRoot.contains(node)
+    );
+    setToolkitClass(node, STRONG_FEED_PROMOTION_HIDDEN_CLASS, shouldHide);
+  }
+
+  function reconcileStrongTipsAdModules(root) {
+    if (!root) return;
+    walkElementSubtree(root, applyStrongTipsAdVisibility);
+  }
+
+  function findLatestRecommendedCardAncestor(node) {
+    let current = node && node.nodeType === 1 ? node : node?.parentElement;
+    while (current) {
+      if (hasClass(current, "wbpro-scroller-item")) return current;
+      if (current === latestRecommendedRoot) return null;
+      current = current.parentElement;
+    }
+    return null;
+  }
+
+  function hasAncestorClassBefore(node, boundary, className) {
+    for (let current = node?.parentElement; current && current !== boundary; ) {
+      if (hasClass(current, className)) return true;
+      current = current.parentElement;
+    }
+    return false;
+  }
+
+  function longPostIdentity(parts) {
+    if (!parts || typeof parts.header.querySelectorAll !== "function") {
+      return null;
+    }
+    for (const link of parts.header.querySelectorAll("a")) {
+      const href =
+        typeof link.href === "string" && link.href !== ""
+          ? link.href
+          : link.getAttribute?.("href");
+      if (typeof href !== "string" || href === "") continue;
+      try {
+        const path = new URL(href, WEIBO_MAIN_ORIGIN).pathname;
+        const match = /^\/([1-9]\d*)\/([A-Za-z0-9]+)\/?$/.exec(path);
+        if (match) return `${match[1]}/${match[2]}`;
+      } catch (_) {
+        // A malformed/non-Weibo link is not a stable post identity.
+      }
+    }
+    return null;
+  }
+
+  function longPostDedupIdentity(card, parts) {
+    const postIdentity = longPostIdentity(parts);
+    if (postIdentity !== null) return postIdentity;
+    const dataIndex = card?.getAttribute?.("data-index");
+    return typeof dataIndex === "string" && dataIndex !== ""
+      ? `index:${dataIndex}`
+      : card;
+  }
+
+  function validateLongPostExpandControl(control) {
+    if (
+      !pageCleanupPreferences.autoExpandLongPosts ||
+      !isAutoExpandLongPostRoute() ||
+      !latestRecommendedRoot ||
+      !control ||
+      control.nodeType !== 1 ||
+      control.isConnected === false ||
+      !hasClass(control, "expand") ||
+      normalizeLatestRecommendedBadgeText(control.textContent) !== "展开"
+    ) {
+      return null;
+    }
+    const card = findLatestRecommendedCardAncestor(control);
+    if (
+      !card ||
+      !latestRecommendedRoot.contains(card) ||
+      !latestRecommendedRoot.contains(control) ||
+      hasClass(card, LATEST_RECOMMENDED_HIDDEN_CLASS)
+    ) {
+      return null;
+    }
+    const parts = resolvePageFeedCardParts(card);
+    if (
+      !parts ||
+      typeof card.querySelector !== "function" ||
+      card.querySelector(".retweet") ||
+      card.querySelector(".wbpro-feed-reText") ||
+      !parts.content.contains(control) ||
+      hasAncestorClassBefore(control, card, "wbpro-feed-reText") ||
+      hasAncestorClassBefore(control, card, "retweet")
+    ) {
+      return null;
+    }
+    return {
+      card,
+      parts,
+      identity: longPostDedupIdentity(card, parts),
+    };
+  }
+
+  function visibleAreaRatio(element) {
+    if (!element || typeof element.getBoundingClientRect !== "function") {
+      return null;
+    }
+    const rect = element.getBoundingClientRect();
+    const width = Number(rect.width) || Number(rect.right) - Number(rect.left);
+    const height = Number(rect.height) || Number(rect.bottom) - Number(rect.top);
+    if (!(width > 0) || !(height > 0)) return null;
+    const viewportWidth = Number(window?.innerWidth) || 0;
+    const viewportHeight = Number(window?.innerHeight) || 0;
+    if (!(viewportWidth > 0) || !(viewportHeight > 0)) return null;
+    const visibleWidth = Math.max(
+      0,
+      Math.min(Number(rect.right), viewportWidth) - Math.max(Number(rect.left), 0)
+    );
+    const visibleHeight = Math.max(
+      0,
+      Math.min(Number(rect.bottom), viewportHeight) - Math.max(Number(rect.top), 0)
+    );
+    return (visibleWidth * visibleHeight) / (width * height);
+  }
+
+  function longPostControlIsMeaningfullyVisible(control, card) {
+    const cardRatio = visibleAreaRatio(card);
+    if (cardRatio !== null && cardRatio <= 0) return false;
+    const controlRatio = visibleAreaRatio(control);
+    if (controlRatio !== null) {
+      return controlRatio >= AUTO_EXPAND_INTERSECTION_RATIO;
+    }
+    return (
+      cardRatio !== null && cardRatio >= AUTO_EXPAND_INTERSECTION_RATIO
+    );
+  }
+
+  function autoExpandSafeZoneGeometry(control) {
+    if (!control || typeof control.getBoundingClientRect !== "function") {
+      return null;
+    }
+    const viewportHeight = Number(window?.innerHeight) || 0;
+    const rect = control.getBoundingClientRect();
+    const top = Number(rect.top);
+    const bottom = Number(rect.bottom);
+    if (
+      !(viewportHeight > 0) ||
+      !Number.isFinite(top) ||
+      !Number.isFinite(bottom) ||
+      !(bottom > top)
+    ) {
+      return null;
+    }
+    const centerY = (top + bottom) / 2;
+    if (
+      centerY < viewportHeight * AUTO_EXPAND_SAFE_ZONE_TOP_RATIO ||
+      centerY > viewportHeight * AUTO_EXPAND_SAFE_ZONE_BOTTOM_RATIO
+    ) {
+      return null;
+    }
+    return { centerY };
+  }
+
+  function clearAutoExpandScrollIdleTimer() {
+    if (autoExpandScrollIdleTimer !== null) {
+      clearTimeout(autoExpandScrollIdleTimer);
+    }
+    autoExpandScrollIdleTimer = null;
+  }
+
+  function clearAutoExpandViewportIntent() {
+    if (autoExpandViewportIntentTimer !== null) {
+      clearTimeout(autoExpandViewportIntentTimer);
+    }
+    autoExpandViewportIntentTimer = null;
+    autoExpandDominantCandidate = null;
+    autoExpandViewportIntentGeneration += 1;
+  }
+
+  function pageAllowsAutoExpandReadingIntent() {
+    if (
+      document.hidden === true ||
+      document.visibilityState === "hidden" ||
+      (typeof document.hasFocus === "function" && !document.hasFocus()) ||
+      typeof window.getSelection !== "function"
+    ) {
+      return false;
+    }
+    try {
+      const selection = window.getSelection();
+      return Boolean(selection && selection.isCollapsed === true);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function pointerElementIsInteractive(element, card) {
+    const interactiveTags = new Set([
+      "A",
+      "BUTTON",
+      "INPUT",
+      "TEXTAREA",
+      "SELECT",
+      "SUMMARY",
+    ]);
+    for (let current = element; current; current = current.parentElement) {
+      const role = current.getAttribute?.("role");
+      if (
+        interactiveTags.has(current.tagName) ||
+        hasClass(current, "expand") ||
+        role === "button" ||
+        role === "link" ||
+        current.getAttribute?.("contenteditable") === "true" ||
+        current.isContentEditable === true
+      ) {
+        return true;
+      }
+      if (current === card) break;
+    }
+    return false;
+  }
+
+  function dominantAutoExpandCandidate() {
+    if (
+      autoExpandExpandedEpoch === autoExpandScrollEpoch ||
+      !latestRecommendedRoot ||
+      !pageCleanupPreferences.autoExpandLongPosts ||
+      !isAutoExpandLongPostRoute()
+    ) {
+      return null;
+    }
+    const viewportHeight = Number(window?.innerHeight) || 0;
+    if (!(viewportHeight > 0)) return null;
+    let dominant = null;
+    for (const card of latestRecommendedRoot.querySelectorAll(
+      ".wbpro-scroller-item"
+    )) {
+      const cardRatio = visibleAreaRatio(card);
+      if (
+        cardRatio === null ||
+        cardRatio < AUTO_EXPAND_INTERSECTION_RATIO ||
+        typeof card.getBoundingClientRect !== "function" ||
+        typeof card.querySelectorAll !== "function"
+      ) {
+        continue;
+      }
+      const rect = card.getBoundingClientRect();
+      const visibleTop = Math.max(Number(rect.top), 0);
+      const visibleBottom = Math.min(Number(rect.bottom), viewportHeight);
+      if (!(visibleBottom > visibleTop)) continue;
+      const score = Math.abs(
+        (visibleTop + visibleBottom) / 2 - viewportHeight / 2
+      );
+      for (const control of card.querySelectorAll(".expand")) {
+        const validated = validateLongPostExpandControl(control);
+        if (
+          validated &&
+          longPostClickedControlStates.get(control) !== validated.identity &&
+          longPostControlIsMeaningfullyVisible(control, validated.card) &&
+          autoExpandSafeZoneGeometry(control) !== null &&
+          (!dominant || score < dominant.score)
+        ) {
+          dominant = {
+            root: latestRecommendedRoot,
+            card,
+            control,
+            identity: validated.identity,
+            score,
+          };
+        }
+      }
+    }
+    return dominant;
+  }
+
+  function intentCandidatesMatch(left, right) {
+    return Boolean(
+      left &&
+        right &&
+        left.root === right.root &&
+        left.card === right.card &&
+        left.control === right.control &&
+        left.identity === right.identity
+    );
+  }
+
+  function currentPointerElement() {
+    if (
+      !autoExpandPointerKnown ||
+      typeof document.elementFromPoint !== "function"
+    ) {
+      return null;
+    }
+    const pointed = document.elementFromPoint(
+      autoExpandPointerX,
+      autoExpandPointerY
+    );
+    return pointed && pointed.nodeType === 1 ? pointed : null;
+  }
+
+  function pointerBlocksDominantCandidate(candidate) {
+    const pointed = currentPointerElement();
+    if (!pointed || !candidate.card.contains(pointed)) return false;
+    return pointerElementIsInteractive(pointed, candidate.card);
+  }
+
+  function pointerFastPathMatches(candidate) {
+    const pointed = currentPointerElement();
+    return Boolean(
+      pointed &&
+        candidate.card.contains(pointed) &&
+        !pointerElementIsInteractive(pointed, candidate.card)
+    );
+  }
+
+  function cancelAutoExpandGeometryConfirmation() {
+    if (
+      autoExpandGeometryFrameHandle !== null &&
+      typeof cancelAnimationFrame === "function"
+    ) {
+      cancelAnimationFrame(autoExpandGeometryFrameHandle);
+    }
+    autoExpandGeometryFrameHandle = null;
+    autoExpandGeometryCandidate = null;
+    autoExpandGeometryGeneration += 1;
+  }
+
+  function scheduleAutoExpandGeometryConfirmation(candidate) {
+    if (!candidate || typeof requestAnimationFrame !== "function") {
+      return false;
+    }
+    if (
+      autoExpandGeometryFrameHandle !== null &&
+      intentCandidatesMatch(candidate, autoExpandGeometryCandidate)
+    ) {
+      return true;
+    }
+    cancelAutoExpandGeometryConfirmation();
+    const current = dominantAutoExpandCandidate();
+    const firstGeometry = autoExpandSafeZoneGeometry(current?.control);
+    if (
+      !intentCandidatesMatch(current, candidate) ||
+      !firstGeometry ||
+      !autoExpandScrollIsIdle ||
+      pointerBlocksDominantCandidate(current) ||
+      !pageAllowsAutoExpandReadingIntent()
+    ) {
+      return false;
+    }
+    autoExpandGeometryCandidate = current;
+    const generation = autoExpandGeometryGeneration;
+    autoExpandGeometryFrameHandle = requestAnimationFrame(() => {
+      autoExpandGeometryFrameHandle = null;
+      if (generation !== autoExpandGeometryGeneration) return;
+      const expected = autoExpandGeometryCandidate;
+      const latest = dominantAutoExpandCandidate();
+      const secondGeometry = autoExpandSafeZoneGeometry(latest?.control);
+      const geometryStable = Boolean(
+        secondGeometry &&
+          Math.abs(secondGeometry.centerY - firstGeometry.centerY) <=
+            AUTO_EXPAND_GEOMETRY_STABLE_DELTA_PX
+      );
+      if (
+        !intentCandidatesMatch(latest, expected) ||
+        !geometryStable ||
+        !autoExpandScrollIsIdle ||
+        pointerBlocksDominantCandidate(latest) ||
+        !pageAllowsAutoExpandReadingIntent()
+      ) {
+        cancelAutoExpandGeometryConfirmation();
+        clearAutoExpandViewportIntent();
+        return;
+      }
+      const validated = validateLongPostExpandControl(latest.control);
+      if (
+        !validated ||
+        validated.identity !== latest.identity ||
+        !longPostControlIsMeaningfullyVisible(latest.control, validated.card) ||
+        !autoExpandSafeZoneGeometry(latest.control)
+      ) {
+        cancelAutoExpandGeometryConfirmation();
+        clearAutoExpandViewportIntent();
+        return;
+      }
+      cancelAutoExpandGeometryConfirmation();
+      clickValidatedLongPostControl(latest.control, validated);
+    });
+    return true;
+  }
+
+  function clickCurrentViewportIntentCandidate(candidate) {
+    if (
+      !candidate ||
+      !autoExpandScrollIsIdle ||
+      autoExpandExpandedEpoch === autoExpandScrollEpoch ||
+      !pageAllowsAutoExpandReadingIntent()
+    ) {
+      return false;
+    }
+    const current = dominantAutoExpandCandidate();
+    if (
+      !intentCandidatesMatch(current, candidate) ||
+      pointerBlocksDominantCandidate(current)
+    ) {
+      return false;
+    }
+    const validated = validateLongPostExpandControl(current.control);
+    if (
+      !validated ||
+      validated.identity !== current.identity ||
+      !longPostControlIsMeaningfullyVisible(current.control, validated.card) ||
+      !autoExpandSafeZoneGeometry(current.control)
+    ) {
+      return false;
+    }
+    return scheduleAutoExpandGeometryConfirmation(current);
+  }
+
+  function reconcileAutoExpandViewportIntent() {
+    const candidate = dominantAutoExpandCandidate();
+    if (!candidate) {
+      cancelAutoExpandGeometryConfirmation();
+      clearAutoExpandViewportIntent();
+      return false;
+    }
+    if (
+      autoExpandGeometryCandidate &&
+      !intentCandidatesMatch(candidate, autoExpandGeometryCandidate)
+    ) {
+      cancelAutoExpandGeometryConfirmation();
+    }
+    if (
+      autoExpandGeometryFrameHandle !== null &&
+      intentCandidatesMatch(candidate, autoExpandGeometryCandidate)
+    ) {
+      return true;
+    }
+    if (
+      intentCandidatesMatch(candidate, autoExpandDominantCandidate) &&
+      autoExpandScrollIsIdle &&
+      AUTO_EXPAND_POINTER_FAST_IDLE_MS <= AUTO_EXPAND_SCROLL_IDLE_MS &&
+      pointerFastPathMatches(candidate)
+    ) {
+      if (clickCurrentViewportIntentCandidate(candidate)) {
+        clearAutoExpandViewportIntent();
+        return true;
+      }
+    }
+    if (
+      intentCandidatesMatch(candidate, autoExpandDominantCandidate) &&
+      autoExpandViewportIntentTimer !== null
+    ) {
+      return true;
+    }
+    clearAutoExpandViewportIntent();
+    autoExpandDominantCandidate = candidate;
+    const generation = autoExpandViewportIntentGeneration;
+    autoExpandViewportIntentTimer = setTimeout(() => {
+      autoExpandViewportIntentTimer = null;
+      if (generation !== autoExpandViewportIntentGeneration) return;
+      const current = dominantAutoExpandCandidate();
+      if (!intentCandidatesMatch(current, candidate)) {
+        clearAutoExpandViewportIntent();
+        if (current) reconcileAutoExpandViewportIntent();
+        return;
+      }
+      clearAutoExpandViewportIntent();
+      clickCurrentViewportIntentCandidate(current);
+    }, AUTO_EXPAND_VIEWPORT_INTENT_MS);
+    return true;
+  }
+
+  function scheduleAutoExpandScrollIdle(resetDeadline = false) {
+    const root = latestRecommendedRoot;
+    if (
+      !pageCleanupPreferences.autoExpandLongPosts ||
+      !isAutoExpandLongPostRoute() ||
+      !root
+    ) {
+      clearAutoExpandScrollIdleTimer();
+      return false;
+    }
+    if (resetDeadline) clearAutoExpandScrollIdleTimer();
+    if (autoExpandScrollIdleTimer !== null) return false;
+    const epoch = autoExpandScrollEpoch;
+    autoExpandScrollIdleTimer = setTimeout(() => {
+      autoExpandScrollIdleTimer = null;
+      if (
+        epoch !== autoExpandScrollEpoch ||
+        latestRecommendedRoot !== root ||
+        !pageCleanupPreferences.autoExpandLongPosts ||
+        !isAutoExpandLongPostRoute()
+      ) {
+        return;
+      }
+      autoExpandScrollIsIdle = true;
+      reconcileCurrentPageFeed();
+    }, AUTO_EXPAND_SCROLL_IDLE_MS);
+    return true;
+  }
+
+  function handleAutoExpandRelevantScroll() {
+    autoExpandScrollEpoch += 1;
+    autoExpandScrollIsIdle = false;
+    cancelAutoExpandGeometryConfirmation();
+    clearAutoExpandViewportIntent();
+    scheduleAutoExpandScrollIdle(true);
+    schedulePageFeedReconcile();
+  }
+
+  function handleAutoExpandPointerMove(event) {
+    if (
+      !event ||
+      !Number.isFinite(event.clientX) ||
+      !Number.isFinite(event.clientY)
+    ) {
+      return;
+    }
+    autoExpandPointerKnown = true;
+    autoExpandPointerX = event.clientX;
+    autoExpandPointerY = event.clientY;
+    if (
+      autoExpandScrollIsIdle &&
+      autoExpandExpandedEpoch !== autoExpandScrollEpoch
+    ) {
+      schedulePageFeedReconcile();
+    }
+  }
+
+  function teardownAutoExpandScrollTracking() {
+    clearAutoExpandScrollIdleTimer();
+    cancelAutoExpandGeometryConfirmation();
+    clearAutoExpandViewportIntent();
+    for (const target of autoExpandScrollTargets) {
+      target.removeEventListener?.("scroll", handleAutoExpandRelevantScroll);
+    }
+    autoExpandScrollTargets = [];
+    if (autoExpandPointerTarget) {
+      autoExpandPointerTarget.removeEventListener?.(
+        "pointermove",
+        handleAutoExpandPointerMove
+      );
+    }
+    autoExpandPointerTarget = null;
+    autoExpandPointerKnown = false;
+    autoExpandPointerX = 0;
+    autoExpandPointerY = 0;
+    autoExpandScrollEpoch = 0;
+    autoExpandExpandedEpoch = -1;
+    autoExpandScrollIsIdle = false;
+  }
+
+  function installAutoExpandScrollTracking() {
+    const targets = [window, latestRecommendedRoot].filter(
+      (target, index, all) =>
+        target &&
+        typeof target.addEventListener === "function" &&
+        all.indexOf(target) === index
+    );
+    if (
+      targets.length === autoExpandScrollTargets.length &&
+      targets.every((target, index) => target === autoExpandScrollTargets[index])
+    ) {
+      return;
+    }
+    teardownAutoExpandScrollTracking();
+    autoExpandScrollTargets = targets;
+    for (const target of autoExpandScrollTargets) {
+      target.addEventListener("scroll", handleAutoExpandRelevantScroll, {
+        passive: true,
+      });
+    }
+    autoExpandPointerTarget = window;
+    autoExpandPointerTarget.addEventListener(
+      "pointermove",
+      handleAutoExpandPointerMove,
+      { passive: true }
+    );
+    scheduleAutoExpandScrollIdle();
+  }
+
+  function clickValidatedLongPostControl(control, validated) {
+    if (
+      !validated ||
+      !autoExpandScrollIsIdle ||
+      autoExpandExpandedEpoch === autoExpandScrollEpoch ||
+      longPostClickedControlStates.get(control) === validated.identity
+    ) {
+      return false;
+    }
+    autoExpandExpandedEpoch = autoExpandScrollEpoch;
+    longPostClickedControlStates.set(control, validated.identity);
+    if (longPostIntersectionObserver) {
+      longPostIntersectionObserver.unobserve(control);
+    }
+    longPostObservedControls.delete(control);
+    if (typeof control.click === "function") control.click();
+    return true;
+  }
+
+  function registerLongPostControls(card) {
+    if (!card || typeof card.querySelectorAll !== "function") {
+      return;
+    }
+    for (const control of card.querySelectorAll(".expand")) {
+      const validated = validateLongPostExpandControl(control);
+      if (!validated) continue;
+      if (longPostClickedControlStates.get(control) === validated.identity) {
+        if (longPostIntersectionObserver) {
+          longPostIntersectionObserver.unobserve(control);
+        }
+        longPostObservedControls.delete(control);
+        continue;
+      }
+      if (!longPostIntersectionObserver || longPostObservedControls.has(control)) {
+        continue;
+      }
+      longPostObservedControls.add(control);
+      longPostIntersectionObserver.observe(control);
+    }
+  }
+
+  function pruneLongPostControls() {
+    if (!longPostIntersectionObserver) return;
+    for (const control of [...longPostObservedControls]) {
+      if (validateLongPostExpandControl(control)) continue;
+      longPostIntersectionObserver.unobserve(control);
+      longPostObservedControls.delete(control);
+    }
+  }
+
+  function processLongPostIntersections(entries) {
+    for (const entry of entries) {
+      if (
+        !entry.isIntersecting ||
+        entry.intersectionRatio < AUTO_EXPAND_INTERSECTION_RATIO
+      ) {
+        continue;
+      }
+      const control = entry.target;
+      const validated = validateLongPostExpandControl(control);
+      if (!validated) continue;
+      if (!autoExpandScrollIsIdle) scheduleAutoExpandScrollIdle();
+      else schedulePageFeedReconcile();
+    }
+  }
+
+  function teardownLongPostAutoExpand() {
+    teardownAutoExpandScrollTracking();
+    if (longPostIntersectionObserver) {
+      longPostIntersectionObserver.disconnect();
+    }
+    longPostIntersectionObserver = null;
+    longPostObservedControls.clear();
+    longPostClickedControlStates = new WeakMap();
+  }
+
+  function syncLongPostAutoExpand() {
+    if (
+      !pageCleanupPreferences.autoExpandLongPosts ||
+      !isAutoExpandLongPostRoute() ||
+      !latestRecommendedRoot
+    ) {
+      teardownLongPostAutoExpand();
+      return false;
+    }
+    if (
+      !longPostIntersectionObserver &&
+      typeof IntersectionObserver === "function"
+    ) {
+      longPostIntersectionObserver = new IntersectionObserver(
+        processLongPostIntersections,
+        { threshold: AUTO_EXPAND_INTERSECTION_RATIO }
+      );
+    }
+    installAutoExpandScrollTracking();
+    pruneLongPostControls();
+    return true;
+  }
+
+  function reconcileCurrentPageFeed() {
+    const root = latestRecommendedRoot;
+    if (!root || !pageFeedFeaturesAreActiveForRoute()) {
+      return false;
+    }
+    if (findLatestFeedRoot() !== root) {
+      installLatestFeedRecommendationFilter();
+      return false;
+    }
+    const autoExpandActive = syncLongPostAutoExpand();
+    // Each feed feature is switched on its own; the friend-notes entries need
+    // neither the promotion filter nor auto-expand to be enabled.
+    const friendNotesActive = syncFeedFriendNotes();
+    for (const card of root.querySelectorAll(".wbpro-scroller-item")) {
+      applyLatestRecommendedVisibility(card);
+      if (autoExpandActive) registerLongPostControls(card);
+      if (friendNotesActive) reconcileFeedFriendNoteCard(card);
+    }
+    if (friendNotesActive) pruneFeedFriendNoteEntries(root);
+    reconcileStrongTipsAdModules(root);
+    if (autoExpandActive) reconcileAutoExpandViewportIntent();
+    else clearAutoExpandViewportIntent();
+    return true;
+  }
+
+  function cancelPageFeedReconcile() {
+    if (pageFeedReconcileHandle === null) return;
+    const handle = pageFeedReconcileHandle;
+    const usedAnimationFrame = pageFeedReconcileUsesAnimationFrame;
+    pageFeedReconcileHandle = null;
+    pageFeedReconcileUsesAnimationFrame = false;
+    if (
+      usedAnimationFrame &&
+      typeof cancelAnimationFrame === "function"
+    ) {
+      cancelAnimationFrame(handle);
+    } else {
+      clearTimeout(handle);
+    }
+  }
+
+  function schedulePageFeedReconcile() {
+    if (pageFeedReconcileHandle !== null) return false;
+    const callback = () => {
+      pageFeedReconcileHandle = null;
+      pageFeedReconcileUsesAnimationFrame = false;
+      reconcileCurrentPageFeed();
+    };
+    if (typeof requestAnimationFrame === "function") {
+      pageFeedReconcileUsesAnimationFrame = true;
+      pageFeedReconcileHandle = requestAnimationFrame(callback);
+    } else {
+      pageFeedReconcileHandle = setTimeout(callback, 0);
+    }
+    return true;
+  }
+
+  function processLatestRecommendedMutations() {
+    schedulePageFeedReconcile();
+  }
+
+  function clearLatestRecommendedMarkers(root) {
+    if (!root || typeof root.querySelectorAll !== "function") return;
+    for (const card of root.querySelectorAll(
+      `.${LATEST_RECOMMENDED_HIDDEN_CLASS}`
+    )) {
+      setToolkitClass(card, LATEST_RECOMMENDED_HIDDEN_CLASS, false);
+    }
+    for (const module of root.querySelectorAll(
+      `.${STRONG_FEED_PROMOTION_HIDDEN_CLASS}`
+    )) {
+      setToolkitClass(module, STRONG_FEED_PROMOTION_HIDDEN_CLASS, false);
+    }
+  }
+
+  function findLatestFeedRoot() {
+    if (typeof document.getElementById !== "function") return null;
+    const root = document.getElementById("scroller");
+    return hasClass(root, "vue-recycle-scroller") ? root : null;
+  }
+
+  function findPageFeedDiscoveryHost() {
+    if (typeof document.querySelector !== "function") return null;
+    if (
+      resolveProfileRouteTargetUid() !== null &&
+      autoExpandIsActiveForRoute()
+    ) {
+      return document.querySelector("main");
+    }
+    return document.querySelector(".homeWrap");
+  }
+
+  function currentPageFeedDiscoveryRouteKey() {
+    return pageFeedFeaturesAreActiveForRoute() &&
+      typeof location?.href === "string"
+      ? location.href
+      : null;
+  }
+
+  function cancelPageFeedRootDiscovery() {
+    if (pageFeedRootDiscoveryTimer !== null) {
+      clearTimeout(pageFeedRootDiscoveryTimer);
+    }
+    pageFeedRootDiscoveryTimer = null;
+    pageFeedRootDiscoveryAttempts = 0;
+    pageFeedRootDiscoveryRouteKey = null;
+  }
+
+  function schedulePageFeedRootDiscovery() {
+    const routeKey = currentPageFeedDiscoveryRouteKey();
+    if (routeKey === null || findLatestFeedRoot()) {
+      cancelPageFeedRootDiscovery();
+      return false;
+    }
+    if (
+      pageFeedRootDiscoveryTimer !== null &&
+      pageFeedRootDiscoveryRouteKey === routeKey
+    ) {
+      return false;
+    }
+    if (
+      pageFeedRootDiscoveryTimer !== null ||
+      pageFeedRootDiscoveryRouteKey !== routeKey
+    ) {
+      cancelPageFeedRootDiscovery();
+    }
+    pageFeedRootDiscoveryRouteKey = routeKey;
+    pageFeedRootDiscoveryTimer = setTimeout(() => {
+      pageFeedRootDiscoveryTimer = null;
+      if (
+        currentPageFeedDiscoveryRouteKey() !== routeKey ||
+        !pageFeedFeaturesAreActiveForRoute()
+      ) {
+        cancelPageFeedRootDiscovery();
+        return;
+      }
+      if (findLatestFeedRoot() || findPageFeedDiscoveryHost()) {
+        pageFeedRootDiscoveryAttempts = 0;
+        pageFeedRootDiscoveryRouteKey = null;
+        installLatestFeedRecommendationFilter();
+        return;
+      }
+      pageFeedRootDiscoveryAttempts += 1;
+      if (
+        pageFeedRootDiscoveryAttempts >=
+        PAGE_FEED_ROOT_DISCOVERY_MAX_ATTEMPTS
+      ) {
+        cancelPageFeedRootDiscovery();
+        return;
+      }
+      schedulePageFeedRootDiscovery();
+    }, PAGE_FEED_ROOT_DISCOVERY_DELAY_MS);
+    return true;
+  }
+
+  function disconnectLatestRecommendedDiscoveryObserver() {
+    if (latestRecommendedDiscoveryObserver) {
+      latestRecommendedDiscoveryObserver.disconnect();
+    }
+    latestRecommendedDiscoveryObserver = null;
+    latestRecommendedDiscoveryHost = null;
+  }
+
+  function teardownLatestFeedRecommendationFilter() {
+    teardownFeedFriendNotes();
+    if (
+      !latestRecommendedObserver &&
+      !latestRecommendedRoot &&
+      !latestRecommendedDiscoveryObserver &&
+      !latestRecommendedDiscoveryHost &&
+      !longPostIntersectionObserver &&
+      pageFeedRootDiscoveryTimer === null &&
+      pageFeedReconcileHandle === null
+    ) {
+      return;
+    }
+    cancelPageFeedRootDiscovery();
+    cancelPageFeedReconcile();
+    teardownLongPostAutoExpand();
+    if (latestRecommendedObserver) latestRecommendedObserver.disconnect();
+    disconnectLatestRecommendedDiscoveryObserver();
+    clearLatestRecommendedMarkers(latestRecommendedRoot);
+    latestRecommendedObserver = null;
+    latestRecommendedRoot = null;
+  }
+
+  function installLatestFeedRecommendationFilter() {
+    if (!pageFeedFeaturesAreActiveForRoute()) {
+      teardownLatestFeedRecommendationFilter();
+      return false;
+    }
+    const root = findLatestFeedRoot();
+    if (!root) {
+      cancelPageFeedReconcile();
+      if (latestRecommendedObserver) {
+        latestRecommendedObserver.disconnect();
+        clearLatestRecommendedMarkers(latestRecommendedRoot);
+        latestRecommendedObserver = null;
+        latestRecommendedRoot = null;
+      }
+      teardownLongPostAutoExpand();
+      clearFeedFriendNoteEntries();
+      const discoveryHost = findPageFeedDiscoveryHost();
+      if (
+        latestRecommendedDiscoveryObserver &&
+        (latestRecommendedDiscoveryHost !== discoveryHost ||
+          latestRecommendedDiscoveryHost?.isConnected === false)
+      ) {
+        disconnectLatestRecommendedDiscoveryObserver();
+      }
+      if (
+        !latestRecommendedDiscoveryObserver &&
+        discoveryHost &&
+        discoveryHost.isConnected !== false
+      ) {
+        cancelPageFeedRootDiscovery();
+        latestRecommendedDiscoveryHost = discoveryHost;
+        latestRecommendedDiscoveryObserver = new MutationObserver(() => {
+          if (!pageFeedFeaturesAreActiveForRoute()) {
+            teardownLatestFeedRecommendationFilter();
+            return;
+          }
+          if (findLatestFeedRoot()) installLatestFeedRecommendationFilter();
+        });
+        latestRecommendedDiscoveryObserver.observe(discoveryHost, {
+          childList: true,
+          subtree: true,
+        });
+      } else if (!latestRecommendedDiscoveryObserver) {
+        schedulePageFeedRootDiscovery();
+      }
+      return false;
+    }
+    cancelPageFeedRootDiscovery();
+    disconnectLatestRecommendedDiscoveryObserver();
+    if (latestRecommendedRoot === root && latestRecommendedObserver) {
+      cancelPageFeedReconcile();
+      reconcileCurrentPageFeed();
+      return true;
+    }
+    cancelPageFeedReconcile();
+    if (latestRecommendedObserver) latestRecommendedObserver.disconnect();
+    teardownLongPostAutoExpand();
+    clearLatestRecommendedMarkers(latestRecommendedRoot);
+    latestRecommendedRoot = root;
+    latestRecommendedObserver = new MutationObserver(
+      processLatestRecommendedMutations
+    );
+    latestRecommendedObserver.observe(root, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      // href: a recycled card can be given another post's links before any of
+      // its other observed attributes change.
+      attributeFilter: ["data-index", "data-active", "class", "href"],
+    });
+    reconcileCurrentPageFeed();
+    return true;
+  }
+
+  function resolveProfileRouteTargetUid() {
+    if (
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN ||
+      typeof location.pathname !== "string"
+    ) {
+      return null;
+    }
+    const match = /^\/u\/([1-9]\d*)\/?$/.exec(location.pathname);
+    return match ? normalizeStableUid(match[1]) : null;
+  }
+
+  function profileVisitStorageKey(ownerUid) {
+    return PROFILE_VISIT_STORAGE_PREFIX + ownerUid;
+  }
+
+  function isValidProfileVisitMap(value) {
+    if (!isPlainObject(value)) return false;
+    for (const [uid, record] of Object.entries(value)) {
+      if (
+        normalizeStableUid(uid) !== uid ||
+        !isPlainObject(record) ||
+        !Number.isSafeInteger(record.count) ||
+        record.count < 1 ||
+        typeof record.lastVisitedAt !== "string" ||
+        !Number.isFinite(Date.parse(record.lastVisitedAt))
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function loadProfileVisits(ownerUid) {
+    try {
+      const stored = GM_getValue(profileVisitStorageKey(ownerUid), null);
+      if (stored === null || typeof stored === "undefined") {
+        return { ok: true, visits: {} };
+      }
+      return isValidProfileVisitMap(stored)
+        ? { ok: true, visits: stored }
+        : { ok: false, failureKind: "STORAGE_ERROR" };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function recordProfileVisit(ownerUid, targetUid, visitedAt) {
+    const loaded = loadProfileVisits(ownerUid);
+    if (!loaded.ok) return loaded;
+    const previous = hasOwn(loaded.visits, targetUid)
+      ? loaded.visits[targetUid]
+      : null;
+    if (previous !== null && previous.count >= Number.MAX_SAFE_INTEGER) {
+      return { ok: false, failureKind: "STORAGE_ERROR" };
+    }
+    const nextRecord = {
+      count: previous === null ? 1 : previous.count + 1,
+      lastVisitedAt: visitedAt,
+    };
+    const nextVisits = { ...loaded.visits, [targetUid]: nextRecord };
+    try {
+      GM_setValue(profileVisitStorageKey(ownerUid), nextVisits);
+      const saved = GM_getValue(profileVisitStorageKey(ownerUid), null);
+      if (
+        !isValidProfileVisitMap(saved) ||
+        saved[targetUid].count !== nextRecord.count ||
+        saved[targetUid].lastVisitedAt !== visitedAt
+      ) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return {
+        ok: true,
+        count: nextRecord.count,
+        previousVisitedAt: previous === null ? null : previous.lastVisitedAt,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function addProfileNameObservation(observations, name, observedAt, order) {
+    if (
+      typeof name !== "string" ||
+      name.trim() === "" ||
+      typeof observedAt !== "string" ||
+      !Number.isFinite(Date.parse(observedAt))
+    ) {
+      return;
+    }
+    observations.push({ name, observedAt, order });
+  }
+
+  function deriveProfileLocalFacts(targetUid, friendState, followerState) {
+    const names = [];
+    const relationshipEvents = [];
+    const evidenceTimes = [];
+    let order = 0;
+    let currentName = null;
+    let currentNameObservedAt = Number.NEGATIVE_INFINITY;
+
+    function observeName(name, observedAt) {
+      addProfileNameObservation(names, name, observedAt, order);
+      order += 1;
+      if (
+        typeof observedAt === "string" &&
+        Number.isFinite(Date.parse(observedAt))
+      ) {
+        evidenceTimes.push(observedAt);
+      }
+    }
+
+    function observeCurrentName(name, observedAt) {
+      const observedTime = Date.parse(observedAt);
+      if (
+        typeof name === "string" &&
+        name.trim() !== "" &&
+        Number.isFinite(observedTime) &&
+        observedTime > currentNameObservedAt
+      ) {
+        currentName = name;
+        currentNameObservedAt = observedTime;
+      }
+    }
+
+    if (friendState && friendState.latestSnapshot) {
+      const snapshot = friendState.latestSnapshot;
+      const record = snapshot.records.find((entry) => entry.uid === targetUid);
+      if (record) {
+        observeCurrentName(record.screenName, snapshot.capturedAt);
+        observeName(record.screenName, snapshot.capturedAt);
+      }
+    }
+    if (friendState) {
+      for (const event of friendState.events) {
+        if (event.subjectUid !== targetUid) continue;
+        evidenceTimes.push(event.detectedAt);
+        relationshipEvents.push({
+          observedAt: event.detectedAt,
+          label: EVENT_LABELS[event.type],
+        });
+        if (event.type === EVENT.SCREEN_NAME_CHANGED) {
+          observeName(event.previous.screenName, event.detectedAt);
+          observeName(event.current.screenName, event.detectedAt);
+        } else {
+          observeName(event.displayName, event.detectedAt);
+        }
+      }
+    }
+
+    if (followerState && followerState.latestSnapshot) {
+      const snapshot = followerState.latestSnapshot;
+      const record = snapshot.records.find((entry) => entry.uid === targetUid);
+      if (record) {
+        observeCurrentName(record.screenName, snapshot.capturedAt);
+        observeName(record.screenName, snapshot.capturedAt);
+      }
+    }
+    if (followerState) {
+      for (const event of followerState.events) {
+        if (event.uid !== targetUid) continue;
+        evidenceTimes.push(event.observedAt);
+        relationshipEvents.push({
+          observedAt: event.observedAt,
+          label: FOLLOWER_EVENT_LABELS[event.type],
+        });
+        observeName(event.displayName, event.observedAt);
+      }
+    }
+
+    names.sort((left, right) => {
+      const timeDifference =
+        Date.parse(left.observedAt) - Date.parse(right.observedAt);
+      return timeDifference || left.order - right.order;
+    });
+    if (currentName === null && names.length > 0) {
+      currentName = names[names.length - 1].name;
+      currentNameObservedAt = Date.parse(names[names.length - 1].observedAt);
+    }
+    const seenNames = new Set();
+    const historicalNames = [];
+    for (const observation of names) {
+      if (
+        observation.name === currentName ||
+        seenNames.has(observation.name)
+      ) {
+        continue;
+      }
+      seenNames.add(observation.name);
+      historicalNames.push(observation.name);
+    }
+    relationshipEvents.sort(
+      (left, right) =>
+        Date.parse(right.observedAt) - Date.parse(left.observedAt)
+    );
+    const earliestLocalRecord = evidenceTimes.length
+      ? new Date(
+          Math.min(...evidenceTimes.map((value) => Date.parse(value)))
+        ).toISOString()
+      : null;
+    return {
+      currentName,
+      // When the name above was recorded, so it is never presented as live.
+      currentNameObservedAt: Number.isFinite(currentNameObservedAt)
+        ? new Date(currentNameObservedAt).toISOString()
+        : null,
+      historicalNames,
+      earliestLocalRecord,
+      recentRelationshipEvent: relationshipEvents[0] || null,
+    };
+  }
+
+  function loadProfileLocalFacts(ownerUid, targetUid) {
+    const friend = loadState(ownerUid);
+    const follower = loadFollowerState(ownerUid);
+    return deriveProfileLocalFacts(
+      targetUid,
+      friend.ok ? friend.state : null,
+      follower.ok ? follower.state : null
+    );
+  }
+
+  function normalizeProfileTabText(value) {
+    return typeof value === "string" ? value.replace(/\s+/g, "").trim() : "";
+  }
+
+  function collectProfileTabLabels(root, labels) {
+    if (!root || root.nodeType !== 1) return;
+    const children = elementChildren(root);
+    if (children.length === 0) {
+      const text = normalizeProfileTabText(root.textContent);
+      if (PROFILE_TAB_LABELS.includes(text)) labels.add(text);
+      return;
+    }
+    for (const child of children) collectProfileTabLabels(child, labels);
+  }
+
+  function findProfileExtrasInsertionPoint() {
+    if (typeof document.querySelector !== "function") return null;
+    const main = document.querySelector("main");
+    if (!main) return null;
+    const stack = [main];
+    const weiboLabels = [];
+    while (stack.length > 0) {
+      const node = stack.pop();
+      const children = elementChildren(node);
+      if (
+        children.length === 0 &&
+        normalizeProfileTabText(node.textContent) === "微博"
+      ) {
+        weiboLabels.push(node);
+      }
+      stack.push(...children);
+    }
+    for (const label of weiboLabels) {
+      let candidate = label.parentElement;
+      for (let depth = 0; candidate && depth < 7; depth += 1) {
+        const labels = new Set();
+        collectProfileTabLabels(candidate, labels);
+        if (labels.has("微博") && labels.size >= 3 && candidate.parentElement) {
+          return { main, host: candidate.parentElement, before: candidate };
+        }
+        if (candidate === main) break;
+        candidate = candidate.parentElement;
+      }
+    }
+    return null;
+  }
+
+  function formatProfileDate(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(
+      date.getDate()
+    )}`;
+  }
+
+  function formatProfileVisitTime(value, nowValue = Date.now()) {
+    const visited = new Date(value);
+    const now = new Date(nowValue);
+    if (Number.isNaN(visited.getTime()) || Number.isNaN(now.getTime())) {
+      return formatMinute(value);
+    }
+    const visitedDay = Date.UTC(
+      visited.getFullYear(),
+      visited.getMonth(),
+      visited.getDate()
+    );
+    const currentDay = Date.UTC(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate()
+    );
+    const daysAgo = Math.round((currentDay - visitedDay) / 86400000);
+    const time = `${String(visited.getHours()).padStart(2, "0")}:${String(
+      visited.getMinutes()
+    ).padStart(2, "0")}`;
+    if (daysAgo === 0) return `今天 ${time}`;
+    if (daysAgo === 1) return `昨天 ${time}`;
+    if (daysAgo >= 2 && daysAgo <= 6) return `${daysAgo} 天前`;
+    return formatProfileDate(value);
+  }
+
+  function addProfileLine(
+    root,
+    label,
+    value,
+    exactTime = null,
+    valueTitle = null
+  ) {
+    const row = createElement("p", null, "wfr-profile-row");
+    row.append(createElement("span", `${label}：`, "wfr-profile-label"));
+    const displayedValue = createElement("span", String(value));
+    if (exactTime !== null) {
+      displayedValue.title = formatMinute(exactTime);
+    } else if (valueTitle !== null) {
+      displayedValue.title = valueTitle;
+    }
+    row.append(displayedValue);
+    root.append(row);
+  }
+
+  function closeProfileNicknamePopover(restoreFocus = false) {
+    const active = activeProfileNicknamePopover;
+    if (active === null) return;
+    activeProfileNicknamePopover = null;
+    if (typeof document.removeEventListener === "function") {
+      document.removeEventListener("click", active.onDocumentClick, true);
+      document.removeEventListener("keydown", active.onKeydown);
+    }
+    if (active.root.parentNode) {
+      active.root.parentNode.removeChild(active.root);
+    }
+    active.trigger.setAttribute("aria-expanded", "false");
+    if (restoreFocus && typeof active.trigger.focus === "function") {
+      active.trigger.focus();
+    }
+  }
+
+  function openProfileNicknamePopover(trigger, names) {
+    if (!trigger || !trigger.parentNode || !Array.isArray(names)) return false;
+    closeProfileNicknamePopover();
+    const popover = createElement(
+      "div",
+      null,
+      "wfr-profile-name-popover"
+    );
+    popover.id = "wfr-profile-name-popover";
+    popover.setAttribute("role", "dialog");
+    popover.setAttribute("aria-label", "本地记录过的昵称");
+    const header = createElement("div", null, "wfr-profile-name-popover-header");
+    header.append(createElement("strong", "本地记录过的昵称"));
+    const closeButton = createElement(
+      "button",
+      "关闭",
+      "wfr-profile-name-close"
+    );
+    closeButton.type = "button";
+    closeButton.setAttribute("aria-label", "关闭昵称列表");
+    header.append(closeButton);
+    const list = createElement("ul", null, "wfr-profile-name-list");
+    for (const name of names) list.append(createElement("li", name));
+    popover.append(header, list);
+    trigger.parentNode.append(popover);
+    trigger.setAttribute("aria-expanded", "true");
+
+    const onDocumentClick = (event) => {
+      const target = event && event.target;
+      if (
+        target &&
+        (popover.contains(target) || trigger.contains(target))
+      ) {
+        return;
+      }
+      closeProfileNicknamePopover();
+    };
+    const onKeydown = (event) => {
+      if (event && event.key === "Escape") {
+        closeProfileNicknamePopover(true);
+      }
+    };
+    activeProfileNicknamePopover = {
+      root: popover,
+      trigger,
+      onDocumentClick,
+      onKeydown,
+    };
+    closeButton.addEventListener("click", () => {
+      closeProfileNicknamePopover(true);
+    });
+    if (typeof document.addEventListener === "function") {
+      document.addEventListener("click", onDocumentClick, true);
+      document.addEventListener("keydown", onKeydown);
+    }
+    return true;
+  }
+
+  function renderProfileExtras(context) {
+    const root = createElement(
+      "section",
+      null,
+      "wfr-profile-extras wfr-root"
+    );
+    root.id = PROFILE_EXTRAS_ID;
+    root.setAttribute("aria-label", "Weibo Toolkit 本地记录");
+    applyThemeToRoot(root);
+
+    const facts = context.facts;
+    if (facts.historicalNames.length > 0) {
+      const row = createElement("div", null, "wfr-profile-name-row");
+      const trigger = createElement(
+        "button",
+        `历史昵称：${facts.historicalNames.length} 个`,
+        "wfr-profile-name-trigger"
+      );
+      trigger.type = "button";
+      trigger.setAttribute("aria-expanded", "false");
+      trigger.setAttribute("aria-haspopup", "dialog");
+      trigger.setAttribute("aria-controls", "wfr-profile-name-popover");
+      trigger.addEventListener("click", () => {
+        if (
+          activeProfileNicknamePopover &&
+          activeProfileNicknamePopover.trigger === trigger
+        ) {
+          closeProfileNicknamePopover(true);
+          return;
+        }
+        openProfileNicknamePopover(trigger, facts.historicalNames);
+      });
+      row.append(trigger);
+      root.append(row);
+    }
+    if (facts.recentRelationshipEvent !== null) {
+      addProfileLine(
+        root,
+        "最近记录",
+        `${formatProfileDate(facts.recentRelationshipEvent.observedAt)} · ${facts.recentRelationshipEvent.label}`,
+        facts.recentRelationshipEvent.observedAt
+      );
+    }
+    if (facts.earliestLocalRecord !== null) {
+      addProfileLine(
+        root,
+        "最早本地记录",
+        formatProfileDate(facts.earliestLocalRecord),
+        facts.earliestLocalRecord
+      );
+    }
+    if (context.visit.ok && context.visit.previousVisitedAt !== null) {
+      addProfileLine(
+        root,
+        "上次访问",
+        formatProfileVisitTime(context.visit.previousVisitedAt),
+        context.visit.previousVisitedAt
+      );
+    }
+    if (context.visit.ok) {
+      addProfileLine(
+        root,
+        "累计访问次数",
+        `${context.visit.count} 次`,
+        null,
+        "当前浏览器中 Toolkit 记录的累计访问次数"
+      );
+    }
+    return root;
+  }
+
+  function profileContextHasContent(context) {
+    return Boolean(
+      context &&
+        (context.visit.ok ||
+          context.facts.historicalNames.length > 0 ||
+          context.facts.earliestLocalRecord !== null ||
+          context.facts.recentRelationshipEvent !== null)
+    );
+  }
+
+  function removeProfileExtrasNode() {
+    closeProfileNicknamePopover();
+    if (typeof document.getElementById !== "function") return;
+    const node = document.getElementById(PROFILE_EXTRAS_ID);
+    if (node && node.parentNode) node.parentNode.removeChild(node);
+  }
+
+  function disconnectProfileExtrasObserver() {
+    if (profileExtrasObserver) profileExtrasObserver.disconnect();
+    profileExtrasObserver = null;
+    profileExtrasObservedMain = null;
+    profileExtrasObservedHost = null;
+  }
+
+  function cancelProfileExtrasDiscovery() {
+    if (profileExtrasDiscoveryTimer !== null) {
+      clearTimeout(profileExtrasDiscoveryTimer);
+      profileExtrasDiscoveryTimer = null;
+    }
+    profileExtrasDiscoveryCount = 0;
+  }
+
+  function teardownProfileExtras(resetContext = true) {
+    disconnectProfileExtrasObserver();
+    cancelProfileExtrasDiscovery();
+    removeProfileExtrasNode();
+    if (resetContext) activeProfileContext = null;
+  }
+
+  function scheduleProfileExtrasEnsure() {
+    if (profileExtrasEnsureScheduled) return;
+    profileExtrasEnsureScheduled = true;
+    setTimeout(() => {
+      profileExtrasEnsureScheduled = false;
+      ensureProfileExtras();
+    }, 0);
+  }
+
+  function observeProfileExtrasHost(point) {
+    if (
+      profileExtrasObserver &&
+      profileExtrasObservedMain === point.main &&
+      profileExtrasObservedHost === point.host
+    ) {
+      return;
+    }
+    disconnectProfileExtrasObserver();
+    profileExtrasObserver = new MutationObserver(scheduleProfileExtrasEnsure);
+    profileExtrasObserver.observe(point.main, { childList: true });
+    if (point.host !== point.main) {
+      profileExtrasObserver.observe(point.host, { childList: true });
+    }
+    profileExtrasObservedMain = point.main;
+    profileExtrasObservedHost = point.host;
+  }
+
+  function scheduleProfileExtrasDiscovery() {
+    if (
+      profileExtrasDiscoveryTimer !== null ||
+      profileExtrasDiscoveryCount >= 20
+    ) {
+      return;
+    }
+    profileExtrasDiscoveryTimer = setTimeout(() => {
+      profileExtrasDiscoveryTimer = null;
+      profileExtrasDiscoveryCount += 1;
+      ensureProfileExtras();
+    }, 250);
+  }
+
+  function ensureProfileExtras() {
+    if (!pageCleanupPreferences.showProfileExtras) {
+      const targetUid = resolveProfileRouteTargetUid();
+      const owner = determineCurrentUid();
+      const sameRecordedRoute = Boolean(
+        activeProfileContext &&
+          owner.ok &&
+          activeProfileContext.ownerUid === owner.uid &&
+          activeProfileContext.targetUid === targetUid
+      );
+      teardownProfileExtras(!sameRecordedRoute);
+      return false;
+    }
+    const targetUid = resolveProfileRouteTargetUid();
+    const owner = determineCurrentUid();
+    if (!owner.ok || targetUid === null || targetUid === owner.uid) {
+      teardownProfileExtras();
+      return false;
+    }
+    if (
+      activeProfileContext === null ||
+      activeProfileContext.ownerUid !== owner.uid ||
+      activeProfileContext.targetUid !== targetUid
+    ) {
+      teardownProfileExtras();
+      const visitedAt = new Date().toISOString();
+      activeProfileContext = {
+        ownerUid: owner.uid,
+        targetUid,
+        facts: loadProfileLocalFacts(owner.uid, targetUid),
+        visit: recordProfileVisit(owner.uid, targetUid, visitedAt),
+      };
+    }
+
+    if (!profileContextHasContent(activeProfileContext)) {
+      removeProfileExtrasNode();
+      disconnectProfileExtrasObserver();
+      cancelProfileExtrasDiscovery();
+      return false;
+    }
+
+    const point = findProfileExtrasInsertionPoint();
+    if (!point) {
+      removeProfileExtrasNode();
+      disconnectProfileExtrasObserver();
+      scheduleProfileExtrasDiscovery();
+      return false;
+    }
+    if (profileExtrasDiscoveryTimer !== null) {
+      clearTimeout(profileExtrasDiscoveryTimer);
+      profileExtrasDiscoveryTimer = null;
+    }
+    profileExtrasDiscoveryCount = 0;
+    let root = document.getElementById(PROFILE_EXTRAS_ID);
+    if (!root || root.parentNode !== point.host) {
+      removeProfileExtrasNode();
+      root = renderProfileExtras(activeProfileContext);
+      point.host.insertBefore(root, point.before);
+    }
+    observeProfileExtrasHost(point);
+    return true;
+  }
+
+  function parseToolkitReleaseVersion(value) {
+    if (typeof value !== "string") return null;
+    const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(
+      value
+    );
+    if (!match) return null;
+    const parts = match.slice(1).map(Number);
+    return parts.every(Number.isSafeInteger) ? parts : null;
+  }
+
+  function compareToolkitReleaseVersions(left, right) {
+    const leftParts = parseToolkitReleaseVersion(left);
+    const rightParts = parseToolkitReleaseVersion(right);
+    if (leftParts === null || rightParts === null) return null;
+    for (let index = 0; index < 3; index += 1) {
+      if (leftParts[index] !== rightParts[index]) {
+        return leftParts[index] < rightParts[index] ? -1 : 1;
+      }
+    }
+    return 0;
+  }
+
+  function getBundledChangelog(version) {
+    return parseToolkitReleaseVersion(version) !== null &&
+      hasOwn(CHANGELOG_BY_VERSION, version)
+      ? CHANGELOG_BY_VERSION[version]
+      : null;
+  }
+
+  function bundledReleaseVersionsThrough(currentVersion) {
+    if (parseToolkitReleaseVersion(currentVersion) === null) return [];
+    return Object.keys(CHANGELOG_BY_VERSION)
+      .filter((version) => {
+        const comparison = compareToolkitReleaseVersions(
+          version,
+          currentVersion
+        );
+        return comparison !== null && comparison <= 0;
+      })
+      .sort((left, right) => compareToolkitReleaseVersions(right, left));
+  }
+
+  function loadSeenChangelogVersion() {
+    try {
+      const value = GM_getValue(CHANGELOG_SEEN_VERSION_KEY, null);
+      return parseToolkitReleaseVersion(value) !== null ? value : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function saveSeenChangelogVersion(version) {
+    if (parseToolkitReleaseVersion(version) === null) return false;
+    try {
+      GM_setValue(CHANGELOG_SEEN_VERSION_KEY, version);
+      return GM_getValue(CHANGELOG_SEEN_VERSION_KEY, null) === version;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function shouldAutoShowBundledChangelog(version) {
+    const rolloutComparison = compareToolkitReleaseVersions(
+      version,
+      AUTO_CHANGELOG_FROM_VERSION
+    );
+    return (
+      rolloutComparison !== null &&
+      rolloutComparison >= 0 &&
+      getBundledChangelog(version) !== null &&
+      loadSeenChangelogVersion() !== version
+    );
+  }
+
+  function appendChangelogSections(body, changelog) {
+    for (const [property, title] of [
+      ["added", "新增"],
+      ["improved", "改进"],
+      ["fixed", "修复"],
+    ]) {
+      const entries = changelog[property];
+      if (!Array.isArray(entries) || entries.length === 0) continue;
+      body.append(createElement("h3", title));
+      const list = createElement("ul", null, "wfr-changelog-list");
+      for (const entry of entries) list.append(createElement("li", entry));
+      body.append(list);
+    }
+  }
+
+  function showBundledChangelog(version) {
+    const changelog = getBundledChangelog(version);
+    if (changelog === null) return false;
+    let body;
+    try {
+      body = showPanel(`Weibo Toolkit v${version} 新功能`);
+      appendChangelogSections(body, changelog);
+      const actions = createElement("div", null, "wfr-actions");
+      const acknowledge = createElement(
+        "button",
+        "知道了",
+        "wfr-button wfr-primary"
+      );
+      acknowledge.type = "button";
+      acknowledge.addEventListener("click", closePanel);
+      actions.append(acknowledge);
+      body.append(actions);
+    } catch (_) {
+      panelDismissHandler = null;
+      closePanel();
+      return false;
+    }
+    panelDismissHandler = () => {
+      saveSeenChangelogVersion(version);
+    };
+    return true;
+  }
+
+  function showUpdateHistory(currentVersion = APP_VERSION) {
+    const versions = bundledReleaseVersionsThrough(currentVersion);
+    if (versions.length === 0) return false;
+    const body = showPanel("更新记录", true);
+    for (const version of versions) {
+      const details = createElement("details", null, "wfr-release-history");
+      details.open = version === currentVersion;
+      details.append(createElement("summary", `v${version}`));
+      const content = createElement(
+        "div",
+        null,
+        "wfr-release-history-content"
+      );
+      appendChangelogSections(content, CHANGELOG_BY_VERSION[version]);
+      details.append(content);
+      body.append(details);
+    }
+    return true;
+  }
+
+  function maybeAutoShowBundledChangelog(version = APP_VERSION) {
+    if (
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN ||
+      panelRoot !== null ||
+      !shouldAutoShowBundledChangelog(version)
+    ) {
+      return false;
+    }
+    return showBundledChangelog(version);
+  }
+
+  function scheduleBundledChangelogAutoShow() {
+    if (!shouldAutoShowBundledChangelog(APP_VERSION)) return;
+    setTimeout(() => {
+      maybeAutoShowBundledChangelog(APP_VERSION);
+    }, 1500);
+  }
+
+  function usageLocalDateKey(nowValue = Date.now()) {
+    const date = new Date(nowValue);
+    if (Number.isNaN(date.getTime())) return null;
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+      date.getDate()
+    )}`;
+  }
+
+  function isValidUsageDateKey(value) {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      return false;
+    }
+    const [year, month, day] = value.split("-").map(Number);
+    const date = new Date(year, month - 1, day);
+    return (
+      date.getFullYear() === year &&
+      date.getMonth() === month - 1 &&
+      date.getDate() === day
+    );
+  }
+
+  function isValidUsagePostId(value) {
+    return typeof value === "string" && /^[A-Za-z0-9]{5,32}$/.test(value);
+  }
+
+  function emptyUsageState(dateKey) {
+    return {
+      version: USAGE_STATE_VERSION,
+      currentDay: {
+        date: dateKey,
+        activeSeconds: 0,
+        uniquePostIds: [],
+      },
+      days: {},
+    };
+  }
+
+  function isValidUsageState(state) {
+    if (
+      !isPlainObject(state) ||
+      state.version !== USAGE_STATE_VERSION ||
+      !isPlainObject(state.currentDay) ||
+      !isValidUsageDateKey(state.currentDay.date) ||
+      typeof state.currentDay.activeSeconds !== "number" ||
+      !Number.isFinite(state.currentDay.activeSeconds) ||
+      state.currentDay.activeSeconds < 0 ||
+      state.currentDay.activeSeconds > 86400 ||
+      !Array.isArray(state.currentDay.uniquePostIds) ||
+      !isPlainObject(state.days)
+    ) {
+      return false;
+    }
+    const postIds = new Set();
+    for (const postId of state.currentDay.uniquePostIds) {
+      if (!isValidUsagePostId(postId) || postIds.has(postId)) return false;
+      postIds.add(postId);
+    }
+    const dayEntries = Object.entries(state.days);
+    if (dayEntries.length > USAGE_RETENTION_DAYS) return false;
+    for (const [dateKey, day] of dayEntries) {
+      if (
+        !isValidUsageDateKey(dateKey) ||
+        dateKey >= state.currentDay.date ||
+        !isPlainObject(day) ||
+        typeof day.activeSeconds !== "number" ||
+        !Number.isFinite(day.activeSeconds) ||
+        day.activeSeconds < 0 ||
+        day.activeSeconds > 86400 ||
+        !Number.isSafeInteger(day.uniquePosts) ||
+        day.uniquePosts < 0
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function usageRetentionCutoff(nowValue) {
+    const date = new Date(nowValue);
+    date.setHours(0, 0, 0, 0);
+    date.setDate(date.getDate() - (USAGE_RETENTION_DAYS - 1));
+    return usageLocalDateKey(date.getTime());
+  }
+
+  function rollUsageStateToDate(state, dateKey, nowValue = Date.now()) {
+    if (state.currentDay.date === dateKey) return state;
+    const days = {
+      ...state.days,
+      [state.currentDay.date]: {
+        activeSeconds: state.currentDay.activeSeconds,
+        uniquePosts: state.currentDay.uniquePostIds.length,
+      },
+    };
+    const cutoff = usageRetentionCutoff(nowValue);
+    for (const storedDate of Object.keys(days)) {
+      if (storedDate < cutoff || storedDate >= dateKey) delete days[storedDate];
+    }
+    return {
+      version: USAGE_STATE_VERSION,
+      currentDay: {
+        date: dateKey,
+        activeSeconds: 0,
+        uniquePostIds: [],
+      },
+      days,
+    };
+  }
+
+  function usageStorageKey(ownerUid) {
+    return USAGE_STORAGE_PREFIX + ownerUid;
+  }
+
+  function loadUsageState(ownerUid, nowValue = Date.now()) {
+    const dateKey = usageLocalDateKey(nowValue);
+    if (dateKey === null) return { ok: false, failureKind: "STORAGE_ERROR" };
+    try {
+      const raw = GM_getValue(usageStorageKey(ownerUid), null);
+      if (raw === null || typeof raw === "undefined") {
+        return { ok: true, state: emptyUsageState(dateKey), raw: null };
+      }
+      if (typeof raw !== "string") {
+        return { ok: false, failureKind: "STORAGE_ERROR" };
+      }
+      const parsed = JSON.parse(raw);
+      if (!isValidUsageState(parsed)) {
+        return { ok: false, failureKind: "STORAGE_ERROR" };
+      }
+      return {
+        ok: true,
+        state: rollUsageStateToDate(parsed, dateKey, nowValue),
+        raw,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function persistUsageState(ownerUid, state) {
+    if (!isValidUsageState(state)) {
+      return { ok: false, failureKind: "PERSISTENCE_ERROR" };
+    }
+    try {
+      const raw = JSON.stringify(state);
+      GM_setValue(usageStorageKey(ownerUid), raw);
+      return GM_getValue(usageStorageKey(ownerUid), null) === raw
+        ? { ok: true, state, raw }
+        : { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function usageLockUnavailable(reason, error) {
+    const result = {
+      ok: false,
+      failureKind: "STATE_LOCK_UNAVAILABLE",
+      reason,
+    };
+    if (error) result.errorName = error.name ? String(error.name) : "Error";
+    return result;
+  }
+
+  async function withUsageStateLock(ownerUid, transaction) {
+    const lockManager = pageLockManager();
+    if (lockManager === null) return usageLockUnavailable("LOCK_UNAVAILABLE");
+    try {
+      return await lockManager.request.call(
+        lockManager,
+        USAGE_LOCK_PREFIX + ownerUid,
+        { mode: "exclusive" },
+        async (lock) => {
+          if (lock === null) return usageLockUnavailable("LOCK_NOT_ACQUIRED");
+          return await transaction();
+        }
+      );
+    } catch (error) {
+      return usageLockUnavailable("LOCK_REQUEST_FAILED", error);
+    }
+  }
+
+  function usageMonotonicNow() {
+    try {
+      if (typeof performance !== "undefined" && performance.now) {
+        return performance.now();
+      }
+    } catch (_) {
+      // Date.now remains a monotonic-enough fallback only for this tab session.
+    }
+    return Date.now();
+  }
+
+  function mergeUsagePendingIntoState(state, activeSeconds, postIds) {
+    const mergedIds = new Set(state.currentDay.uniquePostIds);
+    for (const postId of postIds) mergedIds.add(postId);
+    return {
+      ...state,
+      currentDay: {
+        ...state.currentDay,
+        activeSeconds: Math.min(
+          86400,
+          state.currentDay.activeSeconds + activeSeconds
+        ),
+        uniquePostIds: [...mergedIds].sort(),
+      },
+    };
+  }
+
+  async function flushUsageState() {
+    if (usageFlushInFlight !== null) return await usageFlushInFlight;
+    if (
+      usageRuntimeOwnerUid === null ||
+      usageState === null ||
+      (usagePendingActiveSeconds <= 0 && usagePendingPostIds.size === 0)
+    ) {
+      return { ok: true, state: usageState };
+    }
+    const ownerUid = usageRuntimeOwnerUid;
+    const pendingDate = usageState.currentDay.date;
+    const activeSnapshot = usagePendingActiveSeconds;
+    const postSnapshot = [...usagePendingPostIds];
+    usageFlushInFlight = withUsageStateLock(ownerUid, async () => {
+      const loaded = loadUsageState(ownerUid);
+      if (!loaded.ok || loaded.state.currentDay.date !== pendingDate) {
+        return loaded.ok
+          ? { ok: false, failureKind: "CONCURRENT_MODIFICATION" }
+          : loaded;
+      }
+      const merged = mergeUsagePendingIntoState(
+        loaded.state,
+        activeSnapshot,
+        postSnapshot
+      );
+      return persistUsageState(ownerUid, merged);
+    });
+    const result = await usageFlushInFlight;
+    usageFlushInFlight = null;
+    if (result.ok && usageRuntimeOwnerUid === ownerUid) {
+      usagePendingActiveSeconds = Math.max(
+        0,
+        usagePendingActiveSeconds - activeSnapshot
+      );
+      for (const postId of postSnapshot) usagePendingPostIds.delete(postId);
+      usageState = mergeUsagePendingIntoState(
+        result.state,
+        usagePendingActiveSeconds,
+        usagePendingPostIds
+      );
+      syncUsageCorner();
+    }
+    return result;
+  }
+
+  async function ensureUsageCurrentDay(nowValue = Date.now()) {
+    if (usageState === null) return false;
+    const dateKey = usageLocalDateKey(nowValue);
+    if (dateKey === null) return false;
+    if (usageState.currentDay.date === dateKey) return true;
+    const flushed = await flushUsageState();
+    if (!flushed.ok || usagePendingActiveSeconds > 0 || usagePendingPostIds.size) {
+      return false;
+    }
+    usageState = rollUsageStateToDate(usageState, dateKey, nowValue);
+    return true;
+  }
+
+  function isUsageFeedRoute() {
+    return Boolean(
+      typeof location !== "undefined" &&
+        location.origin === WEIBO_MAIN_ORIGIN &&
+        (location.pathname === "/" || location.pathname === "/mygroups")
+    );
+  }
+
+  function extractUsagePostId(card) {
+    if (!card || !hasClass(card, "wbpro-scroller-item")) return null;
+    const article = elementChildren(card).find(
+      (child) => child.tagName === "ARTICLE"
+    );
+    if (!article) return null;
+    const articleBody = elementChildren(article).find(
+      (child) => child.tagName === "DIV"
+    );
+    if (!articleBody) return null;
+    const header = elementChildren(articleBody).find(
+      (child) => child.tagName === "HEADER"
+    );
+    if (!header) return null;
+    const stack = [header];
+    while (stack.length > 0) {
+      const node = stack.pop();
+      if (node.tagName === "A" && typeof node.href === "string") {
+        try {
+          const url = new URL(node.href, WEIBO_MAIN_ORIGIN);
+          const match = /^\/[1-9]\d*\/([A-Za-z0-9]{5,32})\/?$/.exec(
+            url.pathname
+          );
+          if (url.origin === WEIBO_MAIN_ORIGIN && match) return match[1];
+        } catch (_) {
+          // A malformed or unrelated header link is not a post identity.
+        }
+      }
+      stack.push(...elementChildren(node));
+    }
+    return null;
+  }
+
+  function clearUsageCardDwell(cardState) {
+    if (cardState && cardState.dwellTimer !== null) {
+      clearTimeout(cardState.dwellTimer);
+      cardState.dwellTimer = null;
+    }
+  }
+
+  function cleanupDisconnectedUsageCards() {
+    for (const [card, cardState] of usageCardStates) {
+      if (
+        card.isConnected === false ||
+        !usageFeedRoot ||
+        !usageFeedRoot.contains(card)
+      ) {
+        clearUsageCardDwell(cardState);
+        if (usageIntersectionObserver) usageIntersectionObserver.unobserve(card);
+        usageCardStates.delete(card);
+      }
+    }
+  }
+
+  function registerUsageCard(card) {
+    if (!card || !usageIntersectionObserver) return;
+    const postId = extractUsagePostId(card);
+    const existing = usageCardStates.get(card);
+    if (postId === null) {
+      if (existing) {
+        clearUsageCardDwell(existing);
+        usageIntersectionObserver.unobserve(card);
+        usageCardStates.delete(card);
+      }
+      return;
+    }
+    if (existing && existing.postId === postId) return;
+    if (existing) {
+      clearUsageCardDwell(existing);
+      usageIntersectionObserver.unobserve(card);
+    }
+    usageCardStates.set(card, {
+      postId,
+      visibleRatio: 0,
+      dwellTimer: null,
+    });
+    usageIntersectionObserver.observe(card);
+  }
+
+  function collectUsageCards(node, cards) {
+    if (!node) return;
+    let current = node.nodeType === 1 ? node : node.parentElement;
+    while (current && current !== usageFeedRoot) {
+      if (hasClass(current, "wbpro-scroller-item")) {
+        cards.add(current);
+        break;
+      }
+      current = current.parentElement;
+    }
+    if (node.nodeType !== 1 || typeof node.querySelectorAll !== "function") {
+      return;
+    }
+    if (hasClass(node, "wbpro-scroller-item")) cards.add(node);
+    for (const card of node.querySelectorAll(".wbpro-scroller-item")) {
+      cards.add(card);
+    }
+  }
+
+  function processUsageFeedMutations(mutations) {
+    if (!usageEnabledPreference || !isUsageFeedRoute()) {
+      teardownUsageFeedTracking();
+      return;
+    }
+    const cards = new Set();
+    for (const mutation of mutations) {
+      collectUsageCards(mutation.target, cards);
+      for (const node of mutation.addedNodes || []) collectUsageCards(node, cards);
+    }
+    for (const card of cards) registerUsageCard(card);
+    cleanupDisconnectedUsageCards();
+  }
+
+  function isUsageCardStillHalfVisible(card) {
+    if (!card || typeof card.getBoundingClientRect !== "function") return false;
+    const rect = card.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+    const viewportWidth =
+      typeof window !== "undefined" && Number.isFinite(window.innerWidth)
+        ? window.innerWidth
+        : 0;
+    const viewportHeight =
+      typeof window !== "undefined" && Number.isFinite(window.innerHeight)
+        ? window.innerHeight
+        : 0;
+    if (viewportWidth <= 0 || viewportHeight <= 0) return false;
+    const visibleWidth = Math.max(
+      0,
+      Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0)
+    );
+    const visibleHeight = Math.max(
+      0,
+      Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0)
+    );
+    return (
+      (visibleWidth * visibleHeight) / (rect.width * rect.height) >=
+      USAGE_POST_VISIBILITY_RATIO
+    );
+  }
+
+  function noteUsageActivity() {
+    if (!usageEnabledPreference || usageRuntimeOwnerUid === null) return;
+    usageLastActivityMonotonic = usageMonotonicNow();
+  }
+
+  async function recordQualifiedUsagePost(postId) {
+    if (!usageEnabledPreference || !isValidUsagePostId(postId)) return false;
+    const owner = determineCurrentUid();
+    if (!owner.ok || owner.uid !== usageRuntimeOwnerUid) return false;
+    if (!(await ensureUsageCurrentDay())) return false;
+    noteUsageActivity();
+    let changed = false;
+    if (!usageSessionPostIds.has(postId)) {
+      usageSessionPostIds.add(postId);
+      changed = true;
+    }
+    if (!usageState.currentDay.uniquePostIds.includes(postId)) {
+      usageState.currentDay.uniquePostIds.push(postId);
+      usagePendingPostIds.add(postId);
+      changed = true;
+    }
+    if (changed) syncUsageCorner();
+    return changed;
+  }
+
+  async function finishUsageCardDwell(card, capturedPostId) {
+    const cardState = usageCardStates.get(card);
+    if (cardState) cardState.dwellTimer = null;
+    const owner = determineCurrentUid();
+    if (
+      !usageEnabledPreference ||
+      !isUsageFeedRoute() ||
+      !owner.ok ||
+      owner.uid !== usageRuntimeOwnerUid ||
+      !cardState ||
+      cardState.postId !== capturedPostId ||
+      cardState.visibleRatio < USAGE_POST_VISIBILITY_RATIO ||
+      card.isConnected === false ||
+      !usageFeedRoot ||
+      !usageFeedRoot.contains(card) ||
+      extractUsagePostId(card) !== capturedPostId ||
+      !isUsageCardStillHalfVisible(card)
+    ) {
+      return false;
+    }
+    return await recordQualifiedUsagePost(capturedPostId);
+  }
+
+  function processUsageIntersections(entries) {
+    for (const entry of entries) {
+      const cardState = usageCardStates.get(entry.target);
+      if (!cardState) continue;
+      cardState.visibleRatio =
+        entry.isIntersecting === true && Number.isFinite(entry.intersectionRatio)
+          ? entry.intersectionRatio
+          : 0;
+      clearUsageCardDwell(cardState);
+      if (cardState.visibleRatio >= USAGE_POST_VISIBILITY_RATIO) {
+        const capturedPostId = cardState.postId;
+        cardState.dwellTimer = setTimeout(
+          () => finishUsageCardDwell(entry.target, capturedPostId),
+          USAGE_POST_DWELL_MS
+        );
+      }
+    }
+  }
+
+  function teardownUsageFeedTracking(resetDiscovery = true) {
+    if (usageFeedObserver) usageFeedObserver.disconnect();
+    if (usageIntersectionObserver) usageIntersectionObserver.disconnect();
+    if (resetDiscovery && usageFeedDiscoveryTimer !== null) {
+      clearTimeout(usageFeedDiscoveryTimer);
+    }
+    for (const cardState of usageCardStates.values()) {
+      clearUsageCardDwell(cardState);
+    }
+    usageFeedRoot = null;
+    usageFeedObserver = null;
+    usageIntersectionObserver = null;
+    if (resetDiscovery) {
+      usageFeedDiscoveryTimer = null;
+      usageFeedDiscoveryCount = 0;
+    }
+    usageCardStates = new Map();
+  }
+
+  function scheduleUsageFeedDiscovery() {
+    if (usageFeedDiscoveryTimer !== null || usageFeedDiscoveryCount >= 20) {
+      return;
+    }
+    usageFeedDiscoveryTimer = setTimeout(() => {
+      usageFeedDiscoveryTimer = null;
+      usageFeedDiscoveryCount += 1;
+      installUsageFeedTrackingForRoute();
+    }, 250);
+  }
+
+  function installUsageFeedTrackingForRoute() {
+    if (!usageEnabledPreference || usageRuntimeOwnerUid === null) {
+      teardownUsageFeedTracking();
+      return false;
+    }
+    if (!isUsageFeedRoute()) {
+      teardownUsageFeedTracking();
+      return false;
+    }
+    const root = findLatestFeedRoot();
+    if (!root) {
+      teardownUsageFeedTracking(false);
+      scheduleUsageFeedDiscovery();
+      return false;
+    }
+    if (
+      usageFeedRoot === root &&
+      usageFeedObserver &&
+      usageIntersectionObserver
+    ) {
+      return true;
+    }
+    teardownUsageFeedTracking();
+    if (
+      typeof IntersectionObserver !== "function" ||
+      typeof MutationObserver !== "function"
+    ) {
+      return false;
+    }
+    usageFeedRoot = root;
+    usageIntersectionObserver = new IntersectionObserver(
+      processUsageIntersections,
+      { threshold: [0, USAGE_POST_VISIBILITY_RATIO, 1] }
+    );
+    usageFeedObserver = new MutationObserver(processUsageFeedMutations);
+    for (const card of root.querySelectorAll(".wbpro-scroller-item")) {
+      registerUsageCard(card);
+    }
+    usageFeedObserver.observe(root, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["href", "data-index", "data-active"],
+    });
+    return true;
+  }
+
+  function usageDocumentIsActive(nowMonotonic) {
+    if (
+      !usageEnabledPreference ||
+      usageRuntimeOwnerUid === null ||
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN ||
+      document.visibilityState !== "visible" ||
+      typeof document.hasFocus !== "function" ||
+      !document.hasFocus()
+    ) {
+      return false;
+    }
+    return nowMonotonic - usageLastActivityMonotonic <= USAGE_INACTIVITY_MS;
+  }
+
+  async function runUsageHeartbeat(nowMonotonic = usageMonotonicNow()) {
+    if (!usageEnabledPreference || usageRuntimeOwnerUid === null) return false;
+    const owner = determineCurrentUid();
+    if (!owner.ok || owner.uid !== usageRuntimeOwnerUid) {
+      stopUsageTracking(false);
+      usageRuntimeOwnerUid = null;
+      usageState = null;
+      return false;
+    }
+    if (!(await ensureUsageCurrentDay())) return false;
+    if (usageLastHeartbeatMonotonic === null) {
+      usageLastHeartbeatMonotonic = nowMonotonic;
+      return false;
+    }
+    const elapsedMilliseconds = Math.max(
+      0,
+      nowMonotonic - usageLastHeartbeatMonotonic
+    );
+    usageLastHeartbeatMonotonic = nowMonotonic;
+    if (!usageDocumentIsActive(nowMonotonic)) return false;
+    const addedSeconds =
+      Math.min(elapsedMilliseconds, USAGE_MAX_HEARTBEAT_GAP_MS) / 1000;
+    if (addedSeconds <= 0) return false;
+    usageState.currentDay.activeSeconds = Math.min(
+      86400,
+      usageState.currentDay.activeSeconds + addedSeconds
+    );
+    usageSessionActiveSeconds += addedSeconds;
+    usagePendingActiveSeconds += addedSeconds;
+    syncUsageCorner();
+    return true;
+  }
+
+  function scheduleUsageHeartbeat() {
+    if (usageHeartbeatTimer !== null || !usageEnabledPreference) return;
+    usageHeartbeatTimer = setTimeout(async () => {
+      usageHeartbeatTimer = null;
+      await runUsageHeartbeat();
+      scheduleUsageHeartbeat();
+    }, USAGE_HEARTBEAT_MS);
+  }
+
+  function scheduleUsageFlush() {
+    if (usageFlushTimer !== null || !usageEnabledPreference) return;
+    usageFlushTimer = setTimeout(async () => {
+      usageFlushTimer = null;
+      await flushUsageState();
+      scheduleUsageFlush();
+    }, USAGE_FLUSH_MS);
+  }
+
+  function handleUsageVisibilityChange() {
+    if (document.visibilityState !== "visible") void flushUsageState();
+  }
+
+  function handleUsagePageHide() {
+    void flushUsageState();
+  }
+
+  function installUsageActivityListeners() {
+    if (usageListenersInstalled) return;
+    for (const type of ["pointerdown", "keydown", "wheel", "touchstart"]) {
+      document.addEventListener(type, noteUsageActivity, {
+        passive: type === "wheel" || type === "touchstart",
+      });
+    }
+    window.addEventListener("scroll", noteUsageActivity, { passive: true });
+    document.addEventListener(
+      "visibilitychange",
+      handleUsageVisibilityChange
+    );
+    window.addEventListener("pagehide", handleUsagePageHide);
+    usageListenersInstalled = true;
+  }
+
+  function removeUsageActivityListeners() {
+    if (!usageListenersInstalled) return;
+    for (const type of ["pointerdown", "keydown", "wheel", "touchstart"]) {
+      document.removeEventListener(type, noteUsageActivity);
+    }
+    window.removeEventListener("scroll", noteUsageActivity);
+    document.removeEventListener(
+      "visibilitychange",
+      handleUsageVisibilityChange
+    );
+    window.removeEventListener("pagehide", handleUsagePageHide);
+    usageListenersInstalled = false;
+  }
+
+  function startUsageTracking(fromUserAction = false) {
+    if (!usageEnabledPreference) return { ok: false, reason: "DISABLED" };
+    const owner = determineCurrentUid();
+    if (!owner.ok) return owner;
+    if (pageLockManager() === null) {
+      return { ok: false, failureKind: "STATE_LOCK_UNAVAILABLE" };
+    }
+    if (usageRuntimeOwnerUid === owner.uid && usageState !== null) {
+      installUsageActivityListeners();
+      installUsageFeedTrackingForRoute();
+      scheduleUsageHeartbeat();
+      scheduleUsageFlush();
+      syncUsageCorner();
+      if (fromUserAction) noteUsageActivity();
+      return { ok: true };
+    }
+    const loaded = loadUsageState(owner.uid);
+    if (!loaded.ok) return loaded;
+    usageRuntimeOwnerUid = owner.uid;
+    usageState = loaded.state;
+    usagePendingActiveSeconds = 0;
+    usagePendingPostIds = new Set();
+    usageLastHeartbeatMonotonic = usageMonotonicNow();
+    usageLastActivityMonotonic = Number.NEGATIVE_INFINITY;
+    if (usageSessionOwnerUid !== owner.uid) {
+      usageSessionOwnerUid = owner.uid;
+      usageSessionActiveSeconds = 0;
+      usageSessionPostIds = new Set();
+    }
+    installUsageActivityListeners();
+    installUsageFeedTrackingForRoute();
+    scheduleUsageHeartbeat();
+    scheduleUsageFlush();
+    if (fromUserAction) noteUsageActivity();
+    syncUsageCorner();
+    return { ok: true };
+  }
+
+  function stopUsageTracking(flushPending = true) {
+    if (usageHeartbeatTimer !== null) clearTimeout(usageHeartbeatTimer);
+    if (usageFlushTimer !== null) clearTimeout(usageFlushTimer);
+    usageHeartbeatTimer = null;
+    usageFlushTimer = null;
+    removeUsageActivityListeners();
+    teardownUsageFeedTracking();
+    removeUsageCorner();
+    usageLastHeartbeatMonotonic = null;
+    usageLastActivityMonotonic = Number.NEGATIVE_INFINITY;
+    if (flushPending) void flushUsageState();
+  }
+
+  function handleUsageRouteChange() {
+    if (!usageEnabledPreference || usageRuntimeOwnerUid === null) return;
+    void flushUsageState();
+    installUsageFeedTrackingForRoute();
+  }
+
+  function latestFeedWasNormalizedInThisTab() {
+    try {
+      return (
+        typeof sessionStorage !== "undefined" &&
+        sessionStorage.getItem(LATEST_FEED_SESSION_MARKER) === "1"
+      );
+    } catch (_) {
+      // An unavailable session boundary must disable automatic navigation.
+      return true;
+    }
+  }
+
+  function markLatestFeedNormalizedInThisTab() {
+    try {
+      if (typeof sessionStorage === "undefined") return false;
+      sessionStorage.setItem(LATEST_FEED_SESSION_MARKER, "1");
+      return sessionStorage.getItem(LATEST_FEED_SESSION_MARKER) === "1";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function maybeNormalizeHomeToLatest() {
+    if (!isCanonicalWeiboHome()) {
+      latestFeedNavigationPending = false;
+      return false;
+    }
+    if (
+      !preferLatestFeed ||
+      latestFeedNavigationPending ||
+      latestFeedWasNormalizedInThisTab()
+    ) {
+      return false;
+    }
+    const target = resolveLatestFeedUrl();
+    if (target === null || typeof location.assign !== "function") return false;
+    const current =
+      typeof location.href === "string"
+        ? location.href
+        : location.origin + location.pathname;
+    if (current === target) return false;
+    if (!markLatestFeedNormalizedInThisTab()) return false;
+    latestFeedNavigationPending = true;
+    try {
+      location.assign(target);
+      return true;
+    } catch (_) {
+      latestFeedNavigationPending = false;
+      return false;
+    }
+  }
+
+  function syncPageRouteFeatures() {
+    maybeNormalizeHomeToLatest();
+    installLatestFeedRecommendationFilter();
+    ensureProfileExtras();
+    ensureProfileFriendNotes();
+    handleUsageRouteChange();
+  }
+
+  function schedulePageRouteSync() {
+    if (pageRouteSyncScheduled) return;
+    pageRouteSyncScheduled = true;
+    setTimeout(() => {
+      pageRouteSyncScheduled = false;
+      syncPageRouteFeatures();
+    }, 0);
+  }
+
+  function installPageRouteHook() {
+    if (
+      pageRouteHookInstalled ||
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN
+    ) {
+      return;
+    }
+    let routeWindow;
+    try {
+      routeWindow =
+        typeof unsafeWindow !== "undefined" && unsafeWindow
+          ? unsafeWindow
+          : window;
+    } catch (_) {
+      return;
+    }
+    const routeHistory = routeWindow && routeWindow.history;
+    if (!routeHistory) return;
+    pageRouteHookInstalled = true;
+    for (const method of ["pushState", "replaceState"]) {
+      const original = routeHistory[method];
+      if (typeof original !== "function") continue;
+      routeHistory[method] = function (...args) {
+        const result = original.apply(this, args);
+        schedulePageRouteSync();
+        return result;
+      };
+    }
+    if (typeof routeWindow.addEventListener === "function") {
+      routeWindow.addEventListener("popstate", schedulePageRouteSync);
+    }
+  }
+
+  // Each Toolkit root (the launcher and the open overlay) carries the theme marker
+  // itself, so no Weibo-owned node is ever touched.
+  function applyThemeToRoot(node) {
+    if (!node) return;
+    const classNames = String(node.className)
+      .split(/\s+/)
+      .filter((name) => name.length > 0 && !name.startsWith("wfr-theme-"));
+    classNames.push(`wfr-theme-${currentTheme}`);
+    node.className = classNames.join(" ");
+  }
+
+  function applyTheme() {
+    applyThemeToRoot(launcherButton);
+    applyThemeToRoot(usageCornerButton);
+    applyThemeToRoot(panelRoot);
+    applyThemeToRoot(
+      profileFriendNotesContext === null ? null : profileFriendNotesContext.root
+    );
+    applyFeedFriendNotesTheme();
+  }
+
+  function closePanel() {
+    const dismissHandler = panelDismissHandler;
+    panelDismissHandler = null;
+    if (panelRoot && panelRoot.parentNode) panelRoot.parentNode.removeChild(panelRoot);
+    panelRoot = null;
+    // Scans, restores and event clearing all run from the panel, so the local
+    // facts cached for the feed entries are re-read once it is really closed.
+    markFeedFriendNotesStale();
+    if (typeof dismissHandler === "function") dismissHandler();
+  }
+
+  function showPanel(title, withBack = false) {
+    closePanel();
+    const root = createElement("div", null, "wfr-overlay wfr-root");
+    applyThemeToRoot(root);
+    const panel = createElement("section", null, "wfr-panel");
+    const header = createElement("header", null, "wfr-header");
+    const heading = createElement("h2", title);
+    const closeButton = createElement("button", "关闭", "wfr-button");
+    closeButton.type = "button";
+    closeButton.addEventListener("click", closePanel);
+    const body = createElement("div", null, "wfr-body");
+    if (withBack) {
+      const backButton = createElement("button", "← 返回", "wfr-button");
+      backButton.type = "button";
+      backButton.addEventListener(
+        "click",
+        typeof withBack === "function" ? withBack : showToolkitHome
+      );
+      header.append(backButton, heading, closeButton);
+    } else {
+      header.append(heading, closeButton);
+    }
+    panel.append(header, body);
+    root.append(panel);
+    document.body.append(root);
+    panelRoot = root;
+    return body;
+  }
+
+  function addLine(body, label, value) {
+    const row = createElement("p", null, "wfr-row");
+    const strong = createElement("strong", `${label}: `);
+    const span = createElement("span", String(value));
+    row.append(strong, span);
+    body.append(row);
+  }
+
+  function formatUsageMinutes(seconds) {
+    return Math.max(0, Math.round(seconds / 60));
+  }
+
+  function usageCornerText(state) {
+    return `今日 ${formatUsageMinutes(
+      state.currentDay.activeSeconds
+    )} 分钟 · ${state.currentDay.uniquePostIds.length} 条`;
+  }
+
+  function removeUsageCorner() {
+    if (usageCornerButton && usageCornerButton.parentNode) {
+      usageCornerButton.parentNode.removeChild(usageCornerButton);
+    }
+    usageCornerButton = null;
+  }
+
+  function syncUsageCorner() {
+    if (
+      !usageEnabledPreference ||
+      !usageCornerPreference ||
+      usageRuntimeOwnerUid === null ||
+      usageState === null ||
+      !document.body
+    ) {
+      removeUsageCorner();
+      return;
+    }
+    if (!usageCornerButton) {
+      usageCornerButton = createElement(
+        "button",
+        null,
+        "wfr-usage-corner wfr-root"
+      );
+      usageCornerButton.id = USAGE_CORNER_ID;
+      usageCornerButton.type = "button";
+      usageCornerButton.setAttribute("aria-label", "打开微博计步器");
+      usageCornerButton.addEventListener("click", showUsageStatistics);
+      applyThemeToRoot(usageCornerButton);
+      document.body.append(usageCornerButton);
+    }
+    usageCornerButton.textContent = usageCornerText(usageState);
+  }
+
+  function usageStateForDisplay(ownerUid) {
+    if (usageRuntimeOwnerUid === ownerUid && usageState !== null) {
+      return { ok: true, state: usageState };
+    }
+    return loadUsageState(ownerUid);
+  }
+
+  async function clearUsageStatisticsForOwner(ownerUid) {
+    const result = await withUsageStateLock(ownerUid, async () => {
+      try {
+        GM_deleteValue(usageStorageKey(ownerUid));
+        return GM_getValue(usageStorageKey(ownerUid), null) === null
+          ? { ok: true }
+          : { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      } catch (error) {
+        return {
+          ok: false,
+          failureKind: "PERSISTENCE_ERROR",
+          errorName: error && error.name ? String(error.name) : "Error",
+        };
+      }
+    });
+    if (!result.ok) return result;
+    if (usageRuntimeOwnerUid === ownerUid) {
+      usageState = emptyUsageState(usageLocalDateKey());
+      usagePendingActiveSeconds = 0;
+      usagePendingPostIds = new Set();
+    }
+    if (usageSessionOwnerUid === ownerUid) {
+      usageSessionActiveSeconds = 0;
+      usageSessionPostIds = new Set();
+    }
+    syncUsageCorner();
+    return { ok: true };
+  }
+
+  function appendUsageClearAction(body, ownerUid) {
+    const actions = createElement("div", null, "wfr-actions");
+    const clearButton = createElement(
+      "button",
+      "清空使用统计",
+      "wfr-button wfr-danger"
+    );
+    clearButton.type = "button";
+    clearButton.addEventListener("click", async () => {
+      const confirmed = confirm(
+        "清空当前账号在本浏览器中的使用统计？\n此操作不会影响微博数据。"
+      );
+      if (!confirmed) return;
+      const currentOwner = determineCurrentUid();
+      if (!currentOwner.ok || currentOwner.uid !== ownerUid) {
+        showFailure("微博计步器", {
+          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+        });
+        return;
+      }
+      const cleared = await clearUsageStatisticsForOwner(ownerUid);
+      if (!cleared.ok) {
+        showFailure("微博计步器", cleared);
+        return;
+      }
+      showUsageStatistics("使用统计已清空。追踪偏好保持不变。");
+    });
+    actions.append(clearButton);
+    body.append(actions);
+  }
+
+  function showUsageStatistics(statusText = null) {
+    const owner = determineCurrentUid();
+    if (!owner.ok) {
+      showFailure("微博计步器", owner);
+      return;
+    }
+    const loaded = usageStateForDisplay(owner.uid);
+    if (!loaded.ok) {
+      const body = showPanel("微博计步器", true);
+      body.append(
+        createElement(
+          "p",
+          "本地使用统计无法读取。请先检查或清空该账号的使用统计。",
+          "wfr-error"
+        )
+      );
+      appendUsageClearAction(body, owner.uid);
+      return;
+    }
+    const body = showPanel("微博计步器", true);
+    if (statusText) body.append(createElement("p", statusText, "wfr-success"));
+    body.append(createElement("h3", "今日"));
+    addLine(
+      body,
+      "活跃时间",
+      `约 ${formatUsageMinutes(loaded.state.currentDay.activeSeconds)} 分钟`
+    );
+    addLine(
+      body,
+      "浏览微博",
+      `${loaded.state.currentDay.uniquePostIds.length} 条不同微博`
+    );
+    body.append(createElement("h3", "本标签页"));
+    addLine(
+      body,
+      "活跃时间",
+      `约 ${formatUsageMinutes(
+        usageSessionOwnerUid === owner.uid ? usageSessionActiveSeconds : 0
+      )} 分钟`
+    );
+    addLine(
+      body,
+      "浏览微博",
+      `${
+        usageSessionOwnerUid === owner.uid ? usageSessionPostIds.size : 0
+      } 条不同微博`
+    );
+    body.append(
+      createElement(
+        "p",
+        "仅保存在当前浏览器，不记录微博正文或具体浏览历史。",
+        "wfr-muted"
+      )
+    );
+    appendUsageClearAction(body, owner.uid);
+  }
+
+  // A restore can fail after one or both durable writes were already attempted,
+  // so it must never reuse the generic "failed before saving" note. Every reason
+  // below states what is actually known about local state, and nothing is
+  // appended that would contradict the reason line above it.
+  const RESTORE_PRE_WRITE_REASONS = Object.freeze([
+    "MALFORMED_JSON",
+    "INVALID_TOP_LEVEL",
+    "WRONG_BACKUP_FORMAT",
+    "MISSING_FOLLOWER_STATE",
+    "INVALID_FOLLOWER_STATE",
+    "MISSING_FRIEND_NOTES",
+    "INVALID_FRIEND_NOTES",
+    "FRIEND_NOTES_CHANGED_SINCE_PREVIEW",
+    "UNSUPPORTED_BACKUP_VERSION",
+    "INVALID_OWNER_UID",
+    "OWNER_UID_MISMATCH",
+    "INVALID_EXPORTED_AT",
+    "INVALID_STATE",
+    "FILE_READ_ERROR",
+  ]);
+
+  const RESTORE_STATE_MESSAGES = Object.freeze({
+    FOLLOWER_RESTORE_FAILED_ROLLED_BACK:
+      "粉丝快照确认未被修改，关系雷达数据已还原为恢复前的内容。",
+    RESTORE_CONCURRENT_STATE_CHANGED:
+      "其他标签页写入的较新数据已被保留，未被本次恢复覆盖。",
+    RESTORE_STATE_UNCERTAIN:
+      "本地数据可能已被部分修改，且最终状态无法确认。请先导出当前数据并检查，再决定是否重试。",
+    FRIEND_NOTES_RESTORE_FAILED_ROLLED_BACK:
+      "友人档案确认未被修改，关系雷达数据、粉丝快照和粉丝变化记录已还原为恢复前的内容。",
+    FRIEND_NOTES_RESTORE_FAILED_PARTIAL:
+      "友人档案确认未被修改。其他标签页在恢复过程中写入的较新数据已被保留，因此已恢复的部分没有全部回退：当前本地数据处于部分恢复状态。请先导出并检查当前数据，再决定是否重试。",
+  });
+
+  const RESTORE_UNSETTLED_REASONS = Object.freeze([
+    "RESTORE_STATE_UNCERTAIN",
+    "FRIEND_NOTES_RESTORE_FAILED_PARTIAL",
+  ]);
+
+  function restoreStateMessage(reason) {
+    if (RESTORE_PRE_WRITE_REASONS.includes(reason)) {
+      return {
+        text: "本次失败发生在写入之前，关系雷达数据、粉丝快照、粉丝变化记录和友人档案均未被更改。",
+        className: "wfr-muted",
+      };
+    }
+    const known = RESTORE_STATE_MESSAGES[reason];
+    if (known) {
+      return {
+        text: known,
+        className: RESTORE_UNSETTLED_REASONS.includes(reason)
+          ? "wfr-error"
+          : "wfr-muted",
+      };
+    }
+    return {
+      text: RESTORE_STATE_MESSAGES.RESTORE_STATE_UNCERTAIN,
+      className: "wfr-error",
+    };
+  }
+
+  function failureText(result) {
+    if (result.failureKind === "BACKUP_RESTORE_ERROR") {
+      const restoreMessages = {
+        MALFORMED_JSON: "备份文件不是有效的 JSON。",
+        INVALID_TOP_LEVEL: "备份文件结构无效。",
+        WRONG_BACKUP_FORMAT: "备份格式不匹配。",
+        MISSING_FOLLOWER_STATE: "备份缺少粉丝快照部分，未恢复。",
+        INVALID_FOLLOWER_STATE: "备份中的粉丝快照或粉丝变化记录无效，未恢复。",
+        MISSING_FRIEND_NOTES: "备份缺少友人档案部分，未恢复。",
+        INVALID_FRIEND_NOTES: "备份中的友人档案无效，未恢复。",
+        FRIEND_NOTES_CHANGED_SINCE_PREVIEW:
+          "友人档案在预览之后已被修改，本次恢复没有写入任何数据。请重新选择备份文件并核对预览。",
+        FRIEND_NOTES_RESTORE_FAILED_ROLLED_BACK:
+          "友人档案未能恢复，本次恢复已取消，关系雷达与粉丝数据已回退到恢复前的状态。",
+        FRIEND_NOTES_RESTORE_FAILED_PARTIAL:
+          "恢复未能完整完成：友人档案未恢复，其他数据也未能全部回退。",
+        FOLLOWER_RESTORE_FAILED_ROLLED_BACK:
+          "粉丝快照未能恢复，本次恢复已取消，关系雷达数据已回退到恢复前的状态。",
+        // Reached both when a rollback could not be confirmed and when a
+        // follower mutation may already have landed, so the wording must not
+        // assume a rollback was attempted.
+        RESTORE_STATE_UNCERTAIN:
+          "恢复未能完成，且最终状态无法确认。",
+        RESTORE_CONCURRENT_STATE_CHANGED:
+          "恢复未能完整完成；关系雷达数据在恢复过程中已被其他操作更新，因此没有回退这些较新的数据。请先导出并检查当前数据后再重试。",
+        UNSUPPORTED_BACKUP_VERSION: "此备份版本不受支持。",
+        INVALID_OWNER_UID: "备份账号 UID 无效。",
+        OWNER_UID_MISMATCH: "备份不属于当前登录账号，未恢复。",
+        INVALID_EXPORTED_AT: "备份导出时间无效。",
+        INVALID_STATE: "备份中的关系雷达数据无效或不完整。",
+        FILE_READ_ERROR: "无法读取所选备份文件。",
+      };
+      return restoreMessages[result.reason] || FAILURE_LABELS.BACKUP_RESTORE_ERROR;
+    }
+    if (
+      result.failureKind === "PAGINATION_FAILURE" &&
+      result.reason === "HARD_REQUEST_CEILING_REACHED"
+    ) {
+      return "本次扫描达到本工具设定的单次请求上限，未保存扫描结果。";
+    }
+    const label = FAILURE_LABELS[result.failureKind] || FAILURE_LABELS.UNKNOWN_FAILURE;
+    return result.reason ? `${label} (${result.reason})` : label;
+  }
+
+  function showFailure(title, result, withBack = true) {
+    const body = showPanel(title, withBack);
+    body.append(createElement("p", failureText(result), "wfr-error"));
+    if (result.failureKind === "BACKUP_EXPORT_ERROR") {
+      body.append(
+        createElement(
+          "p",
+          "备份未能完成。关系雷达本地数据未被修改。",
+          "wfr-muted"
+        )
+      );
+      addLine(body, "失败阶段", result.backupStage);
+      addLine(body, "错误类型", result.errorName);
+      if (["CREATE_WRITABLE", "WRITE_FILE", "CLOSE_FILE"].includes(result.backupStage)) {
+        body.append(
+          createElement(
+            "p",
+            "目标位置可能存在未完成的备份文件。",
+            "wfr-muted"
+          )
+        );
+      }
+      return;
+    }
+    if (result.failureKind === "EVENT_EXPORT_ERROR") {
+      body.append(
+        createElement(
+          "p",
+          "导出未能完成。关系雷达本地数据未被修改。",
+          "wfr-muted"
+        )
+      );
+      addLine(body, "失败阶段", result.exportStage);
+      addLine(body, "错误类型", result.errorName);
+      return;
+    }
+    if (result.failureKind === "BACKUP_RESTORE_ERROR") {
+      const restoreState = restoreStateMessage(result.reason);
+      body.append(
+        createElement("p", restoreState.text, restoreState.className)
+      );
+      return;
+    }
+    if (result.failureKind === "CONCURRENT_MODIFICATION") return;
+    if (
+      result.failureKind === "PAGINATION_FAILURE" &&
+      result.reason === "HARD_REQUEST_CEILING_REACHED"
+    ) {
+      addLine(body, "已请求", result.requestsMade);
+      addLine(body, "已读取", result.visibleRecordsCollected);
+      if (typeof result.reportedTotal === "number") {
+        addLine(body, "接口报告总数", result.reportedTotal);
+      }
+    }
+    if (typeof result.failedPage === "number") {
+      addLine(body, "停止页", result.failedPage);
+    }
+    if (
+      typeof result.requestsMade === "number" &&
+      !(
+        result.failureKind === "PAGINATION_FAILURE" &&
+        result.reason === "HARD_REQUEST_CEILING_REACHED"
+      )
+    ) {
+      addLine(body, "已发请求", result.requestsMade);
+    }
+    let stateMessage;
+    let stateMessageClass = "wfr-muted";
+    if (result.failureKind === "UNKNOWN_FAILURE") {
+      stateMessage =
+        "更新结果无法完全确认。重试前请先查看“关系雷达状态”。";
+      stateMessageClass = "wfr-error";
+    } else if (result.failureKind === "PERSISTENCE_ERROR") {
+      if (result.rollbackSucceeded === true) {
+        stateMessage =
+          "保存失败，但上一次本地状态已恢复。";
+      } else {
+        stateMessage =
+          "保存和恢复均未能确认成功。本地状态可能不确定或损坏，在检查或重新保存首次快照前请勿信任。";
+        stateMessageClass = "wfr-error";
+      }
+    } else {
+      stateMessage =
+        "本次失败发生在保存之前，本地快照和事件记录未被更改。";
+    }
+    body.append(
+      createElement(
+        "p",
+        stateMessage,
+        stateMessageClass
+      )
+    );
+  }
+
+  function countEventTypes(events) {
+    const counts = {};
+    for (const event of events) counts[event.type] = (counts[event.type] || 0) + 1;
+    return counts;
+  }
+
+  function showUpdateSuccess(result) {
+    const body = showPanel("关系雷达更新", true);
+    const message = result.baselineCreated
+      ? "首次关注快照已保存，从下次更新开始记录变化。"
+      : `更新完成，发现 ${result.newEvents.length} 个新事件。`;
+    body.append(createElement("p", message, "wfr-success"));
+    addLine(body, "API可见关注", result.snapshot.visibleCount);
+    addLine(body, "接口总数", result.snapshot.reportedTotal);
+    addLine(
+      body,
+      "未解析关系差值",
+      result.snapshot.unresolvedRelationCount
+    );
+    addLine(body, "请求数", result.requestsMade);
+    addLine(body, "新事件", result.newEvents.length);
+
+    const counts = countEventTypes(result.newEvents);
+    for (const type of Object.values(EVENT)) {
+      addLine(body, EVENT_LABELS[type], counts[type] || 0);
+    }
+  }
+
+  const PROGRESS_FIELDS = Object.freeze([
+    ["page", "当前页"],
+    ["requestsMade", "已请求"],
+    ["visibleRecordsCollected", "已读取"],
+    ["reportedTotal", "接口报告总数"],
+  ]);
+
+  function showScanProgress() {
+    const body = showPanel("关系雷达更新");
+    body.append(
+      createElement("p", "正在读取可见关注，请保持页面打开。")
+    );
+    const values = new Map();
+    for (const [key, label] of PROGRESS_FIELDS) {
+      const row = createElement("p", null, "wfr-row");
+      const value = createElement("span", "—");
+      row.append(createElement("strong", `${label}：`), value);
+      values.set(key, value);
+      body.append(row);
+    }
+    return function reportProgress(progress) {
+      for (const [key] of PROGRESS_FIELDS) {
+        const value = values.get(key);
+        const reported = progress[key];
+        value.textContent =
+          typeof reported === "number" ? String(reported) : "—";
+      }
+    };
+  }
+
+  async function updateNow() {
+    if (updateRunning || followerUpdateRunning || followerRemovalInFlight) {
+      showFailure("关系雷达更新", {
+        failureKind: "UPDATE_ALREADY_RUNNING",
+      });
+      return;
+    }
+    const reportProgress = showScanProgress();
+    updateRunning = true;
+    let result;
+    try {
+      result = await performUpdate(reportProgress);
+    } catch (error) {
+      result = {
+        ok: false,
+        failureKind: "UNKNOWN_FAILURE",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    } finally {
+      updateRunning = false;
+    }
+    refreshUnreadBadge();
+    if (result.ok) showUpdateSuccess(result);
+    else showFailure("关系雷达更新失败", result);
+  }
+
+  function followerFailureText(result) {
+    if (result.failureKind === "FOLLOWER_SCAN_CANCELLED") {
+      return "读取已取消。";
+    }
+    if (
+      result.failureKind === "PAGINATION_FAILURE" &&
+      result.reason === "FOLLOWER_SAFETY_CEILING_REACHED"
+    ) {
+      return "达到本次安全上限，未更新粉丝快照。";
+    }
+    const labels = {
+      UID_UNAVAILABLE: "无法可靠识别当前登录账号。",
+      ACCOUNT_CHANGED_DURING_SCAN: "扫描期间登录账号发生变化。",
+      LOGIN_REQUIRED: "登录已失效，请重新登录。",
+      HTTP_ERROR: "接口返回 HTTP 错误。",
+      CHALLENGE_OR_UNEXPECTED_RESPONSE: "收到验证页面或意外 HTML。",
+      NON_JSON_RESPONSE: "接口未返回有效 JSON。",
+      UNEXPECTED_CONTENT_TYPE: "接口响应类型异常。",
+      UNEXPECTED_SCHEMA: "粉丝接口数据结构异常。",
+      PAGINATION_FAILURE: "粉丝分页结果不可信。",
+      NETWORK_ERROR: "网络请求失败。",
+      STORAGE_ERROR: "粉丝快照本地状态无法读取。",
+      PERSISTENCE_ERROR: "粉丝快照保存失败。",
+      CONCURRENT_MODIFICATION: "检测到另一个标签页修改了粉丝快照状态。",
+      STALE_SCAN: "扫描结果早于当前已保存粉丝快照。",
+      UPDATE_ALREADY_RUNNING: "另一个关系扫描正在进行。",
+      STATE_LOCK_UNAVAILABLE:
+        "暂时无法安全地保存粉丝快照，本次结果未保存，已保留上一次成功的快照。",
+      UNKNOWN_FAILURE: "更新结果无法完全确认。",
+    };
+    const label = labels[result.failureKind] || labels.UNKNOWN_FAILURE;
+    return result.reason ? label + " (" + result.reason + ")" : label;
+  }
+
+  function showFollowerFailure(result) {
+    const cancelled = result.failureKind === "FOLLOWER_SCAN_CANCELLED";
+    const body = showPanel(
+      cancelled ? "粉丝快照已取消" : "粉丝快照更新失败",
+      true
+    );
+    body.append(
+      createElement(
+        "p",
+        followerFailureText(result),
+        cancelled ? "wfr-muted" : "wfr-error"
+      )
+    );
+    if (typeof result.failedPage === "number") {
+      addLine(body, "停止页", result.failedPage);
+    }
+    if (typeof result.requestsMade === "number") {
+      addLine(body, "已发请求", result.requestsMade);
+    }
+    if (
+      !cancelled &&
+      !["PERSISTENCE_ERROR", "CONCURRENT_MODIFICATION", "UNKNOWN_FAILURE"].includes(
+        result.failureKind
+      )
+    ) {
+      body.append(
+        createElement(
+          "p",
+          "读取未完成，已保留上一次成功快照，未生成粉丝变化事件。",
+          "wfr-muted"
+        )
+      );
+    }
+    if (result.failureKind === "CONCURRENT_MODIFICATION") {
+      body.append(
+        createElement(
+          "p",
+          "未覆盖另一个标签页保存的粉丝快照状态。",
+          "wfr-muted"
+        )
+      );
+    }
+    if (result.failureKind === "UNKNOWN_FAILURE") {
+      body.append(
+        createElement(
+          "p",
+          "更新结果无法完全确认，重试前请先查看粉丝变化状态。",
+          "wfr-error"
+        )
+      );
+    }
+    if (
+      result.failureKind === "PERSISTENCE_ERROR" &&
+      result.rollbackSucceeded !== true
+    ) {
+      body.append(
+        createElement(
+          "p",
+          "本地保存结果无法确认，请在重试前查看粉丝变化状态。",
+          "wfr-error"
+        )
+      );
+    }
+  }
+
+  function appendFollowerVisibilityNote(body, snapshot) {
+    if (!snapshot || !snapshot.filteredVisibilityObserved) return;
+    body.append(
+      createElement(
+        "p",
+        "微博接口可能过滤部分粉丝；此处仅显示当前API可见结果。",
+        "wfr-muted"
+      )
+    );
+  }
+
+  function showFollowerUpdateSuccess(result) {
+    const body = showPanel("粉丝快照更新", true);
+    if (result.baselineCreated) {
+      body.append(
+        createElement(
+          "p",
+          "首次粉丝快照已保存，从下次更新开始记录变化。",
+          "wfr-success"
+        )
+      );
+    } else if (result.eventsSuppressed) {
+      body.append(
+        createElement(
+          "p",
+          "粉丝快照已更新；因接口过滤状态变化或未知，本次未生成变化事件。",
+          "wfr-muted"
+        )
+      );
+    } else {
+      const counts = countEventTypes(result.newEvents);
+      body.append(createElement("p", "粉丝快照更新完成。", "wfr-success"));
+      addLine(
+        body,
+        "新增可见粉丝",
+        counts[FOLLOWER_EVENT.VISIBLE_FOLLOWER_ADDED] || 0
+      );
+      addLine(
+        body,
+        "从可见粉丝中消失",
+        counts[FOLLOWER_EVENT.VISIBLE_FOLLOWER_DISAPPEARED] || 0
+      );
+    }
+    addLine(body, "API可见粉丝", result.snapshot.uniqueRecordCount);
+    addLine(body, "读取记录", result.snapshot.rawRecordCount);
+    addLine(body, "跨页重复", result.snapshot.crossPageDuplicateCount);
+    addLine(body, "请求数", result.requestsMade);
+    appendFollowerVisibilityNote(body, result.snapshot);
+  }
+
+  const FOLLOWER_PROGRESS_FIELDS = Object.freeze([
+    ["page", "当前页"],
+    ["requestsMade", "已请求"],
+    ["rawRecordCount", "已读取"],
+    ["uniqueRecordCount", "去重后"],
+    ["crossPageDuplicateCount", "跨页重复"],
+  ]);
+
+  function showFollowerScanProgress() {
+    const body = showPanel("粉丝快照更新");
+    body.append(
+      createElement("p", "正在读取API可见粉丝，请保持页面打开。")
+    );
+    const values = new Map();
+    for (const [key, label] of FOLLOWER_PROGRESS_FIELDS) {
+      const row = createElement("p", null, "wfr-row");
+      const value = createElement("span", "—");
+      row.append(createElement("strong", label + "："), value);
+      values.set(key, value);
+      body.append(row);
+    }
+    const cancelButton = createElement("button", "取消", "wfr-button");
+    cancelButton.type = "button";
+    cancelButton.addEventListener("click", () => {
+      followerCancelRequested = true;
+      cancelButton.disabled = true;
+      cancelButton.textContent = "正在取消…";
+    });
+    body.append(cancelButton);
+    return function reportProgress(progress) {
+      for (const [key] of FOLLOWER_PROGRESS_FIELDS) {
+        const reported = progress[key];
+        values.get(key).textContent =
+          typeof reported === "number" ? String(reported) : "—";
+      }
+    };
+  }
+
+  async function updateFollowersNow() {
+    if (followerUpdateRunning || updateRunning || followerRemovalInFlight) {
+      showFollowerFailure({ failureKind: "UPDATE_ALREADY_RUNNING" });
+      return;
+    }
+    followerCancelRequested = false;
+    const reportProgress = showFollowerScanProgress();
+    followerUpdateRunning = true;
+    let result;
+    try {
+      result = await performFollowerUpdate(
+        reportProgress,
+        () => followerCancelRequested
+      );
+    } catch (error) {
+      result = {
+        ok: false,
+        failureKind: "UNKNOWN_FAILURE",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    } finally {
+      followerUpdateRunning = false;
+      followerCancelRequested = false;
+    }
+    if (result.ok) showFollowerUpdateSuccess(result);
+    else showFollowerFailure(result);
+  }
+
+  // Local notification housekeeping only, run inside the follower state lock. The
+  // state is read fresh here, so a Snapshot or new events written by another tab
+  // are preserved: latestSnapshot and every other baseline field are carried over
+  // and only the requested events are dropped.
+  async function writeFollowerEventsOnly(ownerUid, nextEvents) {
+    return await withFollowerStateLock(ownerUid, async () => {
+      const fresh = loadFollowerState(ownerUid);
+      if (!fresh.ok) return fresh;
+      const next = {
+        schemaVersion: fresh.state.schemaVersion,
+        ownerUid: fresh.state.ownerUid,
+        latestSnapshot: fresh.state.latestSnapshot,
+        events: nextEvents(fresh.state.events),
+      };
+      const persisted = persistFollowerState(ownerUid, next, fresh.raw);
+      if (!persisted.ok) return persisted;
+      return { ok: true, state: next };
+    });
+  }
+
+  async function clearFollowerEvent(ownerUid, eventId) {
+    return await writeFollowerEventsOnly(ownerUid, (events) =>
+      events.filter((event) => event.id !== eventId)
+    );
+  }
+
+  // Clears exactly the events the user confirmed, identified by the stored event
+  // id. Anything that appeared after the confirmation was rendered — including
+  // events another tab produced meanwhile — is kept, because the user never saw
+  // it and never agreed to discard it.
+  async function clearFollowerEvents(ownerUid, eventIds) {
+    const targeted = new Set(eventIds);
+    return await writeFollowerEventsOnly(ownerUid, (events) =>
+      events.filter((event) => !targeted.has(event.id))
+    );
+  }
+
+  function sortFollowerEventsNewestFirst(events) {
+    return [...events].sort(
+      (left, right) =>
+        right.observedAt.localeCompare(left.observedAt) ||
+        right.id.localeCompare(left.id)
+    );
+  }
+
+  function renderFollowerEvents(ownerUid, state) {
+    const body = showPanel("粉丝变化", true);
+    const snapshot = state.latestSnapshot;
+    addLine(body, "已有快照", snapshot ? "是" : "否");
+    if (snapshot) {
+      addLine(body, "上次成功更新", formatTime(snapshot.capturedAt));
+      addLine(body, "API可见粉丝", snapshot.uniqueRecordCount);
+      appendFollowerVisibilityNote(body, snapshot);
+    }
+    const countRow = createElement("p", null, "wfr-row");
+    const countValue = createElement("span", String(state.events.length));
+    countRow.append(createElement("strong", "变化事件: "), countValue);
+    body.append(countRow);
+
+    let events = state.events;
+    const clearAllActions = createElement("div", null, "wfr-actions");
+    const clearAllButton = createElement(
+      "button",
+      "清空变化事件",
+      "wfr-button"
+    );
+    clearAllButton.type = "button";
+    clearAllActions.append(clearAllButton);
+    const clearAllPanel = createElement("div", null, "wfr-batch-panel");
+    const status = createElement("p", "", "wfr-muted");
+    const emptyNote = createElement("p", "暂无粉丝变化事件。", "wfr-muted");
+    const list = createElement("div", null, "wfr-event-list");
+    body.append(clearAllActions, clearAllPanel, status, emptyNote, list);
+
+    function clearNode(node) {
+      while (node.childNodes.length > 0) node.removeChild(node.childNodes[0]);
+    }
+
+    const renderedCards = new Map();
+
+    // Reconciles the rendered cards with the freshly persisted event list. Cards
+    // that survived keep their nodes; events another tab added since this view
+    // opened appear instead of being silently dropped from the count.
+    function syncList() {
+      const desired = sortFollowerEventsNewestFirst(events);
+      const desiredIds = new Set(desired.map((event) => event.id));
+      for (const [id, node] of [...renderedCards]) {
+        if (desiredIds.has(id)) continue;
+        if (node.parentNode) node.parentNode.removeChild(node);
+        renderedCards.delete(id);
+      }
+      for (const event of desired) {
+        if (renderedCards.has(event.id)) continue;
+        const card = buildEventCard(event);
+        renderedCards.set(event.id, card);
+        list.append(card);
+      }
+      renderCounts();
+    }
+
+    function renderCounts() {
+      countValue.textContent = String(events.length);
+      const empty = events.length === 0;
+      emptyNote.hidden = !empty;
+      list.hidden = empty;
+      clearAllActions.hidden = empty;
+      if (empty) clearNode(clearAllPanel);
+    }
+
+    // Local records only: clearing a notification never touches the Weibo
+    // relationship, the stored Snapshot, or reconciliation state.
+    function applyLocalWrite(result, failureText) {
+      if (!result.ok) {
+        status.textContent =
+          result.failureKind === "STATE_LOCK_UNAVAILABLE"
+            ? "变化事件暂时无法安全保存，请稍后重试。"
+            : failureText;
+        return false;
+      }
+      events = result.state.events;
+      status.textContent = "";
+      return true;
+    }
+
+    function buildEventCard(event) {
+      const item = createElement("article", null, "wfr-event");
+      item.append(
+        createElement(
+          "h3",
+          FOLLOWER_EVENT_LABELS[event.type] || event.type
+        )
+      );
+      addLine(item, "时间", formatTime(event.observedAt));
+      addLine(item, "账号", event.displayName || event.uid);
+      addLine(item, "UID", event.uid);
+      if (event.type === FOLLOWER_EVENT.VISIBLE_FOLLOWER_DISAPPEARED) {
+        item.append(
+          createElement(
+            "p",
+            "仅表示该账号从API可见粉丝结果中消失，无法判断原因。",
+            "wfr-muted"
+          )
+        );
+      }
+      const actions = createElement("div", null, "wfr-actions");
+      const clearButton = createElement("button", "清除这条", "wfr-button");
+      clearButton.type = "button";
+      clearButton.addEventListener("click", async () => {
+        clearButton.disabled = true;
+        const result = await clearFollowerEvent(ownerUid, event.id);
+        clearButton.disabled = false;
+        if (!applyLocalWrite(result, "未能清除这条记录，本地数据未改变。")) {
+          return;
+        }
+        // Targeted reconciliation: surviving cards keep their nodes and the
+        // reading position stays where it is.
+        syncList();
+      });
+      actions.append(clearButton);
+      item.append(actions);
+      return item;
+    }
+
+    clearAllButton.addEventListener("click", () => {
+      clearNode(clearAllPanel);
+      const confirmation = createElement("div", null, "wfr-removal-confirm");
+      confirmation.append(
+        createElement(
+          "h3",
+          "清空全部 " + String(events.length) + " 条粉丝变化事件？"
+        ),
+        createElement(
+          "p",
+          "这只会清除 Weibo Toolkit 保存在本地的变化记录，不会修改微博关系或粉丝快照。",
+          "wfr-muted"
+        )
+      );
+      const confirmActions = createElement("div", null, "wfr-actions");
+      const cancel = createElement("button", "取消", "wfr-button");
+      const confirm = createElement("button", "确认清空", "wfr-button");
+      cancel.type = "button";
+      confirm.type = "button";
+      cancel.addEventListener("click", () => clearNode(clearAllPanel));
+      // The identities the user is actually confirming, captured while the
+      // confirmation is shown. Only these are cleared.
+      const confirmedIds = events.map((event) => event.id);
+      confirm.addEventListener("click", async () => {
+        cancel.disabled = true;
+        confirm.disabled = true;
+        const result = await clearFollowerEvents(ownerUid, confirmedIds);
+        clearNode(clearAllPanel);
+        if (!applyLocalWrite(result, "未能清空变化记录，本地数据未改变。")) {
+          return;
+        }
+        syncList();
+      });
+      confirmActions.append(cancel, confirm);
+      confirmation.append(confirmActions);
+      clearAllPanel.append(confirmation);
+    });
+
+    syncList();
+  }
+
+  function viewFollowerEvents() {
+    const owner = determineCurrentUid();
+    if (!owner.ok) {
+      showFollowerFailure(owner);
+      return;
+    }
+    const loaded = loadFollowerState(owner.uid);
+    if (!loaded.ok) {
+      showFollowerFailure(loaded);
+      return;
+    }
+    renderFollowerEvents(owner.uid, loaded.state);
+  }
+
+  const FOLLOWER_HYGIENE_PAGE_SIZE = 50;
+  // A Toolkit product safety limit on one deliberate manual batch, not a claim
+  // about any Weibo server rate limit. It matches the local Hygiene page size, so
+  // one reviewed page is the largest unit of work; fifty sequential writes spaced
+  // by FOLLOWER_BATCH_REMOVE_DELAY_MS mean about 147 seconds of inter-write
+  // pauses, which the execution-phase progress and stop control are built for.
+  const FOLLOWER_BATCH_MAX_SELECTION = 50;
+  const FOLLOWER_BATCH_REMOVE_DELAY_MS = 3000;
+
+  function normalizeHygieneThreshold(value) {
+    if (value === null || typeof value === "undefined" || value === "") {
+      return null;
+    }
+    return normalizeNonNegativeInteger(value);
+  }
+
+  function normalizeHygieneDate(value) {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      return null;
+    }
+    const timestamp = Date.parse(value + "T00:00:00.000Z");
+    if (!Number.isFinite(timestamp)) return null;
+    return new Date(timestamp).toISOString().slice(0, 10) === value
+      ? value
+      : null;
+  }
+
+  // UI-only grouping of the raw 关注来源 string. It never rewrites what the
+  // Snapshot stored: cards keep showing the exact API string, and this table is
+  // consulted only when filtering and when naming a match reason.
+  //
+  // Rules are deliberately narrow and explicit, derived from the source strings
+  // actually observed in this repository's fixtures and probes
+  // (兴趣推荐, 微博推荐, 搜索, HUAWEI Mate 40 Pro, 普通来源, 来源, 另一来源, 空值):
+  //   RECOMMENDATION  exact 兴趣推荐/微博推荐/好友推荐, or a value ending in 推荐
+  //   PROFILE         exact 个人主页/主页/他人主页
+  //   SEARCH          exact 搜索/微博搜索/搜索结果, or a value ending in 搜索
+  //   OTHER           any other known, non-empty value, device and client names
+  //                   among them: the card already shows the exact string, so a
+  //                   separate phone-client category earned nothing
+  //   UNKNOWN         no source metadata at all (null/empty/blank)
+  const FOLLOWER_SOURCE_UNKNOWN = "UNKNOWN";
+  const FOLLOWER_SOURCE_CATEGORIES = Object.freeze([
+    // Grouped labels only: the rule set covers every recommendation source, so
+    // the category is 推荐 rather than the narrower 兴趣推荐.
+    Object.freeze({ key: "RECOMMENDATION", label: "推荐" }),
+    Object.freeze({ key: "PROFILE", label: "个人主页" }),
+    Object.freeze({ key: "SEARCH", label: "搜索" }),
+    Object.freeze({ key: "OTHER", label: "其他来源" }),
+    Object.freeze({ key: FOLLOWER_SOURCE_UNKNOWN, label: "来源未知" }),
+  ]);
+  const FOLLOWER_SOURCE_CATEGORY_KEYS = Object.freeze(
+    FOLLOWER_SOURCE_CATEGORIES.map((category) => category.key)
+  );
+  const FOLLOWER_SOURCE_RECOMMENDATION_ALIASES = Object.freeze([
+    "兴趣推荐",
+    "微博推荐",
+    "好友推荐",
+  ]);
+  const FOLLOWER_SOURCE_PROFILE_ALIASES = Object.freeze([
+    "个人主页",
+    "主页",
+    "他人主页",
+  ]);
+  const FOLLOWER_SOURCE_SEARCH_ALIASES = Object.freeze([
+    "搜索",
+    "微博搜索",
+    "搜索结果",
+  ]);
+
+  function followerSourceCategoryLabel(key) {
+    const category = FOLLOWER_SOURCE_CATEGORIES.find(
+      (candidate) => candidate.key === key
+    );
+    return category ? category.label : key;
+  }
+
+  function classifyFollowerSource(sourceText) {
+    const value = typeof sourceText === "string" ? sourceText.trim() : "";
+    if (value === "") return FOLLOWER_SOURCE_UNKNOWN;
+    if (
+      FOLLOWER_SOURCE_RECOMMENDATION_ALIASES.includes(value) ||
+      value.endsWith("推荐")
+    ) {
+      return "RECOMMENDATION";
+    }
+    if (FOLLOWER_SOURCE_PROFILE_ALIASES.includes(value)) return "PROFILE";
+    if (
+      FOLLOWER_SOURCE_SEARCH_ALIASES.includes(value) ||
+      value.endsWith("搜索")
+    ) {
+      return "SEARCH";
+    }
+    return "OTHER";
+  }
+
+  function normalizeHygieneSourceCategories(raw) {
+    if (!Array.isArray(raw)) return [];
+    const selected = [];
+    for (const key of FOLLOWER_SOURCE_CATEGORY_KEYS) {
+      if (raw.includes(key)) selected.push(key);
+    }
+    return selected;
+  }
+
+  function normalizeHygieneFilters(raw) {
+    const statusesMax = normalizeHygieneThreshold(raw.statusesMax);
+    const followersMax = normalizeHygieneThreshold(raw.followersMax);
+    const friendsMax = normalizeHygieneThreshold(raw.friendsMax);
+    const createdAfter = normalizeHygieneDate(raw.createdAfter);
+    const filters = {
+      mode: raw.mode === "ANY" ? "ANY" : "ALL",
+      ownerNotFollowing: raw.ownerNotFollowing === true,
+      statusesMax,
+      followersMax,
+      friendsMax,
+      createdAfter,
+      unverified: raw.unverified === true,
+      // The whole source group is one criterion: the selected categories are
+      // OR-ed with each other, and that single outcome then takes part in the
+      // global ALL/ANY combination.
+      sourceCategories: normalizeHygieneSourceCategories(raw.sourceCategories),
+    };
+    filters.activeCount =
+      Number(filters.ownerNotFollowing) +
+      Number(filters.statusesMax !== null) +
+      Number(filters.followersMax !== null) +
+      Number(filters.friendsMax !== null) +
+      Number(filters.createdAfter !== null) +
+      Number(filters.unverified) +
+      Number(filters.sourceCategories.length > 0);
+    return filters;
+  }
+
+  function followerCreatedDate(record) {
+    if (typeof record.createdAt !== "string") return null;
+    const timestamp = Date.parse(record.createdAt);
+    if (!Number.isFinite(timestamp)) return null;
+    return new Date(timestamp).toISOString().slice(0, 10);
+  }
+
+  function getHygieneMatchReasons(record, filters) {
+    const reasons = [];
+    if (filters.ownerNotFollowing && record.ownerFollowing === false) {
+      reasons.push("未关注 TA");
+    }
+    if (
+      filters.statusesMax !== null &&
+      record.statusesCount !== null &&
+      record.statusesCount <= filters.statusesMax
+    ) {
+      reasons.push("API显示公开微博数 ≤ " + String(filters.statusesMax));
+    }
+    if (
+      filters.followersMax !== null &&
+      record.followersCount !== null &&
+      record.followersCount <= filters.followersMax
+    ) {
+      reasons.push("API显示粉丝数 ≤ " + String(filters.followersMax));
+    }
+    if (
+      filters.friendsMax !== null &&
+      record.friendsCount !== null &&
+      record.friendsCount <= filters.friendsMax
+    ) {
+      reasons.push("API显示关注数 ≤ " + String(filters.friendsMax));
+    }
+    const createdDate = followerCreatedDate(record);
+    if (
+      filters.createdAfter !== null &&
+      createdDate !== null &&
+      createdDate > filters.createdAfter
+    ) {
+      reasons.push("注册时间晚于 " + filters.createdAfter);
+    }
+    if (filters.unverified && record.verified === false) {
+      reasons.push("API显示为未认证");
+    }
+    if (filters.sourceCategories.length > 0) {
+      const category = classifyFollowerSource(record.sourceText);
+      if (filters.sourceCategories.includes(category)) {
+        // Exactly one reason for the whole group, so ALL keeps counting one
+        // criterion per selected condition.
+        reasons.push(
+          category === FOLLOWER_SOURCE_UNKNOWN
+            ? "来源未知"
+            : "来源 " + followerSourceCategoryLabel(category)
+        );
+      }
+    }
+    return reasons;
+  }
+
+  function recordMatchesHygieneFilters(record, filters) {
+    if (filters.activeCount === 0) return false;
+    const reasons = getHygieneMatchReasons(record, filters);
+    return filters.mode === "ANY"
+      ? reasons.length > 0
+      : reasons.length === filters.activeCount;
+  }
+
+  function filterFollowerSnapshot(snapshot, rawFilters) {
+    const filters = normalizeHygieneFilters(rawFilters);
+    if (filters.activeCount === 0) {
+      return { filters, matches: [] };
+    }
+    const matches = [];
+    for (const record of snapshot.records) {
+      const reasons = getHygieneMatchReasons(record, filters);
+      const matched =
+        filters.mode === "ANY"
+          ? reasons.length > 0
+          : reasons.length === filters.activeCount;
+      if (matched) matches.push({ record, reasons });
+    }
+    return { filters, matches };
+  }
+
+  function paginateFollowerHygieneMatches(matches, requestedPage) {
+    const totalResults = matches.length;
+    const totalPages =
+      totalResults === 0
+        ? 0
+        : Math.ceil(totalResults / FOLLOWER_HYGIENE_PAGE_SIZE);
+    const normalizedRequestedPage =
+      Number.isSafeInteger(requestedPage) && requestedPage > 0
+        ? requestedPage
+        : 1;
+    const page =
+      totalPages === 0
+        ? 1
+        : Math.min(normalizedRequestedPage, totalPages);
+    const start = (page - 1) * FOLLOWER_HYGIENE_PAGE_SIZE;
+    return {
+      totalResults,
+      totalPages,
+      page,
+      records:
+        totalPages === 0
+          ? []
+          : matches.slice(start, start + FOLLOWER_HYGIENE_PAGE_SIZE),
+      hasPrevious: totalPages > 0 && page > 1,
+      hasNext: totalPages > 0 && page < totalPages,
+    };
+  }
+
+  function hygieneFact(value, formatter) {
+    if (value === null || typeof value === "undefined") return "未知";
+    return typeof formatter === "function" ? formatter(value) : String(value);
+  }
+
+  // Same facts as before, one wrapping line. Unknown stays unknown: a missing
+  // count is never rendered as 0 and a missing flag is never rendered as false.
+  function hygieneFactLine(record) {
+    return [
+      "公开微博 " + hygieneFact(record.statusesCount),
+      "粉丝 " + hygieneFact(record.followersCount),
+      "关注 " + hygieneFact(record.friendsCount),
+      "注册 " +
+        hygieneFact(record.createdAt, (value) => formatDate(value)),
+      "认证 " +
+        hygieneFact(record.verified, (value) => (value ? "是" : "否")),
+      "来源 " +
+        hygieneFact(record.sourceText === "" ? null : record.sourceText),
+    ].join(" · ");
+  }
+
+  function readWeiboXsrfToken() {
+    try {
+      const match = document.cookie.match(
+        /(?:^|;\s*)XSRF-TOKEN=([^;]*)/
+      );
+      if (!match) return null;
+      const token = decodeURIComponent(match[1]);
+      return token !== "" ? token : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function normalizeWeiboVersionHeader(value) {
+    if (typeof value !== "string" && typeof value !== "number") return null;
+    const normalized = String(value).trim();
+    return normalized === "" ? null : normalized;
+  }
+
+  function resolveFollowerRemovalSecurityContext() {
+    const xsrfToken = readWeiboXsrfToken();
+    let clientVersion = null;
+    let serverVersion = null;
+    try {
+      if (typeof unsafeWindow !== "undefined" && unsafeWindow.$VERSION) {
+        clientVersion = normalizeWeiboVersionHeader(
+          unsafeWindow.$VERSION.CLIENT
+        );
+        serverVersion = normalizeWeiboVersionHeader(
+          unsafeWindow.$VERSION.SERVER
+        );
+      }
+    } catch (_) {
+      // Missing page-realm version metadata prevents the write.
+    }
+    if (
+      xsrfToken === null ||
+      clientVersion === null ||
+      serverVersion === null
+    ) {
+      return {
+        ok: false,
+        failureKind: "REMOVAL_SECURITY_CONTEXT_UNAVAILABLE",
+        requestSent: false,
+      };
+    }
+    return { ok: true, xsrfToken, clientVersion, serverVersion };
+  }
+
+  async function removeSingleFollower(uid, expectedOwnerUid) {
+    const canonicalUid = normalizeStableUid(uid);
+    if (canonicalUid === null || canonicalUid !== uid) {
+      return {
+        ok: false,
+        failureKind: "REMOVAL_INVALID_UID",
+        requestSent: false,
+      };
+    }
+    const ownerBefore = determineCurrentUid();
+    if (!ownerBefore.ok || ownerBefore.uid !== expectedOwnerUid) {
+      return {
+        ok: false,
+        failureKind: "ACCOUNT_CHANGED_DURING_REMOVAL",
+        requestSent: false,
+      };
+    }
+    const security = resolveFollowerRemovalSecurityContext();
+    if (!security.ok) return security;
+
+    const body = new URLSearchParams();
+    body.set("uid", canonicalUid);
+    let response;
+    try {
+      response = await fetch(
+        new URL(FOLLOWER_REMOVE_ENDPOINT, location.origin).href,
+        {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-XSRF-TOKEN": security.xsrfToken,
+            "client-version": security.clientVersion,
+            "server-version": security.serverVersion,
+          },
+          body,
+          cache: "no-store",
+          redirect: "error",
+        }
+      );
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "REMOVAL_NETWORK_OUTCOME_UNKNOWN",
+        requestSent: true,
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    let responseBody;
+    try {
+      responseBody = await response.text();
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "REMOVAL_RESPONSE_OUTCOME_UNKNOWN",
+        requestSent: true,
+        httpStatus: response.status,
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+    if (response.status !== 200 || !response.ok) {
+      return {
+        ok: false,
+        failureKind: "REMOVAL_HTTP_OUTCOME_UNKNOWN",
+        requestSent: true,
+        httpStatus: response.status,
+      };
+    }
+    if (
+      !/(?:application|text)\/[^;]*json/i.test(contentType) ||
+      looksLikeHtml(contentType, responseBody)
+    ) {
+      return {
+        ok: false,
+        failureKind: "REMOVAL_RESPONSE_OUTCOME_UNKNOWN",
+        requestSent: true,
+        httpStatus: response.status,
+      };
+    }
+    let data;
+    try {
+      data = JSON.parse(responseBody);
+    } catch (_) {
+      return {
+        ok: false,
+        failureKind: "REMOVAL_RESPONSE_OUTCOME_UNKNOWN",
+        requestSent: true,
+        httpStatus: response.status,
+      };
+    }
+    if (!isPlainObject(data) || !hasOwn(data, "ok")) {
+      return {
+        ok: false,
+        failureKind: "REMOVAL_RESPONSE_OUTCOME_UNKNOWN",
+        requestSent: true,
+        httpStatus: response.status,
+      };
+    }
+    if (typeof data.ok !== "number" || !Number.isFinite(data.ok)) {
+      return {
+        ok: false,
+        failureKind: "REMOVAL_RESPONSE_OUTCOME_UNKNOWN",
+        requestSent: true,
+        httpStatus: response.status,
+      };
+    }
+    if (data.ok <= 0) {
+      return {
+        ok: false,
+        failureKind: "REMOVAL_API_FAILURE",
+        requestSent: true,
+        httpStatus: response.status,
+      };
+    }
+    const ownerAfter = determineCurrentUid();
+    if (!ownerAfter.ok || ownerAfter.uid !== expectedOwnerUid) {
+      return {
+        ok: false,
+        failureKind: "ACCOUNT_CHANGED_DURING_REMOVAL",
+        requestSent: true,
+        httpStatus: response.status,
+      };
+    }
+    // Direct evidence: this exact UID was sent, Weibo answered with a validated
+    // numeric ok > 0, and the owner never changed. Recorded here so both the
+    // single and the batch path share one definition of "confirmed success".
+    // Awaited after the POST resolved, so the lock covers only the local write.
+    // Its outcome never downgrades this validated success.
+    await recordConfirmedFollowerRemoval(
+      expectedOwnerUid,
+      canonicalUid,
+      Date.now()
+    );
+    return {
+      ok: true,
+      requestSent: true,
+      httpStatus: response.status,
+    };
+  }
+
+  function buildHygieneCheckbox(text) {
+    const label = createElement("label", null, "wfr-hygiene-check");
+    const input = createElement("input");
+    input.type = "checkbox";
+    label.append(input, createElement("span", text));
+    return { label, input };
+  }
+
+  function buildHygieneValueInput(labelText, type, placeholder) {
+    const label = createElement("label", null, "wfr-hygiene-control");
+    label.append(createElement("span", labelText));
+    const input = createElement("input", null, "wfr-hygiene-input");
+    input.type = type;
+    if (type === "number") {
+      input.min = "0";
+      input.step = "1";
+    }
+    if (placeholder) input.placeholder = placeholder;
+    label.append(input);
+    return { label, input };
+  }
+
+  function followerRemovalResultMessage(result) {
+    if (
+      result.failureKind === "REMOVAL_SECURITY_CONTEXT_UNAVAILABLE" ||
+      result.failureKind === "REMOVAL_INVALID_UID"
+    ) {
+      return "无法取得当前微博请求所需的安全信息，未执行移除。";
+    }
+    if (
+      result.failureKind === "ACCOUNT_CHANGED_DURING_REMOVAL" &&
+      result.requestSent === false
+    ) {
+      return "当前登录账号已变化，未执行移除。";
+    }
+    if (result.failureKind === "REMOVAL_API_FAILURE") {
+      return "移除未成功，微博接口返回了失败结果。";
+    }
+    return "请求结果无法确认。没有自动重试，请先在微博中确认当前状态。";
+  }
+
+  function followerRemovalOutcomeIsUncertain(result) {
+    return Boolean(
+      result.requestSent === true &&
+        result.failureKind !== "REMOVAL_API_FAILURE"
+    );
+  }
+
+  function reportFollowerBatchCallback(callback, value) {
+    if (typeof callback !== "function") return;
+    try {
+      callback(value);
+    } catch (_) {
+      // Presentation callbacks cannot change mutation sequencing.
+    }
+  }
+
+  async function runFollowerRemovalBatch(records, expectedOwnerUid, options) {
+    const total = records.length;
+    let success = 0;
+    let failure = 0;
+    let uncertain = 0;
+    for (let index = 0; index < total; index += 1) {
+      if (options.isStopRequested()) {
+        return {
+          outcome: "STOPPED",
+          total,
+          success,
+          failure,
+          uncertain,
+          notExecuted: total - index,
+          stoppedByUser: true,
+        };
+      }
+      const record = records[index];
+      reportFollowerBatchCallback(options.onProgress, {
+        phase: "REQUESTING",
+        current: index + 1,
+        total,
+        record,
+      });
+      let result;
+      try {
+        result = await removeSingleFollower(record.uid, expectedOwnerUid);
+      } catch (error) {
+        result = {
+          ok: false,
+          failureKind: "REMOVAL_NETWORK_OUTCOME_UNKNOWN",
+          requestSent: true,
+          errorName: error && error.name ? String(error.name) : "Error",
+        };
+      }
+      reportFollowerBatchCallback(options.onResult, { record, result });
+      if (!result.ok) {
+        if (followerRemovalOutcomeIsUncertain(result)) uncertain += 1;
+        else failure += 1;
+        return {
+          outcome:
+            uncertain > 0 ? "UNCERTAIN_FAILURE" : "KNOWN_FAILURE",
+          total,
+          success,
+          failure,
+          uncertain,
+          notExecuted: total - index - 1,
+          stoppedByUser: false,
+          failedRecord: record,
+          failedResult: result,
+        };
+      }
+      success += 1;
+      if (options.isStopRequested()) {
+        return {
+          outcome: "STOPPED",
+          total,
+          success,
+          failure,
+          uncertain,
+          notExecuted: total - index - 1,
+          stoppedByUser: true,
+        };
+      }
+      if (index < total - 1) {
+        reportFollowerBatchCallback(options.onProgress, {
+          phase: "WAITING",
+          current: index + 1,
+          total,
+          record,
+        });
+        await delay(FOLLOWER_BATCH_REMOVE_DELAY_MS);
+        if (options.isStopRequested()) {
+          return {
+            outcome: "STOPPED",
+            total,
+            success,
+            failure,
+            uncertain,
+            notExecuted: total - index - 1,
+            stoppedByUser: true,
+          };
+        }
+      }
+    }
+    return {
+      outcome: "COMPLETE",
+      total,
+      success,
+      failure,
+      uncertain,
+      notExecuted: 0,
+      stoppedByUser: false,
+    };
+  }
+
+  async function startFollowerRemovalBatch(
+    records,
+    expectedOwnerUid,
+    options
+  ) {
+    if (followerRemovalInFlight) {
+      return {
+        outcome: "BUSY",
+        total: records.length,
+        success: 0,
+        failure: 0,
+        uncertain: 0,
+        notExecuted: records.length,
+        stoppedByUser: false,
+      };
+    }
+    if (updateRunning || followerUpdateRunning) {
+      return {
+        outcome: "SCAN_RUNNING",
+        total: records.length,
+        success: 0,
+        failure: 0,
+        uncertain: 0,
+        notExecuted: records.length,
+        stoppedByUser: false,
+      };
+    }
+    followerRemovalInFlight = true;
+    try {
+      return await runFollowerRemovalBatch(
+        records,
+        expectedOwnerUid,
+        options
+      );
+    } finally {
+      followerRemovalInFlight = false;
+    }
+  }
+
+  function buildFollowerHygieneCard(match, removalState) {
+    const record = match.record;
+    const item = createElement("article", null, "wfr-event");
+    const canonicalUid = normalizeStableUid(record.uid);
+    const removed = removalState.successfullyRemovedUids.has(record.uid);
+    const uncertain = removalState.uncertainRemovalUids.has(record.uid);
+    const selectionEligible =
+      canonicalUid !== null &&
+      canonicalUid === record.uid &&
+      !removed &&
+      !uncertain &&
+      !followerRemovalInFlight &&
+      !followerUpdateRunning &&
+      !updateRunning;
+    let selectionInput = null;
+    let selectionLabel = null;
+    if (selectionEligible) {
+      selectionLabel = createElement("label", null, "wfr-hygiene-check");
+      selectionInput = createElement("input");
+      selectionInput.type = "checkbox";
+      selectionInput.checked = removalState.selectedUids.has(record.uid);
+      selectionInput.addEventListener("change", () => {
+        removalState.changeSelection(
+          record,
+          selectionInput.checked,
+          selectionInput
+        );
+      });
+      selectionLabel.append(
+        selectionInput,
+        createElement("span", "选择此账号")
+      );
+    }
+    // One identity row instead of three stacked lines: checkbox, screen name and
+    // a muted UID that wraps to its own line only when the name is long.
+    const head = createElement("div", null, "wfr-hygiene-head");
+    if (selectionLabel !== null) head.append(selectionLabel);
+    head.append(
+      createElement(
+        "span",
+        record.screenName || "未知",
+        "wfr-hygiene-name"
+      ),
+      createElement("span", "UID " + record.uid, "wfr-hygiene-uid")
+    );
+    item.append(head);
+    const profile = createElement("a", "查看主页", "wfr-button");
+    profile.href = "https://weibo.com/u/" + record.uid;
+    profile.target = "_blank";
+    profile.rel = "noopener noreferrer";
+    const actions = createElement("div", null, "wfr-actions");
+    actions.append(profile);
+    if (removed) {
+      const removedStatus = createElement(
+        "p",
+        "已移除（粉丝快照尚未更新）",
+        "wfr-success"
+      );
+      item.append(removedStatus);
+      item.append(
+        createElement(
+          "p",
+          "移除已成功。当前粉丝快照仍是操作前的数据。",
+          "wfr-muted"
+        )
+      );
+      const refreshButton = createElement(
+        "button",
+        "更新粉丝快照",
+        "wfr-button"
+      );
+      const removedButton = createElement("button", "已移除", "wfr-button");
+      removedButton.type = "button";
+      removedButton.disabled = true;
+      refreshButton.type = "button";
+      refreshButton.addEventListener("click", () => void updateFollowersNow());
+      actions.append(removedButton, refreshButton);
+    } else if (uncertain) {
+      item.append(
+        createElement(
+          "p",
+          removalState.messages.get(record.uid) ||
+            "请求结果无法确认。请先在微博中确认当前状态。",
+          "wfr-error"
+        )
+      );
+      const uncertainButton = createElement(
+        "button",
+        "结果待确认",
+        "wfr-button"
+      );
+      uncertainButton.type = "button";
+      uncertainButton.disabled = true;
+      actions.append(uncertainButton);
+    } else if (canonicalUid !== null && canonicalUid === record.uid) {
+      const removeButton = createElement(
+        "button",
+        "移除粉丝",
+        "wfr-button wfr-danger"
+      );
+      removeButton.type = "button";
+      removeButton.disabled = followerUpdateRunning || updateRunning;
+      const status = createElement(
+        "p",
+        removalState.messages.get(record.uid) || "",
+        "wfr-muted"
+      );
+      removeButton.addEventListener("click", () => {
+        if (followerRemovalInFlight) {
+          status.textContent = "请等待当前移除操作完成。";
+          return;
+        }
+        removeButton.disabled = true;
+        const confirmation = createElement(
+          "div",
+          null,
+          "wfr-removal-confirm"
+        );
+        confirmation.append(
+          createElement("h3", "确认移除这个粉丝？"),
+          createElement(
+            "p",
+            "账号：" + (record.screenName || record.uid),
+            "wfr-row"
+          ),
+          createElement(
+            "p",
+            "这会修改真实的微博关系，移除后对方将不再是你的粉丝。",
+            "wfr-muted"
+          ),
+          createElement(
+            "p",
+            "Weibo Toolkit无法自动恢复这个操作。",
+            "wfr-muted"
+          )
+        );
+        const confirmationActions = createElement(
+          "div",
+          null,
+          "wfr-actions"
+        );
+        const cancelButton = createElement("button", "取消", "wfr-button");
+        const confirmButton = createElement(
+          "button",
+          "确认移除",
+          "wfr-button wfr-danger"
+        );
+        cancelButton.type = "button";
+        confirmButton.type = "button";
+        cancelButton.addEventListener("click", () => {
+          if (confirmation.parentNode) {
+            confirmation.parentNode.removeChild(confirmation);
+          }
+          removeButton.disabled = false;
+        });
+        confirmButton.addEventListener("click", async () => {
+          cancelButton.disabled = true;
+          confirmButton.disabled = true;
+          status.textContent = "正在移除…";
+          await removalState.confirmRemoval(record);
+        });
+        confirmationActions.append(cancelButton, confirmButton);
+        confirmation.append(confirmationActions);
+        item.append(confirmation);
+      });
+      actions.append(removeButton);
+      item.append(status);
+    }
+    // The page already says what this list is, so the per-card 匹配条件 / 当前事实
+    // headings are dropped. Both stay fully readable as compact wrapping lines.
+    if (match.reasons.length > 0) {
+      item.append(
+        createElement(
+          "p",
+          match.reasons.join(" · "),
+          "wfr-hygiene-line wfr-hygiene-match"
+        )
+      );
+    }
+    item.append(
+      createElement(
+        "p",
+        hygieneFactLine(record),
+        "wfr-hygiene-line wfr-hygiene-facts wfr-muted"
+      )
+    );
+    item.append(actions);
+    if (record.optionalMetadataConflict) {
+      item.append(
+        createElement(
+          "p",
+          "部分附加信息在扫描时存在差异。",
+          "wfr-muted"
+        )
+      );
+    }
+    // The owning view keeps a handle on each card so a single account's state can
+    // be refreshed in place, instead of rebuilding the whole list and losing the
+    // reader's scroll position.
+    if (typeof removalState.registerCard === "function") {
+      removalState.registerCard(record.uid, item, selectionInput);
+    }
+    return item;
+  }
+
+  function showFollowerHygiene() {
+    const owner = determineCurrentUid();
+    if (!owner.ok) {
+      showFollowerFailure(owner);
+      return;
+    }
+    const loaded = loadFollowerState(owner.uid);
+    if (!loaded.ok) {
+      showFollowerFailure(loaded);
+      return;
+    }
+    const body = showPanel("粉丝体检", true);
+    const snapshot = loaded.state.latestSnapshot;
+    if (snapshot === null) {
+      body.append(
+        createElement("p", "还没有可用的粉丝快照。", "wfr-muted"),
+        createElement(
+          "p",
+          "请先更新一次粉丝快照，再开始筛选。",
+          "wfr-muted"
+        )
+      );
+      const updateButton = createElement(
+        "button",
+        "更新粉丝快照",
+        "wfr-button wfr-primary"
+      );
+      updateButton.type = "button";
+      updateButton.addEventListener("click", () => void updateFollowersNow());
+      body.append(updateButton);
+      return;
+    }
+    const successfullyRemovedUids = new Set();
+    const uncertainRemovalUids = new Set();
+    const removalMessages = new Map();
+    const selectedUids = new Set();
+    let currentPage = 1;
+    let currentPageMatches = [];
+    let selectionMessage = "";
+    let batchStopRequested = false;
+    let batchStatus = null;
+    let filterInputs = [];
+    let currentPagination = null;
+    // Live handles on the currently rendered page, so selection and per-account
+    // result updates never rebuild the result list.
+    const cardNodes = new Map();
+    const cardMatches = new Map();
+    const cardSelectionInputs = new Map();
+    const removalState = {
+      successfullyRemovedUids,
+      uncertainRemovalUids,
+      messages: removalMessages,
+      confirmRemoval,
+      selectedUids,
+      changeSelection,
+      registerCard,
+    };
+
+    function registerCard(uid, element, selectionInput) {
+      cardNodes.set(uid, element);
+      if (selectionInput) {
+        cardSelectionInputs.set(uid, selectionInput);
+      } else {
+        cardSelectionInputs.delete(uid);
+      }
+    }
+
+    // Replaces exactly one card node. The result list keeps its identity and its
+    // height, so the scroll container has no reason to move.
+    function refreshCard(uid) {
+      const element = cardNodes.get(uid);
+      const match = cardMatches.get(uid);
+      if (!element || !match || !element.parentNode) return;
+      const parent = element.parentNode;
+      const replacement = buildFollowerHygieneCard(match, removalState);
+      parent.replaceChild(replacement, element);
+    }
+
+    function refreshVisibleCards() {
+      for (const uid of [...cardNodes.keys()]) refreshCard(uid);
+    }
+
+    function clearSelection() {
+      selectedUids.clear();
+      selectionMessage = "";
+      for (const input of cardSelectionInputs.values()) input.checked = false;
+    }
+
+    function changeSelection(record, checked, input) {
+      const canonicalUid = normalizeStableUid(record.uid);
+      const eligible =
+        canonicalUid !== null &&
+        canonicalUid === record.uid &&
+        !successfullyRemovedUids.has(record.uid) &&
+        !uncertainRemovalUids.has(record.uid) &&
+        !followerRemovalInFlight &&
+        !followerUpdateRunning &&
+        !updateRunning;
+      if (!checked) {
+        selectedUids.delete(record.uid);
+        selectionMessage = "";
+      } else if (!eligible) {
+        input.checked = false;
+      } else if (selectedUids.size >= FOLLOWER_BATCH_MAX_SELECTION) {
+        input.checked = false;
+        selectionMessage =
+          "一次最多选择 " +
+          String(FOLLOWER_BATCH_MAX_SELECTION) +
+          " 个粉丝。";
+      } else {
+        selectedUids.add(record.uid);
+        selectionMessage = "";
+      }
+      // Selection is ephemeral view state: nothing outside the toolbar depends on
+      // it, so no card is rebuilt and the scroll position is untouched.
+      renderSelectionToolbar();
+    }
+
+    async function confirmRemoval(record) {
+      if (followerRemovalInFlight) {
+        removalMessages.set(record.uid, "请等待当前移除操作完成。");
+        refreshCard(record.uid);
+        return;
+      }
+      if (followerUpdateRunning || updateRunning) {
+        removalMessages.set(record.uid, "关系扫描进行中，暂时无法移除。");
+        refreshCard(record.uid);
+        return;
+      }
+      followerRemovalInFlight = true;
+      let result;
+      try {
+        result = await removeSingleFollower(record.uid, owner.uid);
+      } catch (error) {
+        result = {
+          ok: false,
+          failureKind: "REMOVAL_NETWORK_OUTCOME_UNKNOWN",
+          requestSent: true,
+          errorName: error && error.name ? String(error.name) : "Error",
+        };
+      } finally {
+        followerRemovalInFlight = false;
+      }
+      if (result.ok) {
+        successfullyRemovedUids.add(record.uid);
+        uncertainRemovalUids.delete(record.uid);
+        removalMessages.delete(record.uid);
+        selectedUids.delete(record.uid);
+      } else {
+        removalMessages.set(record.uid, followerRemovalResultMessage(result));
+        if (followerRemovalOutcomeIsUncertain(result)) {
+          uncertainRemovalUids.add(record.uid);
+        }
+        selectedUids.delete(record.uid);
+      }
+      refreshCard(record.uid);
+      renderSelectionToolbar();
+    }
+
+    // One compact factual line instead of four stacked rows. The filtering
+    // caveat keeps its own muted line: the API result is never claimed complete.
+    const summaryLine = createElement("p", "", "wfr-row wfr-hygiene-summary");
+    body.append(summaryLine);
+    appendFollowerVisibilityNote(body, snapshot);
+
+    // Collapsed by default, so the first cards start near the top. This is view
+    // state only and is never persisted.
+    let filtersExpanded = false;
+    const filterBar = createElement("div", null, "wfr-hygiene-bar");
+    const filterSummary = createElement("span", "", "wfr-hygiene-filter-summary");
+    const filterToggle = createElement("button", "设置筛选", "wfr-button");
+    filterToggle.type = "button";
+    filterBar.append(filterSummary, filterToggle);
+    body.append(filterBar);
+
+    const controls = createElement("div", null, "wfr-hygiene-controls");
+    const modeLabel = createElement("label", null, "wfr-hygiene-control");
+    modeLabel.append(createElement("span", "匹配方式"));
+    const mode = createElement("select", null, "wfr-select");
+    for (const [value, text] of [
+      ["ALL", "匹配全部条件"],
+      ["ANY", "匹配任一条件"],
+    ]) {
+      const option = createElement("option", text);
+      option.value = value;
+      mode.append(option);
+    }
+    mode.value = "ALL";
+    modeLabel.append(mode);
+    controls.append(modeLabel);
+
+    const ownerNotFollowing = buildHygieneCheckbox("未关注 TA");
+    const unverified = buildHygieneCheckbox("未认证");
+    controls.append(ownerNotFollowing.label, unverified.label);
+
+    const statusesMax = buildHygieneValueInput(
+      "公开微博数上限",
+      "number",
+      "未启用"
+    );
+    const followersMax = buildHygieneValueInput(
+      "粉丝数上限",
+      "number",
+      "未启用"
+    );
+    const friendsMax = buildHygieneValueInput(
+      "关注数上限",
+      "number",
+      "未启用"
+    );
+    const createdAfter = buildHygieneValueInput(
+      "注册日期晚于",
+      "date"
+    );
+    controls.append(
+      statusesMax.label,
+      followersMax.label,
+      friendsMax.label,
+      createdAfter.label
+    );
+
+    // Common source categories instead of a keyword the user would have to
+    // guess. Selecting several means "any of these", never "all of these".
+    const sourceGroup = createElement("div", null, "wfr-hygiene-group");
+    sourceGroup.append(
+      createElement("span", "关注来源", "wfr-hygiene-group-label")
+    );
+    const sourceOptions = createElement("div", null, "wfr-hygiene-grid");
+    const sourceInputs = [];
+    for (const category of FOLLOWER_SOURCE_CATEGORIES) {
+      const option = buildHygieneCheckbox(category.label);
+      sourceInputs.push({ key: category.key, input: option.input });
+      sourceOptions.append(option.label);
+    }
+    sourceGroup.append(sourceOptions);
+    controls.append(sourceGroup);
+    controls.hidden = true;
+    const collapseActions = createElement("div", null, "wfr-actions");
+    const collapseButton = createElement("button", "收起筛选", "wfr-button");
+    collapseButton.type = "button";
+    collapseActions.append(collapseButton);
+    controls.append(collapseActions);
+    body.append(controls);
+
+    const prompt = createElement(
+      "p",
+      "请先设置至少一个筛选条件。",
+      "wfr-muted"
+    );
+    const paginationBar = createElement("div", null, "wfr-hygiene-bar");
+    const paginationSummary = createElement("span", "", "wfr-muted");
+    const paginationActions = createElement("div", null, "wfr-actions");
+    const previousButton = createElement("button", "上一页", "wfr-button");
+    const nextButton = createElement("button", "下一页", "wfr-button");
+    previousButton.type = "button";
+    nextButton.type = "button";
+    paginationActions.append(previousButton, nextButton);
+    paginationBar.append(paginationSummary, paginationActions);
+
+    // The selection bar sticks to the bottom of the Toolkit scroll area so the
+    // controls stay reachable while reading a 50-card page. It sits after the
+    // list, so at the end of the page it simply rests in normal flow.
+    const selectionMessageNode = createElement("p", "", "wfr-muted");
+    const selectionToolbar = createElement("div", null, "wfr-selection-bar");
+    const selectionControls = createElement("div", null, "wfr-selection-row");
+    const selectionCountNode = createElement("span", "", "wfr-selection-count");
+    const selectCurrentPageButton = createElement(
+      "button",
+      "选择当前页",
+      "wfr-button"
+    );
+    const clearSelectionButton = createElement(
+      "button",
+      "清除选择",
+      "wfr-button"
+    );
+    const batchRemoveButton = createElement(
+      "button",
+      "移除所选粉丝",
+      "wfr-button wfr-danger"
+    );
+    selectCurrentPageButton.type = "button";
+    clearSelectionButton.type = "button";
+    batchRemoveButton.type = "button";
+    selectionControls.append(
+      selectCurrentPageButton,
+      selectionCountNode,
+      clearSelectionButton,
+      batchRemoveButton
+    );
+    // Execution phase: progress and the stop control live in the same sticky bar,
+    // so a fifty-account batch never leaves them scrolled out of reach. They are
+    // the only stop control while a batch runs.
+    const batchControls = createElement("div", null, "wfr-selection-row");
+    const batchProgressNode = createElement("span", "", "wfr-selection-count");
+    const stopBatchButton = createElement(
+      "button",
+      "停止后续操作",
+      "wfr-button"
+    );
+    stopBatchButton.type = "button";
+    batchControls.append(batchProgressNode, stopBatchButton);
+    batchControls.hidden = true;
+    selectionToolbar.append(
+      selectionControls,
+      batchControls,
+      selectionMessageNode
+    );
+    selectionToolbar.hidden = true;
+
+    const batchPanel = createElement("div", null, "wfr-batch-panel");
+    const list = createElement("div", null, "wfr-event-list");
+    body.append(
+      prompt,
+      paginationBar,
+      batchPanel,
+      list,
+      selectionToolbar
+    );
+
+    function clearNode(node) {
+      while (node.childNodes.length > 0) {
+        node.removeChild(node.childNodes[0]);
+      }
+    }
+
+    function readFilters() {
+      return {
+        mode: mode.value,
+        ownerNotFollowing: ownerNotFollowing.input.checked,
+        statusesMax: statusesMax.input.value,
+        followersMax: followersMax.input.value,
+        friendsMax: friendsMax.input.value,
+        createdAfter: createdAfter.input.value,
+        unverified: unverified.input.checked,
+        sourceCategories: sourceInputs
+          .filter((entry) => entry.input.checked)
+          .map((entry) => entry.key),
+      };
+    }
+
+    // Human-readable description of the active criteria, derived from the live
+    // filter state; nothing internal leaks and nothing is persisted.
+    function describeActiveFilters(filters) {
+      const parts = [];
+      if (filters.ownerNotFollowing) parts.push("未关注 TA");
+      if (filters.statusesMax !== null) {
+        parts.push("公开微博≤" + String(filters.statusesMax));
+      }
+      if (filters.followersMax !== null) {
+        parts.push("粉丝≤" + String(filters.followersMax));
+      }
+      if (filters.friendsMax !== null) {
+        parts.push("关注≤" + String(filters.friendsMax));
+      }
+      if (filters.createdAfter !== null) {
+        parts.push("注册晚于 " + filters.createdAfter);
+      }
+      if (filters.unverified) parts.push("未认证");
+      if (filters.sourceCategories.length > 0) {
+        parts.push(
+          "来源=" +
+            filters.sourceCategories
+              .map((key) => followerSourceCategoryLabel(key))
+              .join("/")
+        );
+      }
+      return parts.join(" · ");
+    }
+
+    function renderFilterBar(filters) {
+      const summary = describeActiveFilters(filters);
+      // ANY reads as one sentence rather than a chain of colons.
+      filterSummary.textContent =
+        summary === ""
+          ? "筛选条件：未设置"
+          : (filters.mode === "ANY" ? "匹配任一条件：" : "筛选条件：") + summary;
+      filterToggle.textContent =
+        filters.activeCount === 0 ? "设置筛选" : "修改筛选";
+      filterToggle.hidden = filtersExpanded;
+      controls.hidden = !filtersExpanded;
+    }
+
+    function renderPaginationState() {
+      const batchActive = Boolean(batchStatus && batchStatus.active);
+      if (currentPagination === null) {
+        previousButton.disabled = true;
+        nextButton.disabled = true;
+        return;
+      }
+      previousButton.disabled = !currentPagination.hasPrevious || batchActive;
+      nextButton.disabled = !currentPagination.hasNext || batchActive;
+    }
+
+    function eligibleVisibleUids() {
+      return currentPageMatches
+        .map((match) => match.record.uid)
+        .filter((uid) => cardSelectionInputs.has(uid));
+    }
+
+    function renderSelectionToolbar() {
+      const batchActive = Boolean(batchStatus && batchStatus.active);
+      const busy =
+        followerRemovalInFlight || followerUpdateRunning || updateRunning;
+      selectionToolbar.hidden =
+        currentPageMatches.length === 0 && !batchActive;
+      selectionControls.hidden = batchActive;
+      batchControls.hidden = !batchActive;
+      selectionCountNode.textContent =
+        "已选择：" +
+        String(selectedUids.size) +
+        " / " +
+        String(FOLLOWER_BATCH_MAX_SELECTION);
+      selectCurrentPageButton.disabled =
+        busy ||
+        selectedUids.size >= FOLLOWER_BATCH_MAX_SELECTION ||
+        !eligibleVisibleUids().some((uid) => !selectedUids.has(uid));
+      clearSelectionButton.disabled = selectedUids.size === 0;
+      batchRemoveButton.disabled = selectedUids.size === 0 || busy;
+      if (batchActive) {
+        batchProgressNode.textContent =
+          batchStatus.current > 0
+            ? "正在移除：" +
+              String(batchStatus.current) +
+              " / " +
+              String(batchStatus.total)
+            : "正在准备批量移除…";
+        stopBatchButton.textContent = batchStatus.stopRequested
+          ? "正在停止…"
+          : "停止后续操作";
+        stopBatchButton.disabled = batchStatus.stopRequested;
+        selectionMessageNode.textContent = batchStatus.currentName
+          ? "当前账号：" + batchStatus.currentName
+          : "";
+        return;
+      }
+      selectionMessageNode.textContent = selectionMessage;
+    }
+
+    // Deliberate, local, current-page only. Ineligible cards carry no checkbox
+    // and are simply skipped; fewer than a full page is not an error.
+    function selectCurrentPage() {
+      if (followerRemovalInFlight) {
+        selectionMessage = "请等待当前移除操作完成。";
+        renderSelectionToolbar();
+        return;
+      }
+      if (followerUpdateRunning || updateRunning) {
+        selectionMessage = "关系扫描进行中，暂时无法选择。";
+        renderSelectionToolbar();
+        return;
+      }
+      let refused = 0;
+      for (const uid of eligibleVisibleUids()) {
+        if (selectedUids.has(uid)) continue;
+        if (selectedUids.size >= FOLLOWER_BATCH_MAX_SELECTION) {
+          refused += 1;
+          continue;
+        }
+        selectedUids.add(uid);
+        const input = cardSelectionInputs.get(uid);
+        if (input) input.checked = true;
+      }
+      selectionMessage =
+        refused > 0
+          ? "一次最多选择 " +
+            String(FOLLOWER_BATCH_MAX_SELECTION) +
+            " 个粉丝。"
+          : "";
+      renderSelectionToolbar();
+    }
+
+    function appendManualSnapshotRefresh(container) {
+      const refreshButton = createElement(
+        "button",
+        "更新粉丝快照",
+        "wfr-button"
+      );
+      refreshButton.type = "button";
+      refreshButton.addEventListener("click", () => void updateFollowersNow());
+      container.append(refreshButton);
+    }
+
+    function renderBatchPanel() {
+      clearNode(batchPanel);
+      if (batchStatus === null) return;
+      // While a batch runs, progress and the stop control are shown by the sticky
+      // bar only, so the one stop control is always reachable.
+      if (batchStatus.active) return;
+
+      const summary = batchStatus.summary;
+      if (summary.outcome === "COMPLETE") {
+        batchPanel.append(
+          createElement(
+            "p",
+            "已完成：" +
+              String(summary.success) +
+              " / " +
+              String(summary.total),
+            "wfr-success"
+          ),
+          createElement(
+            "p",
+            "移除已成功。当前粉丝快照仍是操作前的数据。",
+            "wfr-muted"
+          )
+        );
+      } else if (summary.outcome === "STOPPED") {
+        batchPanel.append(
+          createElement("p", "已停止后续操作。", "wfr-muted")
+        );
+      } else {
+        batchPanel.append(
+          createElement("p", "批量移除已停止。", "wfr-error")
+        );
+      }
+      addLine(batchPanel, "成功", summary.success);
+      if (summary.failure > 0) {
+        addLine(batchPanel, "失败", summary.failure);
+      }
+      if (summary.uncertain > 0) {
+        addLine(batchPanel, "结果无法确认", summary.uncertain);
+      }
+      addLine(batchPanel, "未执行", summary.notExecuted);
+      if (summary.success > 0) appendManualSnapshotRefresh(batchPanel);
+    }
+
+    function selectedVisibleRecords() {
+      return currentPageMatches
+        .filter((match) => selectedUids.has(match.record.uid))
+        .map((match) => match.record);
+    }
+
+    function showBatchConfirmation() {
+      if (followerRemovalInFlight) {
+        selectionMessage = "请等待当前移除操作完成。";
+        renderSelectionToolbar();
+        return;
+      }
+      if (updateRunning || followerUpdateRunning) {
+        selectionMessage = "关系扫描进行中，暂时无法移除。";
+        renderSelectionToolbar();
+        return;
+      }
+      const records = selectedVisibleRecords();
+      if (
+        records.length === 0 ||
+        records.length > FOLLOWER_BATCH_MAX_SELECTION
+      ) {
+        return;
+      }
+      batchStatus = null;
+      clearNode(batchPanel);
+      const confirmation = createElement(
+        "div",
+        null,
+        "wfr-removal-confirm"
+      );
+      confirmation.append(
+        createElement(
+          "h3",
+          "确认移除这 " + String(records.length) + " 个粉丝？"
+        ),
+        createElement("p", "这会修改真实的微博关系。", "wfr-muted"),
+        createElement(
+          "p",
+          "移除后，这些账号将不再是你的粉丝。",
+          "wfr-muted"
+        ),
+        createElement(
+          "p",
+          "Weibo Toolkit无法自动恢复这些操作。",
+          "wfr-muted"
+        ),
+        createElement(
+          "p",
+          "操作将逐个进行，每次成功后约等待 3 秒。",
+          "wfr-muted"
+        ),
+        createElement(
+          "p",
+          "已选择账号（" + String(records.length) + "）",
+          "wfr-row"
+        )
+      );
+      // Every selected account stays inspectable, but the list scrolls inside the
+      // confirmation so the cancel/confirm controls stay on screen at fifty names.
+      const names = createElement("ul", null, "wfr-confirm-list");
+      for (const record of records) {
+        names.append(createElement("li", record.screenName || record.uid));
+      }
+      confirmation.append(names);
+      const actions = createElement("div", null, "wfr-actions");
+      const cancel = createElement("button", "取消", "wfr-button");
+      const confirm = createElement(
+        "button",
+        "确认移除 " + String(records.length) + " 个",
+        "wfr-button wfr-danger"
+      );
+      cancel.type = "button";
+      confirm.type = "button";
+      cancel.addEventListener("click", () => {
+        clearNode(batchPanel);
+        renderSelectionToolbar();
+      });
+      confirm.addEventListener("click", async () => {
+        cancel.disabled = true;
+        confirm.disabled = true;
+        await beginBatchRemoval(records);
+      });
+      actions.append(cancel, confirm);
+      confirmation.append(actions);
+      batchPanel.append(confirmation);
+      // Deliberate navigation for an explicit action, never a side effect of
+      // selecting a card: the confirmation and the later progress/stop control
+      // both live here.
+      if (typeof batchPanel.scrollIntoView === "function") {
+        batchPanel.scrollIntoView({ block: "nearest" });
+      }
+    }
+
+    async function beginBatchRemoval(records) {
+      batchStopRequested = false;
+      batchStatus = {
+        active: true,
+        current: 0,
+        total: records.length,
+        currentName: "",
+        stopRequested: false,
+        summary: null,
+      };
+      for (const input of filterInputs) input.disabled = true;
+      renderSelectionToolbar();
+      renderPaginationState();
+      renderBatchPanel();
+      refreshVisibleCards();
+      const batchPromise = startFollowerRemovalBatch(records, owner.uid, {
+        isStopRequested: () => batchStopRequested,
+        onProgress(progress) {
+          batchStatus.current = progress.current;
+          batchStatus.currentName =
+            progress.record.screenName || progress.record.uid;
+          renderSelectionToolbar();
+        },
+        onResult(entry) {
+          const record = entry.record;
+          const result = entry.result;
+          selectedUids.delete(record.uid);
+          if (result.ok) {
+            successfullyRemovedUids.add(record.uid);
+            uncertainRemovalUids.delete(record.uid);
+            removalMessages.delete(record.uid);
+          } else {
+            removalMessages.set(
+              record.uid,
+              followerRemovalResultMessage(result)
+            );
+            if (followerRemovalOutcomeIsUncertain(result)) {
+              uncertainRemovalUids.add(record.uid);
+            }
+          }
+          refreshCard(record.uid);
+          renderSelectionToolbar();
+        },
+      });
+      const summary = await batchPromise;
+      batchStatus = {
+        active: false,
+        current: summary.success + summary.failure + summary.uncertain,
+        total: summary.total,
+        currentName: "",
+        stopRequested: summary.stoppedByUser,
+        summary,
+      };
+      for (const input of filterInputs) input.disabled = false;
+      renderSelectionToolbar();
+      renderPaginationState();
+      renderBatchPanel();
+      refreshVisibleCards();
+    }
+
+    function renderResults(resetPage) {
+      if (resetPage) {
+        currentPage = 1;
+        clearSelection();
+        batchStatus = null;
+        clearNode(batchPanel);
+      }
+      clearNode(list);
+      cardNodes.clear();
+      cardMatches.clear();
+      cardSelectionInputs.clear();
+      const result = filterFollowerSnapshot(snapshot, readFilters());
+      summaryLine.textContent =
+        "快照：" +
+        formatMinute(snapshot.capturedAt) +
+        " · API可见粉丝：" +
+        String(snapshot.uniqueRecordCount) +
+        (result.filters.activeCount === 0
+          ? ""
+          : " · 匹配：" + String(result.matches.length));
+      renderFilterBar(result.filters);
+      prompt.hidden = result.filters.activeCount !== 0;
+      if (result.filters.activeCount === 0) {
+        paginationSummary.textContent = "";
+        paginationActions.hidden = true;
+        paginationBar.hidden = true;
+        currentPageMatches = [];
+        currentPagination = null;
+        renderPaginationState();
+        renderSelectionToolbar();
+        return;
+      }
+      if (result.matches.length === 0) {
+        paginationSummary.textContent =
+          "当前快照中没有符合筛选条件的API可见粉丝。";
+        paginationActions.hidden = true;
+        paginationBar.hidden = false;
+        currentPageMatches = [];
+        currentPagination = null;
+        renderPaginationState();
+        renderSelectionToolbar();
+        return;
+      }
+      const pagination = paginateFollowerHygieneMatches(
+        result.matches,
+        currentPage
+      );
+      currentPage = pagination.page;
+      currentPageMatches = pagination.records;
+      currentPagination = pagination;
+      paginationSummary.textContent =
+        String(pagination.totalResults) +
+        " 个结果 · 第 " +
+        String(pagination.page) +
+        " / " +
+        String(pagination.totalPages) +
+        " 页";
+      paginationActions.hidden = false;
+      paginationBar.hidden = false;
+      renderPaginationState();
+      for (const match of pagination.records) {
+        cardMatches.set(match.record.uid, match);
+        list.append(buildFollowerHygieneCard(match, removalState));
+      }
+      renderSelectionToolbar();
+      renderBatchPanel();
+    }
+
+    previousButton.addEventListener("click", () => {
+      if (batchStatus && batchStatus.active) return;
+      if (currentPage <= 1) return;
+      currentPage -= 1;
+      clearSelection();
+      batchStatus = null;
+      renderResults(false);
+    });
+    nextButton.addEventListener("click", () => {
+      if (batchStatus && batchStatus.active) return;
+      currentPage += 1;
+      clearSelection();
+      batchStatus = null;
+      renderResults(false);
+    });
+    selectCurrentPageButton.addEventListener("click", selectCurrentPage);
+    clearSelectionButton.addEventListener("click", () => {
+      clearSelection();
+      renderSelectionToolbar();
+    });
+    stopBatchButton.addEventListener("click", () => {
+      if (batchStatus === null || !batchStatus.active) return;
+      batchStopRequested = true;
+      batchStatus.stopRequested = true;
+      renderSelectionToolbar();
+    });
+    batchRemoveButton.addEventListener("click", showBatchConfirmation);
+
+    // Expanding or collapsing is pure view state: it never refilters, never
+    // fetches and never writes.
+    filterToggle.addEventListener("click", () => {
+      filtersExpanded = true;
+      renderFilterBar(normalizeHygieneFilters(readFilters()));
+    });
+    collapseButton.addEventListener("click", () => {
+      filtersExpanded = false;
+      renderFilterBar(normalizeHygieneFilters(readFilters()));
+    });
+
+    filterInputs = [
+      mode,
+      ownerNotFollowing.input,
+      unverified.input,
+      statusesMax.input,
+      followersMax.input,
+      friendsMax.input,
+      createdAfter.input,
+      ...sourceInputs.map((entry) => entry.input),
+    ];
+    for (const input of filterInputs) {
+      input.addEventListener("change", () => renderResults(true));
+      if (input.tagName === "INPUT" && input.type !== "checkbox") {
+        input.addEventListener("input", () => renderResults(true));
+      }
+    }
+    renderResults(true);
+  }
+
+  function formatTime(value) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+  }
+
+  // Minute precision for compact headers; the stored timestamp is untouched.
+  function formatMinute(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    const pad = (part) => String(part).padStart(2, "0");
+    return (
+      `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()} ` +
+      `${pad(date.getHours())}:${pad(date.getMinutes())}`
+    );
+  }
+
+  function formatDate(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+      date.getDate()
+    )}`;
+  }
+
+  function describeEvent(event) {
+    if (event.type === EVENT.SCREEN_NAME_CHANGED) {
+      return `${event.previous.screenName} → ${event.current.screenName}`;
+    }
+    return EVENT_LABELS[event.type] || event.type;
+  }
+
+  // Both sides of a mutual-follow transition are only stated for records that are
+  // present in the API-visible following list, where "you follow them" is known.
+  const MUTUAL_FOLLOW_MEANING = "互相关注";
+  const ONE_WAY_FOLLOW_MEANING = "你关注对方，对方未关注你";
+  const VISIBLE_PRESENT_MEANING = "在你的可见关注列表中";
+  const VISIBLE_ABSENT_MEANING = "不在你的可见关注列表中";
+
+  function eventTransition(event) {
+    if (event.type === EVENT.SCREEN_NAME_CHANGED) {
+      return {
+        previous: event.previous.screenName,
+        current: event.current.screenName,
+      };
+    }
+    if (event.type === EVENT.FOLLOW_ME_GAINED) {
+      return { previous: ONE_WAY_FOLLOW_MEANING, current: MUTUAL_FOLLOW_MEANING };
+    }
+    if (event.type === EVENT.FOLLOW_ME_LOST) {
+      return { previous: MUTUAL_FOLLOW_MEANING, current: ONE_WAY_FOLLOW_MEANING };
+    }
+    if (
+      event.type === EVENT.VISIBLE_FOLLOWING_ADDED ||
+      event.type === EVENT.VISIBLE_FOLLOWING_DISAPPEARED
+    ) {
+      const meaning = (visible) =>
+        visible ? VISIBLE_PRESENT_MEANING : VISIBLE_ABSENT_MEANING;
+      return {
+        previous: meaning(event.previous.visible),
+        current: meaning(event.current.visible),
+      };
+    }
+    return null;
+  }
+
+  function sortEventsNewestFirst(events) {
+    return [...events].sort(
+      (a, b) =>
+        b.detectedAt.localeCompare(a.detectedAt) || b.id.localeCompare(a.id)
+    );
+  }
+
+  // Identity is the stable UID only: a renamed account keeps one timeline, and two
+  // accounts sharing a nickname never merge.
+  function eventsForSubject(events, subjectUid) {
+    return sortEventsNewestFirst(
+      events.filter((event) => event.subjectUid === subjectUid)
+    );
+  }
+
+  function bestDisplayName(state, subjectUid) {
+    const snapshot = state.latestSnapshot;
+    if (snapshot) {
+      const record = snapshot.records.find((entry) => entry.uid === subjectUid);
+      if (record) return record.screenName;
+    }
+    const history = eventsForSubject(state.events, subjectUid);
+    return history.length > 0 ? history[0].displayName : subjectUid;
+  }
+
+  function matchesEventQuery(event, query) {
+    const needle = String(query).trim().toLowerCase();
+    if (needle === "") return true;
+    return (
+      event.subjectUid.includes(needle) ||
+      event.displayName.toLowerCase().includes(needle)
+    );
+  }
+
+  function filterEvents(events, query) {
+    return events.filter((event) => matchesEventQuery(event, query));
+  }
+
+  function renderEvents(ownerUid, state, notice) {
+    const body = showPanel("关系事件", true);
+    if (notice) body.append(createElement("p", notice, "wfr-success"));
+    // Opening the list only reflects read state; it never changes it.
+    const unread = countUnreadEvents(state.events);
+    showUnreadBadge(unread);
+    addLine(body, "事件总数", state.events.length);
+    addLine(body, "未读", unread);
+
+    if (unread > 0) {
+      const markButton = createElement("button", "全部标为已读", "wfr-button wfr-primary");
+      markButton.type = "button";
+      markButton.addEventListener("click", async () => {
+        markButton.disabled = true;
+        const currentUid = determineCurrentUid();
+        if (!currentUid.ok || currentUid.uid !== ownerUid) {
+          showFailure("标记失败", {
+            failureKind: "UID_UNAVAILABLE",
+          });
+          return;
+        }
+        const saved = await withFriendRadarStateLock(ownerUid, async () => {
+          const fresh = loadState(ownerUid);
+          if (!fresh.ok) return fresh;
+          const nextState = markAllEventsRead(fresh.state);
+          const written = persistState(ownerUid, nextState);
+          if (!written.ok) return written;
+          return { ok: true, state: nextState };
+        });
+        if (!saved.ok) {
+          showFailure("标记失败", saved);
+          return;
+        }
+        renderEvents(ownerUid, saved.state, "全部事件已标为已读。");
+      });
+      body.append(markButton);
+    }
+
+    if (state.events.length === 0) {
+      body.append(createElement("p", "暂无事件", "wfr-muted"));
+      return;
+    }
+
+    const exportActions = createElement("div", null, "wfr-actions");
+    for (const [format, text] of [
+      ["csv", "导出 CSV"],
+      ["markdown", "导出 Markdown"],
+    ]) {
+      const button = createElement("button", text, "wfr-button");
+      button.type = "button";
+      button.addEventListener("click", () => exportEvents(ownerUid, state, format));
+      exportActions.append(button);
+    }
+    body.append(exportActions);
+    body.append(
+      createElement(
+        "p",
+        "CSV / Markdown 为已观察事件的导出，恢复数据请使用 JSON 备份。",
+        "wfr-muted"
+      )
+    );
+
+    const search = createElement("input", null, "wfr-search");
+    search.type = "search";
+    search.placeholder = "搜索昵称或 UID";
+    search.setAttribute("aria-label", "搜索昵称或 UID");
+    body.append(search);
+
+    const list = createElement("div", null, "wfr-event-list");
+    body.append(list);
+
+    const newestFirst = sortEventsNewestFirst(state.events);
+    function renderList(query) {
+      while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
+      const matching = filterEvents(newestFirst, query);
+      if (matching.length === 0) {
+        list.append(createElement("p", "没有匹配的事件", "wfr-muted"));
+        return;
+      }
+      for (const event of matching) {
+        list.append(buildEventCard(ownerUid, state, event));
+      }
+    }
+    search.addEventListener("input", () => renderList(search.value || ""));
+    renderList("");
+  }
+
+  function buildEventCard(ownerUid, state, event) {
+    const item = createElement("article", null, "wfr-event");
+    item.append(
+      createElement(
+        "h3",
+        `${event.read ? "已读" : "未读"} · ${EVENT_LABELS[event.type] || event.type}`
+      )
+    );
+    addLine(item, "时间", formatTime(event.detectedAt));
+    addLine(item, "名称", event.displayName);
+    if (event.type === EVENT.SCREEN_NAME_CHANGED) {
+      addLine(item, "变化", describeEvent(event));
+    }
+    const detailButton = createElement("button", "详情", "wfr-button");
+    detailButton.type = "button";
+    detailButton.addEventListener("click", () =>
+      showEventDetail(ownerUid, state, event)
+    );
+    item.append(detailButton);
+    return item;
+  }
+
+  function showEventDetail(ownerUid, state, event) {
+    const body = showPanel("事件详情", () => renderEvents(ownerUid, state, null));
+    body.append(
+      createElement("h3", EVENT_LABELS[event.type] || event.type)
+    );
+    addLine(body, "名称", event.displayName);
+    addLine(body, "UID", event.subjectUid);
+    addLine(body, "检测时间", formatTime(event.detectedAt));
+    addLine(body, "状态", event.read ? "已读" : "未读");
+
+    const transition = eventTransition(event);
+    if (transition) {
+      addLine(body, "变化前", transition.previous);
+      addLine(body, "变化后", transition.current);
+    }
+    addLine(
+      body,
+      "该 UID 的已存事件",
+      eventsForSubject(state.events, event.subjectUid).length
+    );
+
+    if (event.type === EVENT.VISIBLE_FOLLOWING_DISAPPEARED) {
+      body.append(
+        createElement(
+          "p",
+          "本工具只能记录该账号从你的可见关注列表消失，无法判断消失的原因。",
+          "wfr-muted"
+        )
+      );
+    }
+
+    const timelineButton = createElement(
+      "button",
+      "查看关系时间线",
+      "wfr-button wfr-primary"
+    );
+    timelineButton.type = "button";
+    timelineButton.addEventListener("click", () =>
+      showTimeline(ownerUid, state, event.subjectUid)
+    );
+    body.append(timelineButton);
+  }
+
+  function showTimeline(ownerUid, state, subjectUid, onBack) {
+    const history = eventsForSubject(state.events, subjectUid);
+    const body = showPanel(
+      `${bestDisplayName(state, subjectUid)} · 关系时间线`,
+      typeof onBack === "function"
+        ? onBack
+        : () => renderEvents(ownerUid, state, null)
+    );
+    addLine(body, "UID", subjectUid);
+    addLine(body, "历史事件", history.length);
+    body.append(
+      createElement(
+        "p",
+        "以下仅为 Weibo Toolkit 实际观察并保存的事件，不是微博上的完整真实关系历史。",
+        "wfr-muted"
+      )
+    );
+
+    if (history.length === 0) {
+      body.append(createElement("p", "暂无事件", "wfr-muted"));
+      return;
+    }
+
+    const list = createElement("div", null, "wfr-event-list");
+    for (const event of history) {
+      const item = createElement("article", null, "wfr-event");
+      item.append(createElement("h3", formatDate(event.detectedAt)));
+      item.append(
+        createElement("p", EVENT_LABELS[event.type] || event.type, "wfr-row")
+      );
+      if (event.type === EVENT.SCREEN_NAME_CHANGED) {
+        item.append(createElement("p", describeEvent(event), "wfr-row"));
+      }
+      list.append(item);
+    }
+    body.append(list);
+  }
+
+  function viewEvents() {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showFailure("关系事件", uidResult);
+      return;
+    }
+    const loaded = loadState(uidResult.uid);
+    if (!loaded.ok) {
+      showFailure("关系事件", loaded);
+      return;
+    }
+    renderEvents(uidResult.uid, loaded.state, null);
+  }
+
+  function viewStatus() {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showFailure("关系雷达状态", uidResult);
+      return;
+    }
+    const loaded = loadState(uidResult.uid);
+    if (!loaded.ok) {
+      showFailure("关系雷达状态", loaded);
+      return;
+    }
+
+    const body = showPanel("关系雷达状态", true);
+    const snapshot = loaded.state.latestSnapshot;
+    const unread = countUnreadEvents(loaded.state.events);
+    showUnreadBadge(unread);
+    addLine(body, "已有快照", snapshot ? "是" : "否");
+    if (snapshot) {
+      addLine(body, "上次成功更新", formatTime(snapshot.capturedAt));
+      addLine(body, "API可见关注", snapshot.visibleCount);
+      addLine(body, "接口总数", snapshot.reportedTotal);
+      addLine(
+        body,
+        "未解析关系差值",
+        snapshot.unresolvedRelationCount
+      );
+    }
+    addLine(body, "事件总数", loaded.state.events.length);
+    addLine(body, "未读事件", unread);
+  }
+
+  // Friend Notes: what the user wrote about another account, by hand. It is the
+  // only durable module whose content Toolkit never observes for itself, so it is
+  // kept in its own versioned state and never mixed with Friend Radar or follower
+  // facts. Nicknames and relationship history shown beside a note are always
+  // derived from those existing states at display time, never copied in here.
+  const FRIEND_NOTES_SCHEMA_VERSION = 1;
+  const FRIEND_NOTES_STORAGE_PREFIX = "weiboToolkit.friendNotes.v1.";
+  const FRIEND_NOTES_LOCK_PREFIX = "weibo-toolkit-friend-notes-state-";
+  const SHOW_PROFILE_FRIEND_NOTES_KEY =
+    "weiboToolkit.page.showProfileFriendNotes.v1";
+  const FRIEND_NOTE_MAX_LENGTH = 1000;
+  const FRIEND_NOTE_TAG_MAX_LENGTH = 20;
+  const FRIEND_NOTE_MAX_TAGS = 12;
+  const FRIEND_NOTES_MAX_PROFILES = 2000;
+  const FRIEND_NOTES_PAGE_SIZE = 20;
+  const PROFILE_FRIEND_NOTES_ID = "wfr-profile-friend-notes";
+
+  let friendNoteEditorSequence = 0;
+  let friendNoteDetailView = null;
+  let profileFriendNotesContext = null;
+  let profileFriendNotesObserver = null;
+  let profileFriendNotesObservedMain = null;
+  let profileFriendNotesObservedHost = null;
+  let profileFriendNotesDiscoveryTimer = null;
+  let profileFriendNotesDiscoveryCount = 0;
+  let profileFriendNotesEnsureScheduled = false;
+
+  function friendNotesStorageKey(ownerUid) {
+    return FRIEND_NOTES_STORAGE_PREFIX + ownerUid;
+  }
+
+  function emptyFriendNotesState(ownerUid) {
+    return {
+      schemaVersion: FRIEND_NOTES_SCHEMA_VERSION,
+      ownerUid,
+      notes: {},
+    };
+  }
+
+  function normalizeFriendNoteText(value) {
+    return typeof value === "string"
+      ? value.replace(/\r\n?/g, "\n").trim()
+      : null;
+  }
+
+  function normalizeFriendNoteTag(value) {
+    return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : null;
+  }
+
+  function friendNoteInvalid(reason) {
+    return { ok: false, failureKind: "FRIEND_NOTE_INVALID", reason };
+  }
+
+  // Blank tags are dropped and duplicates collapse, so a draft can never turn
+  // whitespace into a stored value. Lengths count UTF-16 units, which is exactly
+  // what the editor's maxlength enforces.
+  function validateFriendNoteDraft(draft) {
+    if (!isPlainObject(draft)) return friendNoteInvalid("DRAFT_NOT_OBJECT");
+    const note = normalizeFriendNoteText(draft.note);
+    if (note === null) return friendNoteInvalid("NOTE_NOT_TEXT");
+    if (note.length > FRIEND_NOTE_MAX_LENGTH) {
+      return friendNoteInvalid("NOTE_TOO_LONG");
+    }
+    if (!Array.isArray(draft.tags)) return friendNoteInvalid("TAGS_NOT_LIST");
+    const tags = [];
+    for (const candidate of draft.tags) {
+      const tag = normalizeFriendNoteTag(candidate);
+      if (tag === null) return friendNoteInvalid("TAG_NOT_TEXT");
+      if (tag === "" || tags.includes(tag)) continue;
+      if (tag.length > FRIEND_NOTE_TAG_MAX_LENGTH) {
+        return friendNoteInvalid("TAG_TOO_LONG");
+      }
+      tags.push(tag);
+    }
+    if (tags.length > FRIEND_NOTE_MAX_TAGS) {
+      return friendNoteInvalid("TOO_MANY_TAGS");
+    }
+    return { ok: true, note, tags };
+  }
+
+  function isValidFriendNoteTimestamp(value) {
+    return typeof value === "string" && Number.isFinite(Date.parse(value));
+  }
+
+  // A stored record must already be in the exact form a save would produce and
+  // must carry content: an empty note with no tags is never a record.
+  function isValidFriendNoteRecord(record) {
+    if (
+      !isPlainObject(record) ||
+      !isValidFriendNoteTimestamp(record.createdAt) ||
+      !isValidFriendNoteTimestamp(record.updatedAt)
+    ) {
+      return false;
+    }
+    const checked = validateFriendNoteDraft(record);
+    return Boolean(
+      checked.ok &&
+        checked.note === record.note &&
+        checked.tags.length === record.tags.length &&
+        checked.tags.every((tag, index) => tag === record.tags[index]) &&
+        (checked.note !== "" || checked.tags.length > 0)
+    );
+  }
+
+  function isValidFriendNotesState(state, ownerUid) {
+    if (
+      !isPlainObject(state) ||
+      state.schemaVersion !== FRIEND_NOTES_SCHEMA_VERSION ||
+      state.ownerUid !== ownerUid ||
+      !isPlainObject(state.notes)
+    ) {
+      return false;
+    }
+    const subjectUids = Object.keys(state.notes);
+    if (subjectUids.length > FRIEND_NOTES_MAX_PROFILES) return false;
+    return subjectUids.every(
+      (uid) =>
+        normalizeStableUid(uid) === uid &&
+        isValidFriendNoteRecord(state.notes[uid])
+    );
+  }
+
+  // Interprets one exact stored value. Absence is a valid empty state; anything
+  // unreadable, malformed or written by a newer schema is a failure that callers
+  // must surface, never a reason to start over from empty.
+  function friendNotesStateFromRaw(raw, ownerUid) {
+    if (raw === null || typeof raw === "undefined") {
+      return { ok: true, state: emptyFriendNotesState(ownerUid), raw: null };
+    }
+    if (typeof raw !== "string") {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "FRIEND_NOTES_NOT_STRING",
+      };
+    }
+    let state;
+    try {
+      state = JSON.parse(raw);
+    } catch (_) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "FRIEND_NOTES_MALFORMED",
+      };
+    }
+    if (
+      isPlainObject(state) &&
+      hasOwn(state, "schemaVersion") &&
+      state.schemaVersion !== FRIEND_NOTES_SCHEMA_VERSION
+    ) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "FRIEND_NOTES_SCHEMA_UNSUPPORTED",
+      };
+    }
+    if (!isValidFriendNotesState(state, ownerUid)) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "FRIEND_NOTES_SCHEMA_INVALID",
+      };
+    }
+    return { ok: true, state, raw };
+  }
+
+  function loadFriendNotesState(ownerUid) {
+    let raw;
+    try {
+      raw = GM_getValue(friendNotesStorageKey(ownerUid), null);
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "FRIEND_NOTES_UNREADABLE",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+    return friendNotesStateFromRaw(raw, ownerUid);
+  }
+
+  function friendNotesLockUnavailable(reason, error) {
+    const result = {
+      ok: false,
+      failureKind: "STATE_LOCK_UNAVAILABLE",
+      reason,
+    };
+    if (error) result.errorName = error.name ? String(error.name) : "Error";
+    return result;
+  }
+
+  // Owner-scoped cross-tab serialization, mirroring the other durable modules.
+  // The transaction must stay local and short: no fetch, no delay, no UI wait.
+  async function withFriendNotesLock(ownerUid, transaction) {
+    const lockManager = pageLockManager();
+    if (lockManager === null) {
+      return friendNotesLockUnavailable("LOCK_UNAVAILABLE");
+    }
+    try {
+      return await lockManager.request.call(
+        lockManager,
+        FRIEND_NOTES_LOCK_PREFIX + ownerUid,
+        { mode: "exclusive" },
+        async (lock) => {
+          if (lock === null) {
+            return friendNotesLockUnavailable("LOCK_NOT_ACQUIRED");
+          }
+          return await transaction();
+        }
+      );
+    } catch (error) {
+      return friendNotesLockUnavailable("LOCK_REQUEST_FAILED", error);
+    }
+  }
+
+  // Unlocked helper: callers must already hold the Friend Notes lock. It writes
+  // exact bytes (or restores absence) and verifies them. After a failed attempt
+  // one bounded re-read is used solely to prove that the previous bytes are
+  // still stored; it never retries and never upgrades a failure to success.
+  function writeFriendNotesRaw(ownerUid, nextRaw, previousRaw) {
+    const key = friendNotesStorageKey(ownerUid);
+    const storedRaw = () => {
+      const value = GM_getValue(key, null);
+      return typeof value === "string" ? value : null;
+    };
+    let failure;
+    try {
+      if (nextRaw === null) GM_deleteValue(key);
+      else GM_setValue(key, nextRaw);
+      if (storedRaw() === nextRaw) return { ok: true };
+      failure = {
+        failureKind: "PERSISTENCE_ERROR",
+        reason: "WRITE_NOT_VERIFIED",
+      };
+    } catch (error) {
+      failure = {
+        failureKind: "PERSISTENCE_ERROR",
+        reason: "WRITE_FAILED",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+    let outcomeUnknown = true;
+    try {
+      outcomeUnknown = storedRaw() !== previousRaw;
+    } catch (_) {
+      // An unreadable value proves nothing about what is stored.
+    }
+    return { ...failure, ok: false, mutationAttempted: true, outcomeUnknown };
+  }
+
+  // Identity of one stored record as an editor saw it. A save carries the token
+  // of the version it started from, so an edit based on a version another tab
+  // has since replaced is detected instead of silently winning.
+  function friendNoteRecordToken(record) {
+    return record === null
+      ? null
+      : JSON.stringify([
+          record.note,
+          record.tags,
+          record.createdAt,
+          record.updatedAt,
+        ]);
+  }
+
+  // The single write path for one profile. Everything that decides the outcome
+  // is read inside the lock: the live owner, the stored state, and the version
+  // the caller based its edit on. An empty draft removes the profile, so blank
+  // input can never leave a meaningless record behind.
+  async function saveFriendNote(
+    ownerUid,
+    subjectUid,
+    draft,
+    expectedToken,
+    savedAt
+  ) {
+    if (
+      typeof ownerUid !== "string" ||
+      typeof subjectUid !== "string" ||
+      normalizeStableUid(ownerUid) !== ownerUid ||
+      normalizeStableUid(subjectUid) !== subjectUid
+    ) {
+      return friendNoteInvalid("SUBJECT_UID_UNAVAILABLE");
+    }
+    if (subjectUid === ownerUid) return friendNoteInvalid("SUBJECT_IS_OWNER");
+    if (!isValidFriendNoteTimestamp(savedAt)) {
+      return friendNoteInvalid("INVALID_TIMESTAMP");
+    }
+    const checked = validateFriendNoteDraft(draft);
+    if (!checked.ok) return checked;
+    const owner = determineCurrentUid();
+    if (!owner.ok) return owner;
+    if (owner.uid !== ownerUid) {
+      return { ok: false, failureKind: "FRIEND_NOTE_OWNER_CHANGED" };
+    }
+
+    return await withFriendNotesLock(ownerUid, async () => {
+      const lockedOwner = determineCurrentUid();
+      if (!lockedOwner.ok || lockedOwner.uid !== ownerUid) {
+        return { ok: false, failureKind: "FRIEND_NOTE_OWNER_CHANGED" };
+      }
+      const loaded = loadFriendNotesState(ownerUid);
+      if (!loaded.ok) return loaded;
+      const current = hasOwn(loaded.state.notes, subjectUid)
+        ? loaded.state.notes[subjectUid]
+        : null;
+      if (friendNoteRecordToken(current) !== expectedToken) {
+        return { ok: false, failureKind: "FRIEND_NOTE_CONFLICT", current };
+      }
+
+      const empty = checked.note === "" && checked.tags.length === 0;
+      if (empty && current === null) {
+        return { ok: true, record: null, token: null, changed: false };
+      }
+      if (
+        current !== null &&
+        current.note === checked.note &&
+        current.tags.length === checked.tags.length &&
+        current.tags.every((tag, index) => tag === checked.tags[index])
+      ) {
+        return { ok: true, record: current, token: expectedToken, changed: false };
+      }
+
+      const nextNotes = { ...loaded.state.notes };
+      let record = null;
+      if (empty) {
+        delete nextNotes[subjectUid];
+      } else {
+        if (
+          current === null &&
+          Object.keys(nextNotes).length >= FRIEND_NOTES_MAX_PROFILES
+        ) {
+          return friendNoteInvalid("TOO_MANY_PROFILES");
+        }
+        record = {
+          note: checked.note,
+          tags: checked.tags,
+          createdAt: current === null ? savedAt : current.createdAt,
+          updatedAt: savedAt,
+        };
+        nextNotes[subjectUid] = record;
+      }
+      const written = writeFriendNotesRaw(
+        ownerUid,
+        JSON.stringify({
+          schemaVersion: FRIEND_NOTES_SCHEMA_VERSION,
+          ownerUid,
+          notes: nextNotes,
+        }),
+        loaded.raw
+      );
+      if (!written.ok) return written;
+      return {
+        ok: true,
+        record,
+        token: friendNoteRecordToken(record),
+        changed: true,
+      };
+    });
+  }
+
+  function friendNoteFailureText(result) {
+    if (result.failureKind === "FRIEND_NOTE_INVALID") {
+      const reasons = {
+        NOTE_TOO_LONG: `备注不能超过 ${FRIEND_NOTE_MAX_LENGTH} 个字。`,
+        TAG_TOO_LONG: `每个标签不能超过 ${FRIEND_NOTE_TAG_MAX_LENGTH} 个字。`,
+        TOO_MANY_TAGS: `每个档案最多 ${FRIEND_NOTE_MAX_TAGS} 个标签。`,
+        TOO_MANY_PROFILES: `友人档案已达到 ${FRIEND_NOTES_MAX_PROFILES} 条上限，请先删除不再需要的档案。`,
+        SUBJECT_UID_UNAVAILABLE: "无法可靠识别目标账号的 UID，未保存。",
+        SUBJECT_IS_OWNER: "不能为当前登录账号自己建立友人档案。",
+      };
+      return reasons[result.reason] || "备注或标签内容无效，未保存。";
+    }
+    if (result.failureKind === "PERSISTENCE_ERROR") {
+      return result.outcomeUnknown === false
+        ? "保存失败，已确认本地友人档案没有被更改。"
+        : "保存结果无法确认。请重新打开此档案核对内容后，再决定是否重试。";
+    }
+    if (result.failureKind === "STORAGE_ERROR") {
+      return result.reason === "FRIEND_NOTES_SCHEMA_UNSUPPORTED"
+        ? "友人档案由更新版本的 Toolkit 写入，当前版本无法读取，未做任何更改。"
+        : "友人档案本地数据无法读取。为避免覆盖，Toolkit 没有重置或更改这些数据。";
+    }
+    const labels = {
+      UID_UNAVAILABLE: "无法可靠识别当前登录账号，未保存。",
+      FRIEND_NOTE_OWNER_CHANGED: "当前登录账号已变化，未保存。请刷新页面后再试。",
+      STATE_LOCK_UNAVAILABLE:
+        "浏览器暂时无法提供跨标签页保护，未保存。请稍后重试。",
+    };
+    return labels[result.failureKind] || "保存失败，结果未能确认。";
+  }
+
+  // One row per saved profile. Names and relationship facts come from the same
+  // derivation the profile page uses, read from the states as they are now, so
+  // evidence that has been cleared or replaced stops matching immediately.
+  function deriveFriendNoteEntries(notesState, friendState, followerState) {
+    return Object.keys(notesState.notes)
+      .map((uid) => {
+        const facts = deriveProfileLocalFacts(uid, friendState, followerState);
+        return {
+          uid,
+          record: notesState.notes[uid],
+          facts,
+          displayName: facts.currentName === null ? uid : facts.currentName,
+        };
+      })
+      .sort(
+        (left, right) =>
+          right.record.updatedAt.localeCompare(left.record.updatedAt) ||
+          left.uid.localeCompare(right.uid)
+      );
+  }
+
+  function matchesFriendNoteQuery(entry, query) {
+    const needle = String(query).trim().toLowerCase();
+    if (needle === "") return true;
+    const haystacks = [
+      entry.uid,
+      entry.record.note,
+      ...entry.record.tags,
+      ...entry.facts.historicalNames,
+    ];
+    if (entry.facts.currentName !== null) haystacks.push(entry.facts.currentName);
+    return haystacks.some((text) => text.toLowerCase().includes(needle));
+  }
+
+  function filterFriendNoteEntries(entries, query, tag) {
+    return entries.filter(
+      (entry) =>
+        (tag === null || entry.record.tags.includes(tag)) &&
+        matchesFriendNoteQuery(entry, query)
+    );
+  }
+
+  function collectFriendNoteTags(entries) {
+    const counts = new Map();
+    for (const entry of entries) {
+      for (const tag of entry.record.tags) {
+        counts.set(tag, (counts.get(tag) || 0) + 1);
+      }
+    }
+    return [...counts.entries()].sort(
+      (left, right) => right[1] - left[1] || left[0].localeCompare(right[0])
+    );
+  }
+
+  // Observed facts are worded as records with their own dates: a nickname seen
+  // in an old snapshot is "last recorded", never the account's name right now.
+  function friendNoteObservedRows(facts) {
+    const rows = [];
+    if (facts.currentName !== null) {
+      rows.push({
+        label: "最近记录昵称",
+        value:
+          facts.currentNameObservedAt === null
+            ? facts.currentName
+            : `${facts.currentName}（记录于 ${formatProfileDate(
+                facts.currentNameObservedAt
+              )}）`,
+        exactTime: facts.currentNameObservedAt,
+      });
+    }
+    if (facts.historicalNames.length > 0) {
+      rows.push({
+        label: "本地记录过的其他昵称",
+        value: facts.historicalNames.join("、"),
+        exactTime: null,
+      });
+    }
+    if (facts.recentRelationshipEvent !== null) {
+      rows.push({
+        label: "最近关系记录",
+        value: `${formatProfileDate(
+          facts.recentRelationshipEvent.observedAt
+        )} · ${facts.recentRelationshipEvent.label}`,
+        exactTime: facts.recentRelationshipEvent.observedAt,
+      });
+    }
+    if (facts.earliestLocalRecord !== null) {
+      rows.push({
+        label: "最早本地记录",
+        value: formatProfileDate(facts.earliestLocalRecord),
+        exactTime: facts.earliestLocalRecord,
+      });
+    }
+    return rows;
+  }
+
+  function clearFriendNoteNode(node) {
+    while (node.childNodes.length > 0) node.removeChild(node.childNodes[0]);
+  }
+
+  function focusFriendNoteControl(control) {
+    if (control && typeof control.focus === "function") control.focus();
+  }
+
+  function createFriendNoteButton(text, className) {
+    const button = createElement("button", text, className || "wfr-button");
+    button.type = "button";
+    return button;
+  }
+
+  function friendNoteProfileUrl(subjectUid) {
+    return `${WEIBO_MAIN_ORIGIN}/u/${subjectUid}`;
+  }
+
+  function createFriendNoteProfileLink(subjectUid) {
+    const link = createElement("a", "打开主页", "wfr-button wfr-note-link");
+    link.href = friendNoteProfileUrl(subjectUid);
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    return link;
+  }
+
+  // User-written text is only ever assigned through textContent.
+  function buildFriendNoteTagList(tags) {
+    const list = createElement("ul", null, "wfr-note-tags");
+    list.setAttribute("aria-label", "标签");
+    for (const tag of tags) list.append(createElement("li", tag, "wfr-note-tag"));
+    return list;
+  }
+
+  function appendFriendNoteRecord(container, record) {
+    container.append(
+      record.note === ""
+        ? createElement("p", "（未写备注，仅有标签）", "wfr-muted")
+        : createElement("p", record.note, "wfr-note-text")
+    );
+    if (record.tags.length > 0) {
+      container.append(buildFriendNoteTagList(record.tags));
+    }
+    container.append(
+      createElement(
+        "p",
+        `手写内容更新于 ${formatMinute(record.updatedAt)}`,
+        "wfr-muted wfr-note-time"
+      )
+    );
+  }
+
+  // A key pressed while an input method is composing belongs to the IME: the
+  // Enter that picks a candidate must not add a tag or save. Chrome, Edge and
+  // Firefox mark those events with isComposing. Safari delivers the committing
+  // Enter's keydown after compositionend, with isComposing already false, and
+  // only keyCode 229 still identifies it.
+  function isFriendNoteImeKeyEvent(event) {
+    return Boolean(
+      event && (event.isComposing === true || event.keyCode === 229)
+    );
+  }
+
+  // The editors that can currently show one profile in this tab are the profile
+  // panel, the Toolkit detail view and the feed card. After one of them has
+  // stored a new version, the others are told directly, and only when they show
+  // the same owner and subject; nothing else is rebuilt. The feed entries for
+  // that subject are updated from the same saved record.
+  function syncFriendNoteViews(ownerUid, subjectUid, record, sourceEditor) {
+    const views = [];
+    const context = profileFriendNotesContext;
+    if (context !== null && context.editor) {
+      views.push({
+        ownerUid: context.ownerUid,
+        subjectUid: context.targetUid,
+        editor: context.editor,
+      });
+    }
+    if (
+      friendNoteDetailView !== null &&
+      panelRoot !== null &&
+      panelRoot.contains(friendNoteDetailView.editor.root)
+    ) {
+      views.push(friendNoteDetailView);
+    }
+    if (feedFriendNoteCard !== null) views.push(feedFriendNoteCard);
+    applyFeedFriendNoteSaved(ownerUid, subjectUid, record);
+    for (const view of views) {
+      if (
+        view.editor !== sourceEditor &&
+        view.ownerUid === ownerUid &&
+        view.subjectUid === subjectUid
+      ) {
+        view.editor.applySavedRecord(record);
+      }
+    }
+  }
+
+  // Shared by the profile panel and the Toolkit detail view. options.guard may
+  // return a sentence explaining why saving is not allowed right now; a save is
+  // otherwise always attempted through saveFriendNote and its lock.
+  // options.onSaved is called only after a save or delete actually changed the
+  // stored profile. options.startInEdit opens straight into the edit form.
+  // Returns { root, applySavedRecord, isEditing, hasUnsavedChanges }.
+  function buildFriendNoteEditor(options) {
+    const ownerUid = options.ownerUid;
+    const subjectUid = options.subjectUid;
+    const root = createElement("div", null, "wfr-note-editor");
+    const content = createElement("div", null, "wfr-note-content");
+    const status = createElement("p", "", "wfr-muted wfr-note-status");
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    root.append(content, status);
+
+    let record = options.record;
+    let baseToken = friendNoteRecordToken(record);
+    let busy = false;
+    let mode = "view";
+    let draftChanged = null;
+
+    const handle = {
+      root,
+      // True while typed input could be lost: an open edit form or a save or
+      // delete still in flight.
+      isEditing: () => busy || mode === "edit",
+      hasUnsavedChanges: () =>
+        busy || (mode === "edit" && draftChanged !== null && draftChanged()),
+      // Another view in this tab has just stored this version. A view with
+      // nothing unsaved simply shows it. An open edit keeps both the typed
+      // input and the token it started from, so its own save still goes through
+      // the stale-edit check instead of silently replacing the newer version.
+      applySavedRecord(savedRecord) {
+        if (busy) return;
+        if (mode === "edit") {
+          setStatus(
+            "此档案刚在本页的其他位置保存了新内容。你的输入仍保留，保存时会进行冲突检查。"
+          );
+          return;
+        }
+        adopt(savedRecord);
+        renderView(false);
+        setStatus("");
+      },
+    };
+
+    function notifySaved(savedRecord) {
+      if (typeof options.onSaved === "function") {
+        options.onSaved(ownerUid, subjectUid, savedRecord, handle);
+      }
+    }
+
+    function setStatus(text, className) {
+      status.textContent = text;
+      status.className = `${className || "wfr-muted"} wfr-note-status`;
+    }
+
+    function adopt(nextRecord) {
+      record = nextRecord;
+      baseToken = friendNoteRecordToken(nextRecord);
+    }
+
+    function saveBlockedText() {
+      return typeof options.guard === "function" ? options.guard() : null;
+    }
+
+    async function attemptSave(draft) {
+      try {
+        return await saveFriendNote(
+          ownerUid,
+          subjectUid,
+          draft,
+          baseToken,
+          new Date().toISOString()
+        );
+      } catch (error) {
+        return {
+          ok: false,
+          failureKind: "UNKNOWN_FAILURE",
+          errorName: error && error.name ? String(error.name) : "Error",
+        };
+      }
+    }
+
+    function renderView(focusPrimary) {
+      mode = "view";
+      draftChanged = null;
+      clearFriendNoteNode(content);
+      if (record === null) {
+        content.append(
+          createElement("p", "还没有为此账号写下备注或标签。", "wfr-muted")
+        );
+      } else {
+        appendFriendNoteRecord(content, record);
+      }
+      const actions = createElement(
+        "div",
+        null,
+        "wfr-actions wfr-compact-actions"
+      );
+      const editButton = createFriendNoteButton(
+        record === null ? "添加备注与标签" : "编辑"
+      );
+      editButton.addEventListener("click", beginEdit);
+      actions.append(editButton);
+      if (record !== null) {
+        const deleteButton = createFriendNoteButton("删除档案");
+        deleteButton.addEventListener("click", renderDeleteConfirm);
+        actions.append(deleteButton);
+      }
+      content.append(actions);
+      if (focusPrimary) focusFriendNoteControl(editButton);
+    }
+
+    // Editing always starts from the version stored right now, not from the one
+    // this view happened to render, so an edit does not begin already stale.
+    function beginEdit() {
+      if (busy) return;
+      const fresh = loadFriendNotesState(ownerUid);
+      if (!fresh.ok) {
+        setStatus(friendNoteFailureText(fresh), "wfr-error");
+        return;
+      }
+      adopt(
+        hasOwn(fresh.state.notes, subjectUid)
+          ? fresh.state.notes[subjectUid]
+          : null
+      );
+      setStatus("");
+      renderEdit({
+        note: record === null ? "" : record.note,
+        tags: record === null ? [] : [...record.tags],
+      });
+    }
+
+    function renderEdit(draft) {
+      mode = "edit";
+      clearFriendNoteNode(content);
+      friendNoteEditorSequence += 1;
+      const fieldId = `wfr-note-field-${friendNoteEditorSequence}`;
+      const tags = [...draft.tags];
+
+      const conflictSlot = createElement("div", null, "wfr-note-conflict-slot");
+
+      const noteLabel = createElement(
+        "label",
+        "私人备注（仅保存在本浏览器）",
+        "wfr-note-field-label"
+      );
+      noteLabel.setAttribute("for", `${fieldId}-note`);
+      const textarea = createElement("textarea", null, "wfr-note-textarea");
+      textarea.id = `${fieldId}-note`;
+      textarea.maxLength = FRIEND_NOTE_MAX_LENGTH;
+      textarea.rows = options.compact ? 3 : 5;
+      textarea.placeholder = "例如：去年摄影展认识的阿岚，喜欢拍海边。";
+      textarea.value = draft.note;
+      const counter = createElement("p", "", "wfr-muted wfr-note-counter");
+      const syncCounter = () => {
+        counter.textContent = `${String(textarea.value).length} / ${FRIEND_NOTE_MAX_LENGTH}`;
+      };
+      textarea.addEventListener("input", syncCounter);
+      syncCounter();
+
+      const tagLabel = createElement("label", "标签", "wfr-note-field-label");
+      tagLabel.setAttribute("for", `${fieldId}-tag`);
+      const tagList = createElement("ul", null, "wfr-note-tags");
+      tagList.setAttribute("aria-label", "已添加的标签");
+      const tagRow = createElement("div", null, "wfr-note-tag-row");
+      const tagInput = createElement("input", null, "wfr-note-tag-input");
+      tagInput.type = "text";
+      tagInput.id = `${fieldId}-tag`;
+      tagInput.maxLength = FRIEND_NOTE_TAG_MAX_LENGTH;
+      tagInput.placeholder = "输入标签后按回车";
+      draftChanged = () =>
+        String(textarea.value) !== draft.note ||
+        String(tagInput.value) !== "" ||
+        tags.length !== draft.tags.length ||
+        tags.some((tag, index) => tag !== draft.tags[index]);
+      const addTagButton = createFriendNoteButton("添加标签");
+      tagRow.append(tagInput, addTagButton);
+      const tagHint = createElement(
+        "p",
+        `最多 ${FRIEND_NOTE_MAX_TAGS} 个标签，每个不超过 ${FRIEND_NOTE_TAG_MAX_LENGTH} 个字。`,
+        "wfr-muted wfr-note-counter"
+      );
+
+      function renderTags() {
+        clearFriendNoteNode(tagList);
+        tagList.hidden = tags.length === 0;
+        for (const tag of tags) {
+          const item = createElement("li", null, "wfr-note-tag");
+          const removeButton = createElement(
+            "button",
+            "×",
+            "wfr-note-tag-remove"
+          );
+          removeButton.type = "button";
+          removeButton.setAttribute("aria-label", `移除标签 ${tag}`);
+          removeButton.addEventListener("click", () => {
+            if (busy) return;
+            tags.splice(tags.indexOf(tag), 1);
+            renderTags();
+            focusFriendNoteControl(tagInput);
+          });
+          item.append(createElement("span", tag), removeButton);
+          tagList.append(item);
+        }
+      }
+
+      // Returns false only when pending input was rejected, so a save never
+      // silently drops a tag the user had typed but not yet added.
+      function addPendingTag() {
+        const tag = normalizeFriendNoteTag(String(tagInput.value));
+        if (tag === "") {
+          tagInput.value = "";
+          return true;
+        }
+        if (tag.length > FRIEND_NOTE_TAG_MAX_LENGTH) {
+          setStatus(friendNoteFailureText(friendNoteInvalid("TAG_TOO_LONG")), "wfr-error");
+          return false;
+        }
+        if (tags.includes(tag)) {
+          tagInput.value = "";
+          setStatus("已经有相同的标签。");
+          return true;
+        }
+        if (tags.length >= FRIEND_NOTE_MAX_TAGS) {
+          setStatus(friendNoteFailureText(friendNoteInvalid("TOO_MANY_TAGS")), "wfr-error");
+          return false;
+        }
+        tags.push(tag);
+        tagInput.value = "";
+        renderTags();
+        setStatus("");
+        return true;
+      }
+
+      const actions = createElement(
+        "div",
+        null,
+        "wfr-actions wfr-compact-actions"
+      );
+      const saveButton = createFriendNoteButton("保存", "wfr-button wfr-primary");
+      const cancelButton = createFriendNoteButton("取消");
+      actions.append(saveButton, cancelButton);
+
+      function setControlsDisabled(disabled) {
+        for (const control of [
+          textarea,
+          tagInput,
+          addTagButton,
+          saveButton,
+          cancelButton,
+        ]) {
+          control.disabled = disabled;
+        }
+      }
+
+      function showConflict(current) {
+        clearFriendNoteNode(conflictSlot);
+        const box = createElement("div", null, "wfr-note-conflict");
+        box.append(
+          createElement(
+            "p",
+            "此档案在你编辑期间已被其他标签页修改，你的内容尚未保存，仍保留在下方。",
+            "wfr-error"
+          ),
+          createElement("p", "目前已保存的版本：", "wfr-muted")
+        );
+        if (current === null) {
+          box.append(createElement("p", "（档案已被删除）", "wfr-muted"));
+        } else {
+          appendFriendNoteRecord(box, current);
+        }
+        const conflictActions = createElement(
+          "div",
+          null,
+          "wfr-actions wfr-compact-actions"
+        );
+        const useSaved = createFriendNoteButton("放弃我的修改，使用已保存的版本");
+        const overwrite = createFriendNoteButton("用我的内容覆盖");
+        useSaved.addEventListener("click", () => {
+          if (busy) return;
+          adopt(current);
+          renderView(true);
+          setStatus("已载入已保存的版本。");
+        });
+        // An explicit decision made after seeing the other version: the edit is
+        // re-based on exactly that version, so a third change is still detected.
+        overwrite.addEventListener("click", () => {
+          if (busy) return;
+          adopt(current);
+          clearFriendNoteNode(conflictSlot);
+          void submit();
+        });
+        conflictActions.append(useSaved, overwrite);
+        box.append(conflictActions);
+        conflictSlot.append(box);
+        focusFriendNoteControl(useSaved);
+      }
+
+      async function submit() {
+        if (busy || !addPendingTag()) return;
+        const draft = { note: String(textarea.value), tags: [...tags] };
+        const checked = validateFriendNoteDraft(draft);
+        if (!checked.ok) {
+          setStatus(friendNoteFailureText(checked), "wfr-error");
+          return;
+        }
+        if (checked.note === "" && checked.tags.length === 0) {
+          setStatus(
+            record === null
+              ? "请先写下备注或添加标签。"
+              : "备注和标签都为空。如需移除此档案，请取消后使用“删除档案”。",
+            "wfr-error"
+          );
+          return;
+        }
+        const blocked = saveBlockedText();
+        if (blocked) {
+          setStatus(`${blocked}你的输入仍保留在这里。`, "wfr-error");
+          return;
+        }
+        busy = true;
+        setControlsDisabled(true);
+        setStatus("正在保存…");
+        const result = await attemptSave(draft);
+        busy = false;
+        if (result.ok) {
+          adopt(result.record);
+          renderView(true);
+          setStatus("已保存。", "wfr-success");
+          if (result.changed) notifySaved(result.record);
+          return;
+        }
+        setControlsDisabled(false);
+        if (result.failureKind === "FRIEND_NOTE_CONFLICT") {
+          setStatus("保存未完成：检测到其他标签页的修改。", "wfr-error");
+          showConflict(result.current);
+          return;
+        }
+        setStatus(
+          `${friendNoteFailureText(result)}你的输入仍保留在这里。`,
+          "wfr-error"
+        );
+      }
+
+      // The view returned to is the stored version, which may be newer than the
+      // one this edit started from if another view saved in the meantime.
+      function cancel() {
+        if (busy) return;
+        const fresh = loadFriendNotesState(ownerUid);
+        if (fresh.ok) {
+          adopt(
+            hasOwn(fresh.state.notes, subjectUid)
+              ? fresh.state.notes[subjectUid]
+              : null
+          );
+        }
+        renderView(true);
+        setStatus("");
+      }
+
+      tagInput.addEventListener("keydown", (event) => {
+        if (isFriendNoteImeKeyEvent(event)) return;
+        if (event && event.key === "Enter") {
+          if (typeof event.preventDefault === "function") event.preventDefault();
+          addPendingTag();
+        }
+      });
+      addTagButton.addEventListener("click", () => {
+        if (normalizeFriendNoteTag(String(tagInput.value)) === "") {
+          setStatus("请先输入标签内容。");
+        } else {
+          addPendingTag();
+        }
+        focusFriendNoteControl(tagInput);
+      });
+      textarea.addEventListener("keydown", (event) => {
+        if (isFriendNoteImeKeyEvent(event)) return;
+        if (event && event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+          if (typeof event.preventDefault === "function") event.preventDefault();
+          void submit();
+        }
+      });
+      saveButton.addEventListener("click", () => void submit());
+      cancelButton.addEventListener("click", cancel);
+
+      renderTags();
+      content.append(
+        conflictSlot,
+        noteLabel,
+        textarea,
+        counter,
+        tagLabel,
+        tagList,
+        tagRow,
+        tagHint,
+        actions
+      );
+      focusFriendNoteControl(textarea);
+    }
+
+    function renderDeleteConfirm() {
+      if (busy || record === null) return;
+      mode = "confirm-delete";
+      clearFriendNoteNode(content);
+      appendFriendNoteRecord(content, record);
+      const confirmation = createElement("div", null, "wfr-removal-confirm");
+      confirmation.append(
+        createElement(
+          "p",
+          "删除这条友人档案？手写的备注和标签会从本浏览器移除，无法撤销；Toolkit 的关系记录不受影响。"
+        )
+      );
+      const actions = createElement(
+        "div",
+        null,
+        "wfr-actions wfr-compact-actions"
+      );
+      const cancelButton = createFriendNoteButton("取消");
+      const confirmButton = createFriendNoteButton(
+        "确认删除",
+        "wfr-button wfr-danger"
+      );
+      cancelButton.addEventListener("click", () => {
+        if (busy) return;
+        renderView(true);
+        setStatus("");
+      });
+      confirmButton.addEventListener("click", async () => {
+        if (busy) return;
+        const blocked = saveBlockedText();
+        if (blocked) {
+          setStatus(blocked, "wfr-error");
+          return;
+        }
+        busy = true;
+        cancelButton.disabled = true;
+        confirmButton.disabled = true;
+        setStatus("正在删除…");
+        const result = await attemptSave({ note: "", tags: [] });
+        busy = false;
+        if (result.ok) {
+          adopt(null);
+          renderView(true);
+          setStatus("档案已删除。", "wfr-success");
+          if (result.changed) notifySaved(null);
+          return;
+        }
+        if (result.failureKind === "FRIEND_NOTE_CONFLICT") {
+          adopt(result.current);
+          renderView(true);
+          setStatus(
+            result.current === null
+              ? "此档案已在其他标签页被删除。"
+              : "此档案刚被其他标签页修改，未删除。已显示最新内容。",
+            "wfr-error"
+          );
+          return;
+        }
+        renderView(true);
+        setStatus(friendNoteFailureText(result), "wfr-error");
+      });
+      actions.append(cancelButton, confirmButton);
+      confirmation.append(actions);
+      content.append(confirmation);
+      focusFriendNoteControl(cancelButton);
+    }
+
+    renderView(false);
+    if (options.startInEdit) beginEdit();
+    return handle;
+  }
+
+  function loadFriendNoteSubjectView(ownerUid, subjectUid) {
+    const notes = loadFriendNotesState(ownerUid);
+    const friend = loadState(ownerUid);
+    const follower = loadFollowerState(ownerUid);
+    return {
+      notes,
+      friend,
+      follower,
+      facts: deriveProfileLocalFacts(
+        subjectUid,
+        friend.ok ? friend.state : null,
+        follower.ok ? follower.state : null
+      ),
+    };
+  }
+
+  function appendFriendNotesUnreadable(body, failure) {
+    body.append(
+      createElement("p", friendNoteFailureText(failure), "wfr-error"),
+      createElement(
+        "p",
+        "在数据恢复可读之前，友人档案无法查看或保存。可以通过“恢复备份”用包含友人档案的备份替换它。",
+        "wfr-muted"
+      )
+    );
+    if (failure.reason) addLine(body, "原因", failure.reason);
+  }
+
+  // The other-user profile currently open in this tab, if it can be identified
+  // from the route alone. Used to offer a note without any relationship baseline.
+  function friendNoteRouteSubject(ownerUid) {
+    const targetUid = resolveProfileRouteTargetUid();
+    return targetUid !== null && targetUid !== ownerUid ? targetUid : null;
+  }
+
+  function showFriendNotesManager(viewState) {
+    // Search text and tag filter survive a round trip through a detail view.
+    const view = viewState || { query: "", tag: null };
+    const owner = determineCurrentUid();
+    if (!owner.ok) {
+      showFailure("友人档案", owner);
+      return;
+    }
+    const ownerUid = owner.uid;
+    const loaded = loadFriendNotesState(ownerUid);
+    const body = showPanel("友人档案", true);
+    if (!loaded.ok) {
+      appendFriendNotesUnreadable(body, loaded);
+      return;
+    }
+    const friend = loadState(ownerUid);
+    const follower = loadFollowerState(ownerUid);
+    const entries = deriveFriendNoteEntries(
+      loaded.state,
+      friend.ok ? friend.state : null,
+      follower.ok ? follower.state : null
+    );
+
+    body.append(
+      createElement(
+        "p",
+        "备注和标签由你手写，按账号 UID 保存在当前浏览器；昵称和关系记录来自 Toolkit 的本地观察，可能不是最新状态。",
+        "wfr-muted"
+      )
+    );
+    if (!friend.ok || !follower.ok) {
+      body.append(
+        createElement(
+          "p",
+          "部分关系雷达或粉丝快照本地数据无法读取，昵称记录可能缺失；手写档案不受影响。",
+          "wfr-muted"
+        )
+      );
+    }
+
+    const routeSubject = friendNoteRouteSubject(ownerUid);
+    if (routeSubject !== null) {
+      const routeActions = createElement("div", null, "wfr-actions");
+      const routeButton = createFriendNoteButton(
+        hasOwn(loaded.state.notes, routeSubject)
+          ? `查看当前主页的档案（UID ${routeSubject}）`
+          : `为当前主页写档案（UID ${routeSubject}）`,
+        "wfr-button wfr-primary"
+      );
+      routeButton.addEventListener("click", () =>
+        showFriendNoteDetail(ownerUid, routeSubject, view)
+      );
+      routeActions.append(routeButton);
+      body.append(routeActions);
+    }
+
+    if (entries.length === 0) {
+      body.append(
+        createElement("h3", "还没有友人档案"),
+        createElement(
+          "p",
+          "打开某个人的微博主页（地址形如 weibo.com/u/数字 UID），再回到这里点“为当前主页写档案”，就可以写下备注并添加标签。不需要先更新关系雷达或粉丝快照。"
+        ),
+        createElement(
+          "p",
+          "也可以在“浏览体验 → 增强”中开启“在主页显示友人档案”，之后直接在对方主页上查看和编辑。",
+          "wfr-muted"
+        )
+      );
+      const emptyActions = createElement("div", null, "wfr-actions");
+      const settingsButton = createFriendNoteButton("打开浏览体验设置");
+      settingsButton.addEventListener("click", showPageSettings);
+      emptyActions.append(settingsButton);
+      body.append(emptyActions);
+      return;
+    }
+
+    const tagCounts = collectFriendNoteTags(entries);
+    if (view.tag !== null && !tagCounts.some(([tag]) => tag === view.tag)) {
+      view.tag = null;
+    }
+
+    const search = createElement("input", null, "wfr-search");
+    search.type = "search";
+    search.placeholder = "搜索昵称、历史昵称、UID、备注或标签";
+    search.setAttribute("aria-label", "搜索友人档案");
+    search.value = view.query;
+    body.append(search);
+
+    const filterRow = createElement("label", "标签筛选：", "wfr-row");
+    const tagSelect = createElement("select", null, "wfr-select");
+    tagSelect.setAttribute("aria-label", "按标签筛选");
+    const allOption = createElement("option", "全部标签");
+    allOption.value = "";
+    tagSelect.append(allOption);
+    for (const [tag, count] of tagCounts) {
+      const option = createElement("option", `${tag}（${count}）`);
+      option.value = tag;
+      option.selected = tag === view.tag;
+      tagSelect.append(option);
+    }
+    tagSelect.value = view.tag === null ? "" : view.tag;
+    filterRow.append(tagSelect);
+    body.append(filterRow);
+
+    const summary = createElement("p", "", "wfr-muted");
+    summary.setAttribute("role", "status");
+    summary.setAttribute("aria-live", "polite");
+    const list = createElement("div", null, "wfr-event-list");
+    const moreActions = createElement("div", null, "wfr-actions");
+    const moreButton = createFriendNoteButton("加载更多");
+    moreActions.append(moreButton);
+    body.append(summary, list, moreActions);
+
+    let matching = [];
+    let shown = 0;
+
+    function buildCard(entry) {
+      const item = createElement("article", null, "wfr-event");
+      item.append(createElement("h3", entry.displayName));
+      item.append(
+        createElement(
+          "p",
+          entry.facts.currentName === null
+            ? `UID ${entry.uid} · 暂无本地昵称记录`
+            : `UID ${entry.uid}`,
+          "wfr-muted wfr-row"
+        )
+      );
+      const needle = view.query.trim().toLowerCase();
+      const matchedOldNames =
+        needle === ""
+          ? []
+          : entry.facts.historicalNames.filter((name) =>
+              name.toLowerCase().includes(needle)
+            );
+      if (matchedOldNames.length > 0) {
+        item.append(
+          createElement(
+            "p",
+            `本地记录过的昵称：${matchedOldNames.join("、")}`,
+            "wfr-muted wfr-row"
+          )
+        );
+      }
+      item.append(
+        entry.record.note === ""
+          ? createElement("p", "（未写备注，仅有标签）", "wfr-muted")
+          : createElement("p", entry.record.note, "wfr-note-preview")
+      );
+      if (entry.record.tags.length > 0) {
+        item.append(buildFriendNoteTagList(entry.record.tags));
+      }
+      const actions = createElement("div", null, "wfr-actions");
+      const openButton = createFriendNoteButton("查看与编辑");
+      openButton.addEventListener("click", () =>
+        showFriendNoteDetail(ownerUid, entry.uid, view)
+      );
+      actions.append(openButton, createFriendNoteProfileLink(entry.uid));
+      item.append(actions);
+      return item;
+    }
+
+    function renderMore() {
+      const next = matching.slice(shown, shown + FRIEND_NOTES_PAGE_SIZE);
+      for (const entry of next) list.append(buildCard(entry));
+      shown += next.length;
+      const remaining = matching.length - shown;
+      moreActions.hidden = remaining <= 0;
+      moreButton.textContent = `加载更多（还有 ${remaining} 条）`;
+    }
+
+    function renderList() {
+      clearFriendNoteNode(list);
+      matching = filterFriendNoteEntries(entries, view.query, view.tag);
+      shown = 0;
+      summary.textContent =
+        matching.length === entries.length
+          ? `共 ${entries.length} 条档案`
+          : `共 ${entries.length} 条档案，匹配 ${matching.length} 条`;
+      if (matching.length === 0) {
+        list.append(createElement("p", "没有匹配的档案", "wfr-muted"));
+      }
+      renderMore();
+    }
+
+    search.addEventListener("input", () => {
+      view.query = String(search.value || "");
+      renderList();
+    });
+    tagSelect.addEventListener("change", () => {
+      view.tag = tagSelect.value === "" ? null : String(tagSelect.value);
+      renderList();
+    });
+    moreButton.addEventListener("click", renderMore);
+    renderList();
+  }
+
+  function showFriendNoteDetail(ownerUid, subjectUid, viewState) {
+    const backToManager = () => showFriendNotesManager(viewState);
+    const owner = determineCurrentUid();
+    if (!owner.ok || owner.uid !== ownerUid) {
+      showFailure("友人档案", { failureKind: "UID_UNAVAILABLE" });
+      return;
+    }
+    const subject = loadFriendNoteSubjectView(ownerUid, subjectUid);
+    const displayName =
+      subject.facts.currentName === null ? subjectUid : subject.facts.currentName;
+    const body = showPanel(`${displayName} · 友人档案`, backToManager);
+    if (!subject.notes.ok) {
+      appendFriendNotesUnreadable(body, subject.notes);
+      return;
+    }
+    addLine(body, "UID", subjectUid);
+    const linkActions = createElement(
+      "div",
+      null,
+      "wfr-actions wfr-compact-actions"
+    );
+    linkActions.append(createFriendNoteProfileLink(subjectUid));
+    body.append(linkActions);
+
+    body.append(createElement("h3", "我的备注与标签（手写）"));
+    const editor = buildFriendNoteEditor({
+      ownerUid,
+      subjectUid,
+      record: hasOwn(subject.notes.state.notes, subjectUid)
+        ? subject.notes.state.notes[subjectUid]
+        : null,
+      compact: false,
+      onSaved: syncFriendNoteViews,
+    });
+    friendNoteDetailView = { ownerUid, subjectUid, editor };
+    body.append(editor.root);
+
+    body.append(createElement("h3", "Toolkit 本地观察记录"));
+    const rows = friendNoteObservedRows(subject.facts);
+    if (rows.length === 0) {
+      body.append(
+        createElement(
+          "p",
+          "Toolkit 尚未在关系雷达或粉丝快照中记录过此账号，这里只显示 UID。",
+          "wfr-muted"
+        )
+      );
+    }
+    for (const row of rows) addLine(body, row.label, row.value);
+    body.append(
+      createElement(
+        "p",
+        "以上仅为 Toolkit 实际记录过的内容和记录时间，之后的变化不会体现在这里。",
+        "wfr-muted"
+      )
+    );
+    if (subject.friend.ok) {
+      const eventCount = eventsForSubject(
+        subject.friend.state.events,
+        subjectUid
+      ).length;
+      const timelineActions = createElement("div", null, "wfr-actions");
+      const timelineButton = createFriendNoteButton(
+        `查看关系时间线（${eventCount} 条本地事件）`
+      );
+      timelineButton.addEventListener("click", () =>
+        showTimeline(ownerUid, subject.friend.state, subjectUid, () =>
+          showFriendNoteDetail(ownerUid, subjectUid, viewState)
+        )
+      );
+      timelineActions.append(timelineButton);
+      body.append(timelineActions);
+    }
+  }
+
+  function removeProfileFriendNotesNode() {
+    const context = profileFriendNotesContext;
+    if (context && context.root && context.root.parentNode) {
+      context.root.parentNode.removeChild(context.root);
+    }
+    if (typeof document.getElementById !== "function") return;
+    const stray = document.getElementById(PROFILE_FRIEND_NOTES_ID);
+    if (stray && stray.parentNode) stray.parentNode.removeChild(stray);
+  }
+
+  function disconnectProfileFriendNotesObserver() {
+    if (profileFriendNotesObserver) profileFriendNotesObserver.disconnect();
+    profileFriendNotesObserver = null;
+    profileFriendNotesObservedMain = null;
+    profileFriendNotesObservedHost = null;
+  }
+
+  function cancelProfileFriendNotesDiscovery() {
+    if (profileFriendNotesDiscoveryTimer !== null) {
+      clearTimeout(profileFriendNotesDiscoveryTimer);
+      profileFriendNotesDiscoveryTimer = null;
+    }
+    profileFriendNotesDiscoveryCount = 0;
+  }
+
+  // Dropping the context drops the panel and every listener attached inside it;
+  // the panel never registers anything on document or window.
+  function teardownProfileFriendNotes() {
+    disconnectProfileFriendNotesObserver();
+    cancelProfileFriendNotesDiscovery();
+    removeProfileFriendNotesNode();
+    profileFriendNotesContext = null;
+  }
+
+  function scheduleProfileFriendNotesEnsure() {
+    if (profileFriendNotesEnsureScheduled) return;
+    profileFriendNotesEnsureScheduled = true;
+    setTimeout(() => {
+      profileFriendNotesEnsureScheduled = false;
+      ensureProfileFriendNotes();
+    }, 0);
+  }
+
+  function observeProfileFriendNotesHost(point) {
+    if (
+      profileFriendNotesObserver &&
+      profileFriendNotesObservedMain === point.main &&
+      profileFriendNotesObservedHost === point.host
+    ) {
+      return;
+    }
+    disconnectProfileFriendNotesObserver();
+    profileFriendNotesObserver = new MutationObserver(
+      scheduleProfileFriendNotesEnsure
+    );
+    profileFriendNotesObserver.observe(point.main, { childList: true });
+    if (point.host !== point.main) {
+      profileFriendNotesObserver.observe(point.host, { childList: true });
+    }
+    profileFriendNotesObservedMain = point.main;
+    profileFriendNotesObservedHost = point.host;
+  }
+
+  function scheduleProfileFriendNotesDiscovery() {
+    if (
+      profileFriendNotesDiscoveryTimer !== null ||
+      profileFriendNotesDiscoveryCount >= 20
+    ) {
+      return;
+    }
+    profileFriendNotesDiscoveryTimer = setTimeout(() => {
+      profileFriendNotesDiscoveryTimer = null;
+      profileFriendNotesDiscoveryCount += 1;
+      ensureProfileFriendNotes();
+    }, 250);
+  }
+
+  function renderProfileFriendNotes(context) {
+    const root = createElement(
+      "section",
+      null,
+      "wfr-profile-notes wfr-root"
+    );
+    root.id = PROFILE_FRIEND_NOTES_ID;
+    root.setAttribute("aria-label", "友人档案（Weibo Toolkit 本地）");
+    applyThemeToRoot(root);
+    const head = createElement("p", null, "wfr-profile-notes-head");
+    head.append(
+      createElement("strong", "友人档案"),
+      createElement("span", "你手写的内容，仅保存在本浏览器", "wfr-muted")
+    );
+    root.append(head);
+
+    if (context.ownerUid === null) {
+      root.append(
+        createElement(
+          "p",
+          "无法可靠识别当前登录账号，友人档案已禁用查看和保存。",
+          "wfr-error"
+        )
+      );
+      return root;
+    }
+    const subject = loadFriendNoteSubjectView(
+      context.ownerUid,
+      context.targetUid
+    );
+    if (!subject.notes.ok) {
+      root.append(
+        createElement(
+          "p",
+          `${friendNoteFailureText(subject.notes)}保存已禁用。`,
+          "wfr-error"
+        )
+      );
+      return root;
+    }
+    context.editor = buildFriendNoteEditor({
+      ownerUid: context.ownerUid,
+      subjectUid: context.targetUid,
+      record: hasOwn(subject.notes.state.notes, context.targetUid)
+        ? subject.notes.state.notes[context.targetUid]
+        : null,
+      compact: true,
+      // The panel is bound to one owner and one target for its whole life. A
+      // save is refused once this tab is no longer showing that target.
+      guard: () =>
+        profileFriendNotesContext === context &&
+        resolveProfileRouteTargetUid() === context.targetUid
+          ? null
+          : "当前页面已不是该账号的主页，未保存。",
+      onSaved: syncFriendNoteViews,
+    });
+    root.append(context.editor.root);
+
+    // Profile Extras already shows these observed facts when it is enabled, so
+    // they are rendered here only when it is not.
+    if (!pageCleanupPreferences.showProfileExtras) {
+      const rows = friendNoteObservedRows(subject.facts);
+      if (rows.length > 0) {
+        const observed = createElement(
+          "div",
+          null,
+          "wfr-profile-notes-observed"
+        );
+        observed.append(
+          createElement(
+            "p",
+            "Toolkit 本地观察记录（非实时）",
+            "wfr-profile-notes-subhead"
+          )
+        );
+        for (const row of rows) {
+          addProfileLine(observed, row.label, row.value, row.exactTime);
+        }
+        root.append(observed);
+      }
+    }
+    if (subject.friend.ok) {
+      const eventCount = eventsForSubject(
+        subject.friend.state.events,
+        context.targetUid
+      ).length;
+      if (eventCount > 0) {
+        const actions = createElement(
+          "div",
+          null,
+          "wfr-actions wfr-compact-actions"
+        );
+        const timelineButton = createFriendNoteButton(
+          `关系时间线（${eventCount} 条本地事件）`
+        );
+        timelineButton.addEventListener("click", () =>
+          showTimeline(
+            context.ownerUid,
+            subject.friend.state,
+            context.targetUid,
+            () =>
+              showFriendNoteDetail(context.ownerUid, context.targetUid, null)
+          )
+        );
+        actions.append(timelineButton);
+        root.append(actions);
+      }
+    }
+    return root;
+  }
+
+  // Shows the panel for exactly the profile this tab is on. It reads local state
+  // only: no request is sent, no visit is recorded, and Weibo's own nodes are
+  // left untouched apart from one inserted sibling.
+  function ensureProfileFriendNotes() {
+    if (!pageCleanupPreferences.showProfileFriendNotes) {
+      teardownProfileFriendNotes();
+      return false;
+    }
+    const targetUid = resolveProfileRouteTargetUid();
+    const owner = determineCurrentUid();
+    if (targetUid === null || (owner.ok && owner.uid === targetUid)) {
+      teardownProfileFriendNotes();
+      return false;
+    }
+    const ownerUid = owner.ok ? owner.uid : null;
+    if (
+      profileFriendNotesContext === null ||
+      profileFriendNotesContext.ownerUid !== ownerUid ||
+      profileFriendNotesContext.targetUid !== targetUid
+    ) {
+      teardownProfileFriendNotes();
+      profileFriendNotesContext = {
+        ownerUid,
+        targetUid,
+        root: null,
+        editor: null,
+      };
+    }
+    const context = profileFriendNotesContext;
+
+    const point = findProfileExtrasInsertionPoint();
+    if (!point) {
+      disconnectProfileFriendNotesObserver();
+      scheduleProfileFriendNotesDiscovery();
+      return false;
+    }
+    cancelProfileFriendNotesDiscovery();
+    // The same node is re-attached if Weibo re-renders around it, so text being
+    // edited survives a host refresh on the same profile.
+    if (context.root === null) context.root = renderProfileFriendNotes(context);
+    if (context.root.parentNode !== point.host) {
+      point.host.insertBefore(context.root, point.before);
+    }
+    observeProfileFriendNotesHost(point);
+    return true;
+  }
+
+  function rebuildProfileFriendNotes() {
+    teardownProfileFriendNotes();
+    return ensureProfileFriendNotes();
+  }
+
+  // Friend Notes in the feed: a small entry beside the outer author of a Home or
+  // Latest card, and one card-sized popover that reuses the Friend Notes editor.
+  // Nothing new is stored: the entry state is derived from the existing notes
+  // and relationship states, and the page's own nickname is only ever compared
+  // with them, never recorded.
+  const SHOW_FEED_FRIEND_NOTES_KEY =
+    "weiboToolkit.page.showFeedFriendNotes.v1";
+  const FEED_FRIEND_NOTE_CARD_ID = "wfr-feed-note-card";
+  const FEED_FRIEND_NOTE_HAS_CLASS = "wfr-feed-note-has";
+
+  // { ownerUid, data, entries: Map<card node, entry>, stale }. data is null when
+  // the notes cannot be read, in which case no entry is shown at all.
+  let feedFriendNotes = null;
+  // { ownerUid, subjectUid, editor, root, notice, entry, onKeydown, ... }
+  let feedFriendNoteCard = null;
+
+  function feedFriendNotesActiveForRoute() {
+    return Boolean(
+      pageCleanupPreferences.showFeedFriendNotes && isPageEnhancementFeedRoute()
+    );
+  }
+
+  function feedLinkPath(link) {
+    const attribute =
+      typeof link.getAttribute === "function" ? link.getAttribute("href") : null;
+    const href =
+      typeof attribute === "string" && attribute !== "" ? attribute : link.href;
+    if (typeof href !== "string" || href === "") return null;
+    try {
+      const url = new URL(href, WEIBO_MAIN_ORIGIN);
+      return url.origin === WEIBO_MAIN_ORIGIN ? url.pathname : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Who wrote the outer post of this card, or null when the page does not prove
+  // it. Only links inside the resolved outer header are evidence, so a reposted
+  // author, a mention in the body and a commenter can never be candidates.
+  //
+  // The post's own permalink, /<UID>/<post id>, is required: it names the author
+  // of exactly this post. Every /u/<UID> profile link in the same header must
+  // agree with it, and all permalinks must agree with each other; any
+  // disagreement skips the card. The post id segment is never read as a UID,
+  // nicknames are never matched, and a custom-domain profile link is simply not
+  // evidence.
+  //
+  // pageName is the header's own text for a /u/<UID> link of that author, used
+  // for display and comparison only; it is null when absent or ambiguous.
+  function resolveFeedAuthorIdentity(card) {
+    const header = resolvePageFeedPromotionHeader(card);
+    if (!header || typeof header.querySelectorAll !== "function") return null;
+    let uid = null;
+    let anchor = null;
+    const profileLinks = [];
+    for (const link of header.querySelectorAll("a")) {
+      const path = feedLinkPath(link);
+      if (path === null) continue;
+      const profile = /^\/u\/([1-9]\d*)\/?$/.exec(path);
+      if (profile) {
+        profileLinks.push({ uid: profile[1], link });
+        continue;
+      }
+      const post = /^\/([1-9]\d*)\/[A-Za-z0-9]+\/?$/.exec(path);
+      if (!post) continue;
+      if (uid !== null && uid !== post[1]) return null;
+      if (uid === null) {
+        uid = post[1];
+        anchor = link;
+      }
+    }
+    if (uid === null || normalizeStableUid(uid) !== uid || !anchor.parentNode) {
+      return null;
+    }
+    if (profileLinks.some((candidate) => candidate.uid !== uid)) return null;
+    const names = new Set();
+    for (const candidate of profileLinks) {
+      const text = normalizeLatestRecommendedBadgeText(
+        candidate.link.textContent
+      );
+      if (text !== "") names.add(text);
+    }
+    // A pure repost can render its author as a usercard span rather than a
+    // profile link. This identifies the display node only: the permalink and
+    // matching numeric profile links above still establish the author UID.
+    const nameSpans = Array.from(header.querySelectorAll("span")).filter(
+      (span) => {
+        const text = normalizeLatestRecommendedBadgeText(span.textContent);
+        return (
+          text !== "" &&
+          span.getAttribute("title") === text &&
+          span.getAttribute("usercard") === `name=@${text}`
+        );
+      }
+    );
+    const nameSpan = nameSpans.length === 1 ? nameSpans[0] : null;
+    return {
+      uid,
+      anchor,
+      // Several links can name the same verified author with different text
+      // (for example the nickname and a repost label). That makes pageName
+      // ambiguous, but does not invalidate the first text-bearing author link
+      // as an insertion point. UID conflicts were already rejected above.
+      entryAnchor:
+        (nameSpan &&
+          (nearestAncestorTagBefore(nameSpan, header, "A") || nameSpan)) ||
+        profileLinks.find(
+          (candidate) =>
+            normalizeLatestRecommendedBadgeText(candidate.link.textContent) !== ""
+        )?.link || anchor,
+      header,
+      pageName: nameSpan
+        ? normalizeLatestRecommendedBadgeText(nameSpan.textContent)
+        : names.size === 1 ? [...names][0] : null,
+    };
+  }
+
+  // Names Toolkit has actually recorded for this UID that differ from the name
+  // the page shows now, most recently recorded first. A difference is only a
+  // difference: it is never reported as a confirmed rename, and the page name
+  // is never added to the evidence.
+  function feedRecordedOtherNames(pageName, facts) {
+    if (typeof pageName !== "string" || pageName === "") return [];
+    const recorded = [];
+    if (facts.currentName !== null) recorded.push(facts.currentName);
+    recorded.push(...[...facts.historicalNames].reverse());
+    return recorded.filter(
+      (name, index) => name !== pageName && recorded.indexOf(name) === index
+    );
+  }
+
+  function feedNicknameHintText(pageName, facts) {
+    const names = feedRecordedOtherNames(pageName, facts);
+    if (names.length === 0) return "";
+    return names.length === 1
+      ? `本地曾记录为：${names[0]}`
+      : `本地曾记录为：${names[0]} 等 ${names.length} 个`;
+  }
+
+  // One read of each state per activation, shared by every card. The verified
+  // notes map and the per-UID derived facts are reused until the data is
+  // reloaded as a whole.
+  function loadFeedFriendNotesData(ownerUid) {
+    const notes = loadFriendNotesState(ownerUid);
+    if (!notes.ok) return null;
+    const friend = loadState(ownerUid);
+    const follower = loadFollowerState(ownerUid);
+    return {
+      notes: notes.state.notes,
+      friendState: friend.ok ? friend.state : null,
+      followerState: follower.ok ? follower.state : null,
+      factsByUid: new Map(),
+    };
+  }
+
+  function feedFriendNoteFacts(uid) {
+    const data = feedFriendNotes.data;
+    if (!data.factsByUid.has(uid)) {
+      data.factsByUid.set(
+        uid,
+        deriveProfileLocalFacts(uid, data.friendState, data.followerState)
+      );
+    }
+    return data.factsByUid.get(uid);
+  }
+
+  function reloadFeedFriendNotesData() {
+    const runtime = feedFriendNotes;
+    if (runtime === null) return;
+    runtime.data = loadFeedFriendNotesData(runtime.ownerUid);
+    runtime.stale = false;
+    if (runtime.data === null) {
+      clearFeedFriendNoteEntries();
+      return;
+    }
+    for (const entry of runtime.entries.values()) {
+      renderFeedFriendNoteEntry(entry, entry.pageName);
+    }
+    flushFeedFriendNoteFits();
+  }
+
+  // Relationship data can change while the Toolkit panel is open or when an
+  // automatic update finishes. The cache is only flagged here and re-read by
+  // the next reconcile, once no panel is open.
+  function markFeedFriendNotesStale() {
+    if (feedFriendNotes === null) return;
+    feedFriendNotes.stale = true;
+    schedulePageFeedReconcile();
+  }
+
+  // Decides whether the feed entries are active for this reconcile and keeps the
+  // runtime in step with the option, the route and the logged-in owner.
+  function syncFeedFriendNotes() {
+    if (!feedFriendNotesActiveForRoute()) {
+      teardownFeedFriendNotes();
+      return false;
+    }
+    const owner = determineCurrentUid();
+    if (!owner.ok) {
+      teardownFeedFriendNotes();
+      return false;
+    }
+    if (feedFriendNotes !== null && feedFriendNotes.ownerUid !== owner.uid) {
+      teardownFeedFriendNotes();
+    }
+    if (feedFriendNotes === null) {
+      feedFriendNotes = {
+        ownerUid: owner.uid,
+        data: loadFeedFriendNotesData(owner.uid),
+        entries: new Map(),
+        pendingFit: new Set(),
+        stale: false,
+      };
+      if (
+        typeof window !== "undefined" &&
+        typeof window.addEventListener === "function"
+      ) {
+        window.addEventListener("resize", refitFeedFriendNoteEntries);
+      }
+    } else if (feedFriendNotes.stale && panelRoot === null) {
+      reloadFeedFriendNotesData();
+    }
+    return feedFriendNotes.data !== null;
+  }
+
+  // Writes only when what should be shown has changed, so reconciling an
+  // unchanged card touches nothing.
+  function renderFeedFriendNoteEntry(entry, pageName) {
+    const data = feedFriendNotes.data;
+    const hasNote = hasOwn(data.notes, entry.uid);
+    const hint = feedNicknameHintText(pageName, feedFriendNoteFacts(entry.uid));
+    const signature = JSON.stringify([hasNote, pageName, hint]);
+    entry.pageName = pageName;
+    if (entry.signature === signature) return;
+    entry.signature = signature;
+    const who = pageName === null ? "这位作者" : pageName;
+    entry.hasNote = hasNote;
+    entry.button.textContent = feedFriendNoteEntryText(entry);
+    setToolkitClass(entry.button, FEED_FRIEND_NOTE_HAS_CLASS, hasNote);
+    entry.button.setAttribute(
+      "aria-label",
+      hasNote
+        ? `友人档案：已为${who}写过备注，打开查看${hint === "" ? "" : `；${hint}`}`
+        : `友人档案：为${who}写备注${hint === "" ? "" : `；${hint}`}`
+    );
+    entry.button.setAttribute(
+      "title",
+      hasNote ? "查看友人档案" : "为这位作者写备注"
+    );
+    entry.hintText = hint;
+    entry.hint.textContent = hint;
+    entry.hint.hidden = hint === "";
+    feedFriendNotes.pendingFit.add(entry);
+  }
+
+  // How much of the entry fits. room is the width left in the post header
+  // after everything before the entry and after Weibo's own content that
+  // follows it in the same row, so Toolkit's addition neither runs past the
+  // header nor pushes native text out. The hint gives way first; if even the
+  // button does not fit, it shrinks to a single character. Whatever is not
+  // shown inline stays in the entry's spoken label and in the card.
+  function feedEntryLayout(room, buttonWidth, hasHint) {
+    const compact = room < buttonWidth;
+    const hintRoom = Math.floor(room - buttonWidth - 6);
+    return {
+      compact,
+      hintWidth:
+        !hasHint || compact || hintRoom < 48 ? 0 : Math.min(hintRoom, 216),
+    };
+  }
+
+  function feedFriendNoteEntryText(entry) {
+    if (entry.compact) return entry.hasNote ? "备" : "写";
+    return entry.hasNote ? "有备注" : "写备注";
+  }
+
+  // Entries are measured only after their content changed or the window was
+  // resized, never on an unchanged pass, and all pending measurements are read
+  // before any of them is applied.
+  function flushFeedFriendNoteFits() {
+    const runtime = feedFriendNotes;
+    if (runtime === null || runtime.pendingFit.size === 0) return;
+    const pending = [...runtime.pendingFit].filter((entry) => entry.active);
+    runtime.pendingFit.clear();
+    const layouts = pending.map((entry) => {
+      const header = entry.header;
+      const parent = entry.wrapper.parentNode;
+      if (
+        !header ||
+        !parent ||
+        typeof header.getBoundingClientRect !== "function" ||
+        typeof entry.wrapper.getBoundingClientRect !== "function"
+      ) {
+        return null;
+      }
+      const bounds = header.getBoundingClientRect();
+      if (!(bounds.width > 0)) return null;
+      const own = entry.wrapper.getBoundingClientRect();
+      const siblings = elementChildren(parent);
+      const last = siblings[siblings.length - 1];
+      const trailing =
+        last && last !== entry.wrapper
+          ? Math.max(0, last.getBoundingClientRect().right - own.right)
+          : 0;
+      if (!entry.compact) {
+        entry.fullButtonWidth = entry.button.getBoundingClientRect().width;
+      }
+      return feedEntryLayout(
+        bounds.right - own.left - trailing,
+        entry.fullButtonWidth,
+        entry.hintText !== ""
+      );
+    });
+    pending.forEach((entry, index) => {
+      const layout = layouts[index];
+      if (layout === null) return;
+      if (entry.compact !== layout.compact) {
+        entry.compact = layout.compact;
+        entry.button.textContent = feedFriendNoteEntryText(entry);
+      }
+      const hidden = layout.hintWidth === 0;
+      const maxWidth = hidden ? "" : `${layout.hintWidth}px`;
+      if (entry.hint.hidden !== hidden) entry.hint.hidden = hidden;
+      if (entry.hint.style.maxWidth !== maxWidth) {
+        entry.hint.style.maxWidth = maxWidth;
+      }
+    });
+  }
+
+  function refitFeedFriendNoteEntries() {
+    const runtime = feedFriendNotes;
+    if (runtime === null) return;
+    for (const entry of runtime.entries.values()) runtime.pendingFit.add(entry);
+    flushFeedFriendNoteFits();
+  }
+  // An entry belongs to one owner and one author for its whole life. When a
+  // recycled node starts showing another author, the old entry is removed and
+  // marked inactive, and a new one is created; nothing is ever re-pointed.
+  function createFeedFriendNoteEntry(ownerUid, uid, card) {
+    const wrapper = createElement("span", null, "wfr-feed-note wfr-root");
+    applyThemeToRoot(wrapper);
+    const button = createFriendNoteButton("", "wfr-feed-note-entry");
+    button.setAttribute("aria-haspopup", "dialog");
+    button.setAttribute("aria-expanded", "false");
+    const hint = createElement("span", "", "wfr-feed-note-hint");
+    hint.hidden = true;
+    wrapper.append(button, hint);
+    const entry = {
+      ownerUid,
+      uid,
+      card,
+      header: null,
+      wrapper,
+      button,
+      hint,
+      hintText: "",
+      rowText: null,
+      hasNote: false,
+      compact: false,
+      fullButtonWidth: 0,
+      pageName: null,
+      signature: null,
+      active: true,
+    };
+    button.addEventListener("click", (event) => {
+      // The header itself may be a link target; the entry is not part of it.
+      if (event && typeof event.preventDefault === "function") {
+        event.preventDefault();
+      }
+      if (event && typeof event.stopPropagation === "function") {
+        event.stopPropagation();
+      }
+      // The node may already show another post while the batched pass that
+      // would re-bind it has not run yet. Nothing is opened on the strength of
+      // what the entry used to mean: the page is brought up to date instead.
+      if (!feedFriendNoteEntryIsCurrent(entry)) {
+        installLatestFeedRecommendationFilter();
+        return;
+      }
+      toggleFeedFriendNoteCard(entry);
+    });
+    return entry;
+  }
+
+  // Decided at the moment of the click, from the page as it is now: the entry
+  // must still be the one registered for its node, that node must still be in
+  // the live feed root, the option, route and owner must still hold, and the
+  // node's own header must still prove the same author UID.
+  function feedFriendNoteEntryIsCurrent(entry) {
+    const runtime = feedFriendNotes;
+    if (
+      runtime === null ||
+      runtime.data === null ||
+      !entry.active ||
+      runtime.entries.get(entry.card) !== entry ||
+      runtime.ownerUid !== entry.ownerUid ||
+      !feedFriendNotesActiveForRoute()
+    ) {
+      return false;
+    }
+    const owner = determineCurrentUid();
+    if (!owner.ok || owner.uid !== entry.ownerUid) return false;
+    const root = latestRecommendedRoot;
+    if (
+      !root ||
+      findLatestFeedRoot() !== root ||
+      !root.contains(entry.card) ||
+      !entry.card.contains(entry.wrapper) ||
+      hasClass(entry.card, LATEST_RECOMMENDED_HIDDEN_CLASS)
+    ) {
+      return false;
+    }
+    const identity = resolveFeedAuthorIdentity(entry.card);
+    return identity !== null && identity.uid === entry.uid;
+  }
+
+  function removeFeedFriendNoteEntry(card, entry) {
+    entry.active = false;
+    if (entry.wrapper.parentNode) {
+      entry.wrapper.parentNode.removeChild(entry.wrapper);
+    }
+    if (feedFriendNotes !== null) feedFriendNotes.entries.delete(card);
+    releaseFeedFriendNoteCardEntry(entry);
+  }
+
+  function reconcileFeedFriendNoteCard(card) {
+    const runtime = feedFriendNotes;
+    let entry = runtime.entries.get(card) || null;
+    const identity = hasClass(card, LATEST_RECOMMENDED_HIDDEN_CLASS)
+      ? null
+      : resolveFeedAuthorIdentity(card);
+    if (identity === null || identity.uid === runtime.ownerUid) {
+      if (entry !== null) removeFeedFriendNoteEntry(card, entry);
+      return;
+    }
+    if (entry !== null && entry.uid !== identity.uid) {
+      removeFeedFriendNoteEntry(card, entry);
+      entry = null;
+    }
+    if (entry === null) {
+      entry = createFeedFriendNoteEntry(runtime.ownerUid, identity.uid, card);
+      runtime.entries.set(card, entry);
+    }
+    entry.header = identity.header;
+    // A small entry belongs beside the verified author name. When the header
+    // has no unambiguous name link, the post permalink remains the fallback.
+    // Both are insertion points only; the permalink still proves the UID.
+    const anchor = identity.entryAnchor;
+    const parent = anchor.parentNode;
+    let remeasure = false;
+    if (
+      entry.wrapper.parentNode !== parent ||
+      anchor.nextSibling !== entry.wrapper
+    ) {
+      const next = anchor.nextSibling;
+      if (next) parent.insertBefore(entry.wrapper, next);
+      else parent.append(entry.wrapper);
+      remeasure = true;
+    }
+    // The room left for the entry depends on Weibo's own content in the same
+    // row (time, source). When that text changes, or the entry was mounted
+    // somewhere else, the entry is queued for one new measurement. Toolkit's
+    // own node is left out of the comparison, so its text and style changes
+    // can never queue it again.
+    const rowText = feedFriendNoteRowText(parent, entry.wrapper);
+    if (entry.rowText !== rowText) {
+      entry.rowText = rowText;
+      remeasure = true;
+    }
+    if (remeasure) runtime.pendingFit.add(entry);
+    renderFeedFriendNoteEntry(entry, identity.pageName);
+  }
+
+  // Reads text only; no layout is measured here.
+  function feedFriendNoteRowText(row, wrapper) {
+    let text = "";
+    for (const node of Array.from(row.childNodes)) {
+      if (node !== wrapper) text += `${node.textContent}\u0000`;
+    }
+    return text;
+  }
+
+  function pruneFeedFriendNoteEntries(root) {
+    for (const [card, entry] of [...feedFriendNotes.entries]) {
+      if (!root.contains(card)) removeFeedFriendNoteEntry(card, entry);
+    }
+    flushFeedFriendNoteFits();
+  }
+
+  function clearFeedFriendNoteEntries() {
+    if (feedFriendNotes === null) return;
+    for (const [card, entry] of [...feedFriendNotes.entries]) {
+      removeFeedFriendNoteEntry(card, entry);
+    }
+  }
+
+  // Leaving the feed, turning the option off or losing the owner removes every
+  // Toolkit node, the open card and its listeners.
+  function teardownFeedFriendNotes() {
+    clearFeedFriendNoteEntries();
+    closeFeedFriendNoteCard(false);
+    if (
+      feedFriendNotes !== null &&
+      typeof window !== "undefined" &&
+      typeof window.removeEventListener === "function"
+    ) {
+      window.removeEventListener("resize", refitFeedFriendNoteEntries);
+    }
+    feedFriendNotes = null;
+  }
+
+  function applyFeedFriendNotesTheme() {
+    if (feedFriendNotes !== null) {
+      for (const entry of feedFriendNotes.entries.values()) {
+        applyThemeToRoot(entry.wrapper);
+      }
+    }
+    if (feedFriendNoteCard !== null) applyThemeToRoot(feedFriendNoteCard.root);
+  }
+
+  // The same-tab save hook: the saved record itself is the new state, so the
+  // cache and the entries of that author are updated without reading storage.
+  function applyFeedFriendNoteSaved(ownerUid, subjectUid, record) {
+    const runtime = feedFriendNotes;
+    if (
+      runtime === null ||
+      runtime.data === null ||
+      runtime.ownerUid !== ownerUid
+    ) {
+      return;
+    }
+    const notes = { ...runtime.data.notes };
+    if (record === null) delete notes[subjectUid];
+    else notes[subjectUid] = record;
+    runtime.data.notes = notes;
+    for (const entry of runtime.entries.values()) {
+      if (entry.uid === subjectUid) {
+        renderFeedFriendNoteEntry(entry, entry.pageName);
+      }
+    }
+    flushFeedFriendNoteFits();
+  }
+
+  function setFeedFriendNoteCardNotice(card, text) {
+    card.notice.textContent = text;
+  }
+
+  const FEED_FRIEND_NOTE_CARD_MARGIN = 12;
+  const FEED_FRIEND_NOTE_CARD_DOCKED_CLASS = "wfr-feed-note-card-docked";
+
+  // Where an anchored card goes, in viewport coordinates. Below the entry if it
+  // fits, otherwise above it if that fits. Whatever was chosen is then clamped
+  // into the viewport, which is also the answer when neither side has room (the
+  // card may cover the entry) and while the entry is scrolled out of view. The
+  // card is never taller than the usable viewport (its body scrolls instead),
+  // so the clamp can always be satisfied.
+  function feedFriendNoteCardMaxHeight(viewportHeight) {
+    return Math.max(
+      120,
+      Math.min(560, viewportHeight - FEED_FRIEND_NOTE_CARD_MARGIN * 2)
+    );
+  }
+
+  function computeFeedFriendNoteCardPlacement(anchor, size, viewport) {
+    const margin = FEED_FRIEND_NOTE_CARD_MARGIN;
+    const gap = 6;
+    const maxHeight = feedFriendNoteCardMaxHeight(viewport.height);
+    const height = Math.min(size.height, maxHeight);
+    const width = Math.min(size.width, Math.max(0, viewport.width - margin * 2));
+    const lowest = Math.max(margin, viewport.height - margin - height);
+    const below = anchor.bottom + gap;
+    const above = anchor.top - gap - height;
+    const fitsBelow = below + height <= viewport.height - margin;
+    const top = !fitsBelow && above >= margin ? above : below;
+    return {
+      maxHeight,
+      left: Math.max(
+        margin,
+        Math.min(anchor.left, viewport.width - width - margin)
+      ),
+      top: Math.max(margin, Math.min(top, lowest)),
+    };
+  }
+
+  function setFeedFriendNoteCardStyle(root, property, value) {
+    if (root.style[property] !== value) root.style[property] = value;
+  }
+
+  // Runs when the card opens and whenever its size, the window or the scroll
+  // position changes; all of those listeners exist only while a card is open.
+  // An anchored card follows its entry. A card that has lost its entry is
+  // docked to the viewport instead, so its controls can never scroll away.
+  function positionFeedFriendNoteCard() {
+    const card = feedFriendNoteCard;
+    if (card === null || typeof window === "undefined") return;
+    const viewport = {
+      width: Number(window.innerWidth) || 0,
+      height: Number(window.innerHeight) || 0,
+    };
+    if (!(viewport.width > 0) || !(viewport.height > 0)) return;
+    const docked = card.entry === null;
+    setToolkitClass(card.root, FEED_FRIEND_NOTE_CARD_DOCKED_CLASS, docked);
+    if (
+      docked ||
+      typeof card.entry.button.getBoundingClientRect !== "function" ||
+      typeof card.root.getBoundingClientRect !== "function"
+    ) {
+      setFeedFriendNoteCardStyle(
+        card.root,
+        "maxHeight",
+        `${feedFriendNoteCardMaxHeight(viewport.height)}px`
+      );
+      setFeedFriendNoteCardStyle(card.root, "left", "");
+      setFeedFriendNoteCardStyle(card.root, "top", "");
+      return;
+    }
+    const placement = computeFeedFriendNoteCardPlacement(
+      card.entry.button.getBoundingClientRect(),
+      card.root.getBoundingClientRect(),
+      viewport
+    );
+    setFeedFriendNoteCardStyle(
+      card.root,
+      "maxHeight",
+      `${placement.maxHeight}px`
+    );
+    setFeedFriendNoteCardStyle(
+      card.root,
+      "left",
+      `${Math.round(placement.left + (Number(window.scrollX) || 0))}px`
+    );
+    setFeedFriendNoteCardStyle(
+      card.root,
+      "top",
+      `${Math.round(placement.top + (Number(window.scrollY) || 0))}px`
+    );
+  }
+
+  // Called when the entry a card was opened from stops representing its author
+  // (the node was recycled, removed, or the feed root was replaced). A card with
+  // nothing unsaved is closed. A card holding typed input is kept and docked to
+  // the viewport, clearly labelled, because it is bound to the owner and
+  // subject UID it was opened for, not to the node.
+  function releaseFeedFriendNoteCardEntry(entry) {
+    const card = feedFriendNoteCard;
+    if (card === null || card.entry !== entry) return;
+    if (!card.editor.hasUnsavedChanges()) {
+      closeFeedFriendNoteCard(false);
+      return;
+    }
+    card.entry = null;
+    setFeedFriendNoteCardNotice(
+      card,
+      `原微博已不在页面上。此卡片仍属于 UID ${card.subjectUid}，你的输入已保留，卡片已停靠在窗口左下角。`
+    );
+    positionFeedFriendNoteCard();
+  }
+
+  function closeFeedFriendNoteCard(restoreFocus) {
+    const card = feedFriendNoteCard;
+    if (card === null) return;
+    feedFriendNoteCard = null;
+    if (typeof document.removeEventListener === "function") {
+      document.removeEventListener("keydown", card.onKeydown);
+      document.removeEventListener("click", card.onDocumentClick, true);
+    }
+    if (
+      typeof window !== "undefined" &&
+      typeof window.removeEventListener === "function"
+    ) {
+      window.removeEventListener("scroll", positionFeedFriendNoteCard, true);
+      window.removeEventListener("resize", positionFeedFriendNoteCard);
+    }
+    if (card.resizeObserver) card.resizeObserver.disconnect();
+    if (card.root.parentNode) card.root.parentNode.removeChild(card.root);
+    const entry = card.entry;
+    if (entry === null) return;
+    entry.button.setAttribute("aria-expanded", "false");
+    // Focus returns only to an entry that still exists and still stands for the
+    // author this card was about.
+    if (
+      restoreFocus &&
+      entry.active &&
+      entry.uid === card.subjectUid &&
+      entry.wrapper.parentNode &&
+      entry.button.isConnected !== false
+    ) {
+      focusFriendNoteControl(entry.button);
+    }
+  }
+
+  // A close the user asked for never discards typed input.
+  function requestCloseFeedFriendNoteCard(restoreFocus) {
+    const card = feedFriendNoteCard;
+    if (card === null) return true;
+    if (card.editor.hasUnsavedChanges()) {
+      setFeedFriendNoteCardNotice(
+        card,
+        "有尚未保存的输入。请先保存或取消，再关闭卡片。"
+      );
+      focusFriendNoteControl(card.root);
+      return false;
+    }
+    closeFeedFriendNoteCard(restoreFocus);
+    return true;
+  }
+
+  function toggleFeedFriendNoteCard(entry) {
+    const current = feedFriendNoteCard;
+    if (current !== null && current.entry === entry) {
+      requestCloseFeedFriendNoteCard(true);
+      return;
+    }
+    // Only one card at a time, and never at the cost of another card's draft.
+    if (!requestCloseFeedFriendNoteCard(false)) return;
+    openFeedFriendNoteCard(entry);
+  }
+
+  function openFeedFriendNoteCard(entry) {
+    const runtime = feedFriendNotes;
+    const owner = determineCurrentUid();
+    if (
+      runtime === null ||
+      !entry.active ||
+      !owner.ok ||
+      owner.uid !== entry.ownerUid ||
+      runtime.ownerUid !== entry.ownerUid
+    ) {
+      return;
+    }
+    // Opening re-reads local state, so a note saved in another tab is shown
+    // rather than the copy cached when the feed was first processed.
+    reloadFeedFriendNotesData();
+    if (runtime.data === null || !entry.active) return;
+
+    // From here on the card is bound to these two UIDs, not to the node.
+    const ownerUid = entry.ownerUid;
+    const subjectUid = entry.uid;
+    const facts = feedFriendNoteFacts(subjectUid);
+    const record = hasOwn(runtime.data.notes, subjectUid)
+      ? runtime.data.notes[subjectUid]
+      : null;
+
+    const root = createElement("div", null, "wfr-feed-note-card wfr-root");
+    root.id = FEED_FRIEND_NOTE_CARD_ID;
+    root.setAttribute("role", "dialog");
+    root.setAttribute("aria-label", "友人档案");
+    root.setAttribute("tabindex", "-1");
+    applyThemeToRoot(root);
+
+    const head = createElement("div", null, "wfr-feed-note-card-head");
+    const title = createElement("p", null, "wfr-feed-note-card-title");
+    const shownName =
+      entry.pageName !== null
+        ? entry.pageName
+        : facts.currentName !== null
+          ? facts.currentName
+          : null;
+    if (shownName !== null) title.append(createElement("strong", shownName));
+    title.append(createElement("span", `UID ${subjectUid}`, "wfr-muted"));
+    const closeButton = createFriendNoteButton("关闭");
+    closeButton.setAttribute("aria-label", "关闭友人档案卡片");
+    head.append(title, closeButton);
+
+    const notice = createElement("p", "", "wfr-error wfr-feed-note-card-notice");
+    notice.setAttribute("role", "status");
+    notice.setAttribute("aria-live", "polite");
+
+    const editor = buildFriendNoteEditor({
+      ownerUid,
+      subjectUid,
+      record,
+      compact: true,
+      onSaved: syncFriendNoteViews,
+    });
+
+    const observed = createElement("div", null, "wfr-profile-notes-observed");
+    observed.append(
+      createElement(
+        "p",
+        "Toolkit 本地观察记录（非实时）",
+        "wfr-profile-notes-subhead"
+      )
+    );
+    const rows = friendNoteObservedRows(facts);
+    if (rows.length === 0) {
+      observed.append(
+        createElement(
+          "p",
+          "暂无此账号的本地昵称或关系记录。",
+          "wfr-profile-row"
+        )
+      );
+    }
+    for (const row of rows) {
+      addProfileLine(observed, row.label, row.value, row.exactTime);
+    }
+
+    const actions = createElement(
+      "div",
+      null,
+      "wfr-actions wfr-compact-actions"
+    );
+    const detailButton = createFriendNoteButton("完整档案");
+    actions.append(createFriendNoteProfileLink(subjectUid), detailButton);
+
+    // The head and the notice stay put; everything else scrolls inside the
+    // card when it is taller than the space the viewport leaves it.
+    const body = createElement("div", null, "wfr-feed-note-card-body");
+    body.append(editor.root, observed, actions);
+    root.append(head, notice, body);
+
+    const card = {
+      ownerUid,
+      subjectUid,
+      editor,
+      root,
+      notice,
+      entry,
+      resizeObserver: null,
+      onKeydown: (event) => {
+        if (event && event.key === "Escape" && !isFriendNoteImeKeyEvent(event)) {
+          requestCloseFeedFriendNoteCard(true);
+        }
+      },
+      onDocumentClick: (event) => {
+        const target = event && event.target;
+        if (
+          !target ||
+          root.contains(target) ||
+          (card.entry !== null && card.entry.wrapper.contains(target))
+        ) {
+          return;
+        }
+        // Clicking elsewhere dismisses a card that has nothing to lose; a card
+        // with typed input stays until it is saved or cancelled.
+        if (!editor.hasUnsavedChanges()) closeFeedFriendNoteCard(false);
+      },
+    };
+    closeButton.addEventListener("click", () =>
+      requestCloseFeedFriendNoteCard(true)
+    );
+    detailButton.addEventListener("click", () => {
+      if (requestCloseFeedFriendNoteCard(false)) {
+        showFriendNoteDetail(ownerUid, subjectUid, null);
+      }
+    });
+
+    feedFriendNoteCard = card;
+    document.body.append(root);
+    entry.button.setAttribute("aria-expanded", "true");
+    positionFeedFriendNoteCard();
+    if (typeof document.addEventListener === "function") {
+      document.addEventListener("keydown", card.onKeydown);
+      document.addEventListener("click", card.onDocumentClick, true);
+    }
+    if (
+      typeof window !== "undefined" &&
+      typeof window.addEventListener === "function"
+    ) {
+      window.addEventListener("scroll", positionFeedFriendNoteCard, {
+        capture: true,
+        passive: true,
+      });
+      window.addEventListener("resize", positionFeedFriendNoteCard);
+    }
+    // Switching between view and edit, adding tags, a conflict box and a
+    // finished save or delete all change the card's height.
+    if (typeof ResizeObserver === "function") {
+      card.resizeObserver = new ResizeObserver(positionFeedFriendNoteCard);
+      card.resizeObserver.observe(root);
+    }
+    // An existing note opens as a dialog; a new one opens straight into its
+    // form, whose note field can only take focus now that it is in the page.
+    focusFriendNoteControl(
+      editor.isEditing() && typeof root.querySelector === "function"
+        ? root.querySelector(".wfr-note-textarea") || root
+        : root
+    );
+  }
+
+  function exportTimestamp(exportedAt) {
+    return exportedAt
+      .toISOString()
+      .replace(/[-:]/g, "")
+      .replace("T", "-")
+      .replace(/\.\d{3}Z$/, "");
+  }
+
+  function backupFilename(ownerUid, exportedAt) {
+    return `weibo-toolkit-friend-radar-${ownerUid}-${exportTimestamp(
+      exportedAt
+    )}.json`;
+  }
+
+  function eventExportFilename(ownerUid, exportedAt, extension) {
+    return `weibo-toolkit-friend-radar-events-${ownerUid}-${exportTimestamp(
+      exportedAt
+    )}.${extension}`;
+  }
+
+  // followerState is always present in v2: an object reproduces the durable
+  // follower state, and an explicit null records that none existed at backup
+  // time. A missing field can only come from v1, where the format simply had no
+  // concept of follower state.
+  //
+  // friendNotes follows the same rule from v3 on: the durable Friend Notes
+  // state, or an explicit null when none was stored. The caller must say which;
+  // an omitted argument is refused rather than exported as "no notes".
+  function createBackup(
+    ownerUid,
+    state,
+    followerState,
+    exportedAt,
+    friendNotesState
+  ) {
+    if (state.ownerUid !== ownerUid) {
+      throw new Error("Backup owner UID mismatch");
+    }
+    if (followerState !== null && followerState.ownerUid !== ownerUid) {
+      throw new Error("Backup follower owner UID mismatch");
+    }
+    if (typeof friendNotesState === "undefined") {
+      throw new Error("Backup friend notes coverage not stated");
+    }
+    if (friendNotesState !== null && friendNotesState.ownerUid !== ownerUid) {
+      throw new Error("Backup friend notes owner UID mismatch");
+    }
+    return {
+      backupFormat: BACKUP_FORMAT,
+      backupVersion: BACKUP_VERSION,
+      exportedAt: exportedAt.toISOString(),
+      appVersion: APP_VERSION,
+      ownerUid,
+      state,
+      followerState,
+      friendNotes: friendNotesState,
+    };
+  }
+
+  function serializeBackup(backup) {
+    return `${JSON.stringify(backup, null, 2)}\n`;
+  }
+
+  // CSV and Markdown are human/analysis exports of observed event history.
+  // The JSON backup above remains the only recovery format.
+  const UTF8_BOM = String.fromCharCode(0xfeff);
+  const EVENT_EXPORT_COLUMNS = Object.freeze([
+    "检测时间",
+    "事件类型",
+    "事件说明",
+    "UID",
+    "记录昵称",
+    "变化前",
+    "变化后",
+    "状态",
+  ]);
+
+  const EXPORT_SCOPE_NOTES = Object.freeze([
+    "本文件仅包含 Weibo Toolkit 实际观察并保存的关系事件，不是微博上的完整真实关系历史。",
+    "关系雷达只读取接口可见的关注列表，不会抓取完整粉丝列表，因此“开始关注你 / 停止关注你”只覆盖它能观察到的账号。",
+    "“从你的可见关注列表消失”只表示该账号不再出现在可见关注列表中，本工具无法判断原因。",
+  ]);
+
+  function eventExportRow(event) {
+    const transition = eventTransition(event);
+    return [
+      event.detectedAt,
+      event.type,
+      EVENT_LABELS[event.type] || event.type,
+      event.subjectUid,
+      event.displayName,
+      transition ? transition.previous : "",
+      transition ? transition.current : "",
+      event.read ? "已读" : "未读",
+    ];
+  }
+
+  // A stored nickname beginning with =, +, - or @ would be evaluated as a formula
+  // by Excel/WPS, so exported cells starting that way are kept as literal text.
+  function neutralizeSpreadsheetFormula(text) {
+    return /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+  }
+
+  function csvField(value) {
+    return `"${neutralizeSpreadsheetFormula(String(value)).replace(/"/g, '""')}"`;
+  }
+
+  function buildEventCsv(events) {
+    const rows = [
+      EVENT_EXPORT_COLUMNS,
+      ...sortEventsNewestFirst(events).map(eventExportRow),
+    ];
+    // The BOM stops Excel/WPS from guessing a legacy codepage; CRLF follows RFC 4180.
+    const body = rows.map((row) => row.map(csvField).join(",")).join("\r\n");
+    return `${UTF8_BOM}${body}\r\n`;
+  }
+
+  function markdownCell(value) {
+    return String(value)
+      .replace(/\\/g, "\\\\")
+      .replace(/\|/g, "\\|")
+      .replace(/\r?\n/g, " ");
+  }
+
+  function buildEventMarkdown(ownerUid, events, exportedAt) {
+    const ordered = sortEventsNewestFirst(events);
+    const lines = [
+      "# Weibo Toolkit 关系事件导出",
+      "",
+      `- 账号 UID：${ownerUid}`,
+      `- 导出时间：${exportedAt.toISOString()}`,
+      `- 已存事件数：${ordered.length}`,
+      `- Weibo Toolkit 版本：${APP_VERSION}`,
+      "",
+      EXPORT_SCOPE_NOTES.map((note) => `> ${note}`).join("\n>\n"),
+      "",
+      "## 已观察事件（按检测时间从新到旧）",
+      "",
+    ];
+    if (ordered.length === 0) {
+      lines.push("暂无已存事件。", "");
+      return lines.join("\n");
+    }
+    lines.push(
+      `| ${EVENT_EXPORT_COLUMNS.join(" | ")} |`,
+      `| ${EVENT_EXPORT_COLUMNS.map(() => "---").join(" | ")} |`
+    );
+    for (const event of ordered) {
+      lines.push(`| ${eventExportRow(event).map(markdownCell).join(" | ")} |`);
+    }
+    lines.push("");
+    return lines.join("\n");
+  }
+
+  const EVENT_EXPORT_FORMATS = Object.freeze({
+    csv: {
+      label: "CSV",
+      extension: "csv",
+      mimeType: "text/csv;charset=utf-8",
+      build: (ownerUid, events) => buildEventCsv(events),
+    },
+    markdown: {
+      label: "Markdown",
+      extension: "md",
+      mimeType: "text/markdown;charset=utf-8",
+      build: buildEventMarkdown,
+    },
+  });
+
+  function loadAutoInterval(ownerUid) {
+    try {
+      const value = GM_getValue(`${AUTO_INTERVAL_PREFIX}${ownerUid}`, 0);
+      if (!AUTO_INTERVAL_HOURS.includes(value)) {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "AUTO_INTERVAL_INVALID",
+        };
+      }
+      return { ok: true, value };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function saveAutoInterval(ownerUid, value) {
+    const key = `${AUTO_INTERVAL_PREFIX}${ownerUid}`;
+    try {
+      GM_setValue(key, value);
+      if (GM_getValue(key, null) !== value) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  function loadLastAutomaticAttempt(ownerUid) {
+    try {
+      const value = GM_getValue(`${AUTO_ATTEMPT_PREFIX}${ownerUid}`, null);
+      if (value === null || typeof value === "undefined") {
+        return { ok: true, value: null };
+      }
+      if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "AUTO_ATTEMPT_INVALID",
+        };
+      }
+      return { ok: true, value };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function saveLastAutomaticAttempt(ownerUid, attemptedAt) {
+    const key = `${AUTO_ATTEMPT_PREFIX}${ownerUid}`;
+    try {
+      GM_setValue(key, attemptedAt);
+      if (GM_getValue(key, null) !== attemptedAt) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  const AUTOMATIC_OUTCOME_VALUES = Object.freeze([
+    "SUCCESS",
+    "FAILURE",
+    "SKIPPED",
+  ]);
+  const AUTOMATIC_SKIP_FAILURE_KINDS = Object.freeze([
+    "STALE_SCAN",
+  ]);
+  const AUTOMATIC_OUTCOME_REASON_LABELS = Object.freeze({
+    STALE_SCAN: "已有更新的快照",
+    NETWORK_ERROR: "网络请求失败",
+    HTTP_ERROR: "接口请求失败",
+    LOGIN_REQUIRED: "登录状态失效",
+    CHALLENGE_OR_UNEXPECTED_RESPONSE: "遇到验证页面或异常响应",
+    NON_JSON_RESPONSE: "接口响应异常",
+    UNEXPECTED_CONTENT_TYPE: "接口响应类型异常",
+    UNEXPECTED_SCHEMA: "接口数据校验失败",
+    PAGINATION_FAILURE: "分页完整性校验失败",
+    MAX_REQUESTS_REACHED: "达到请求安全上限",
+    FOLLOWER_REQUEST_CEILING_REACHED: "达到请求安全上限",
+    ACCOUNT_CHANGED_DURING_SCAN: "扫描期间账号发生变化",
+    STORAGE_ERROR: "本地数据读取失败",
+    PERSISTENCE_ERROR: "本地保存失败",
+    CONCURRENT_MODIFICATION: "检测到并发修改",
+    LOCK_UNAVAILABLE: "浏览器锁不可用",
+    LOCK_REQUEST_FAILED: "浏览器锁请求失败",
+    UNKNOWN_FAILURE: "未能确认原因",
+  });
+
+  function sanitizedAutomaticOutcomeCode(value) {
+    return typeof value === "string" &&
+      value.length <= 64 &&
+      /^[A-Z0-9_]+$/.test(value)
+      ? value
+      : null;
+  }
+
+  function automaticOutcomeFromResult(attemptedAt, result) {
+    const failureKind = sanitizedAutomaticOutcomeCode(result.failureKind);
+    const reason = sanitizedAutomaticOutcomeCode(result.reason);
+    return {
+      attemptedAt,
+      outcome: result.ok
+        ? "SUCCESS"
+        : AUTOMATIC_SKIP_FAILURE_KINDS.includes(failureKind)
+          ? "SKIPPED"
+          : "FAILURE",
+      ...(failureKind === null ? {} : { failureKind }),
+      ...(reason === null ? {} : { reason }),
+    };
+  }
+
+  function loadAutomaticOutcome(prefix, ownerUid) {
+    try {
+      const value = GM_getValue(prefix + ownerUid, null);
+      if (value === null || typeof value === "undefined") {
+        return { ok: true, value: null };
+      }
+      if (
+        !isPlainObject(value) ||
+        typeof value.attemptedAt !== "string" ||
+        !Number.isFinite(Date.parse(value.attemptedAt)) ||
+        !AUTOMATIC_OUTCOME_VALUES.includes(value.outcome) ||
+        (hasOwn(value, "failureKind") &&
+          sanitizedAutomaticOutcomeCode(value.failureKind) === null) ||
+        (hasOwn(value, "reason") &&
+          sanitizedAutomaticOutcomeCode(value.reason) === null)
+      ) {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "AUTO_OUTCOME_INVALID",
+        };
+      }
+      return { ok: true, value };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function saveAutomaticOutcome(prefix, ownerUid, attemptedAt, result) {
+    const key = prefix + ownerUid;
+    const value = automaticOutcomeFromResult(attemptedAt, result);
+    try {
+      GM_setValue(key, value);
+      if (JSON.stringify(GM_getValue(key, null)) !== JSON.stringify(value)) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  function describeAutomaticOutcome(value) {
+    if (value === null) return "—";
+    if (value.outcome === "SUCCESS") return "成功";
+    const code = value.failureKind || value.reason || null;
+    const detail =
+      AUTOMATIC_OUTCOME_REASON_LABELS[code] || "原因未能确认";
+    return value.outcome === "SKIPPED"
+      ? "已跳过（" + detail + "）"
+      : "失败（" + detail + "）";
+  }
+
+  const UNPAIRED_AUTOMATIC_OUTCOME_LABEL = "尚无对应结果记录";
+
+  // The attempt timestamp is the identity of one automatic run. An outcome
+  // record only describes the displayed attempt when it carries that exact
+  // token, so the two records are compared as strings with no tolerance: an
+  // attempt whose outcome never landed must never borrow an older result.
+  function resolveAutomaticAttemptOutcome(lastAttempt, lastOutcome) {
+    const attempt = typeof lastAttempt === "string" ? lastAttempt : null;
+    const outcome = isPlainObject(lastOutcome) ? lastOutcome : null;
+    if (attempt === null) {
+      // An outcome with no recorded attempt is leftover metadata, not a result
+      // that can be attributed to anything currently displayed.
+      return { paired: false, state: outcome === null ? "NONE" : "ORPHANED" };
+    }
+    if (outcome === null) return { paired: false, state: "MISSING" };
+    if (outcome.attemptedAt !== attempt) {
+      return { paired: false, state: "MISMATCHED" };
+    }
+    return { paired: true, state: "PAIRED", outcome };
+  }
+
+  function describeAutomaticOutcomeForAttempt(lastAttempt, lastOutcome) {
+    const resolved = resolveAutomaticAttemptOutcome(lastAttempt, lastOutcome);
+    if (resolved.paired) return describeAutomaticOutcome(resolved.outcome);
+    return resolved.state === "NONE" ? "—" : UNPAIRED_AUTOMATIC_OUTCOME_LABEL;
+  }
+
+  function evaluateAutomaticUpdateEligibility(ownerUid, nowMilliseconds) {
+    const interval = loadAutoInterval(ownerUid);
+    if (!interval.ok) return interval;
+    if (interval.value === 0) {
+      return { ok: true, eligible: false, reason: "DISABLED" };
+    }
+
+    const loaded = loadState(ownerUid);
+    if (!loaded.ok) return loaded;
+    if (loaded.state.latestSnapshot === null) {
+      return { ok: true, eligible: false, reason: "NO_SUCCESSFUL_BASELINE" };
+    }
+    const successfulAt = Date.parse(loaded.state.latestSnapshot.capturedAt);
+    const thresholdMilliseconds = interval.value * 60 * 60 * 1000;
+    if (nowMilliseconds - successfulAt < thresholdMilliseconds) {
+      return { ok: true, eligible: false, reason: "THRESHOLD_NOT_REACHED" };
+    }
+
+    const lastAttempt = loadLastAutomaticAttempt(ownerUid);
+    if (!lastAttempt.ok) return lastAttempt;
+    if (
+      lastAttempt.value !== null &&
+      nowMilliseconds - Date.parse(lastAttempt.value) <
+        AUTO_ATTEMPT_COOLDOWN_MS
+    ) {
+      return { ok: true, eligible: false, reason: "ATTEMPT_COOLDOWN" };
+    }
+    return {
+      ok: true,
+      eligible: true,
+      intervalHours: interval.value,
+      lastSuccessfulAt: loaded.state.latestSnapshot.capturedAt,
+    };
+  }
+
+  function loadFollowerAutoInterval(ownerUid) {
+    try {
+      const value = GM_getValue(
+        FOLLOWER_AUTO_INTERVAL_PREFIX + ownerUid,
+        0
+      );
+      if (!AUTO_INTERVAL_HOURS.includes(value)) {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "FOLLOWER_AUTO_INTERVAL_INVALID",
+        };
+      }
+      return { ok: true, value };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function saveFollowerAutoInterval(ownerUid, value) {
+    const key = FOLLOWER_AUTO_INTERVAL_PREFIX + ownerUid;
+    try {
+      GM_setValue(key, value);
+      if (GM_getValue(key, null) !== value) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  function loadFollowerLastAutomaticAttempt(ownerUid) {
+    try {
+      const value = GM_getValue(
+        FOLLOWER_AUTO_ATTEMPT_PREFIX + ownerUid,
+        null
+      );
+      if (value === null || typeof value === "undefined") {
+        return { ok: true, value: null };
+      }
+      if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "FOLLOWER_AUTO_ATTEMPT_INVALID",
+        };
+      }
+      return { ok: true, value };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function saveFollowerLastAutomaticAttempt(ownerUid, attemptedAt) {
+    const key = FOLLOWER_AUTO_ATTEMPT_PREFIX + ownerUid;
+    try {
+      GM_setValue(key, attemptedAt);
+      if (GM_getValue(key, null) !== attemptedAt) {
+        return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+      }
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "PERSISTENCE_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+        rollbackSucceeded: false,
+      };
+    }
+  }
+
+  function evaluateFollowerAutomaticUpdateEligibility(
+    ownerUid,
+    nowMilliseconds
+  ) {
+    const interval = loadFollowerAutoInterval(ownerUid);
+    if (!interval.ok) return interval;
+    if (interval.value === 0) {
+      return { ok: true, eligible: false, reason: "DISABLED" };
+    }
+    const loaded = loadFollowerState(ownerUid);
+    if (!loaded.ok) return loaded;
+    if (loaded.state.latestSnapshot !== null) {
+      const successfulAt = Date.parse(
+        loaded.state.latestSnapshot.capturedAt
+      );
+      const thresholdMilliseconds = interval.value * 60 * 60 * 1000;
+      if (nowMilliseconds - successfulAt < thresholdMilliseconds) {
+        return {
+          ok: true,
+          eligible: false,
+          reason: "THRESHOLD_NOT_REACHED",
+        };
+      }
+    }
+    const lastAttempt = loadFollowerLastAutomaticAttempt(ownerUid);
+    if (!lastAttempt.ok) return lastAttempt;
+    if (
+      lastAttempt.value !== null &&
+      nowMilliseconds - Date.parse(lastAttempt.value) <
+        AUTO_ATTEMPT_COOLDOWN_MS
+    ) {
+      return { ok: true, eligible: false, reason: "ATTEMPT_COOLDOWN" };
+    }
+    return {
+      ok: true,
+      eligible: true,
+      intervalHours: interval.value,
+      lastSuccessfulAt:
+        loaded.state.latestSnapshot === null
+          ? null
+          : loaded.state.latestSnapshot.capturedAt,
+    };
+  }
+
+  function validateBackupText(text, currentOwnerUid) {
+    let backup;
+    try {
+      backup = JSON.parse(text);
+    } catch (_) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "MALFORMED_JSON",
+      };
+    }
+
+    if (!isPlainObject(backup)) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "INVALID_TOP_LEVEL",
+      };
+    }
+    if (backup.backupFormat !== BACKUP_FORMAT) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "WRONG_BACKUP_FORMAT",
+      };
+    }
+    if (!SUPPORTED_BACKUP_VERSIONS.includes(backup.backupVersion)) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "UNSUPPORTED_BACKUP_VERSION",
+      };
+    }
+    if (
+      typeof backup.ownerUid !== "string" ||
+      normalizeStableUid(backup.ownerUid) !== backup.ownerUid
+    ) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "INVALID_OWNER_UID",
+      };
+    }
+    if (backup.ownerUid !== currentOwnerUid) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "OWNER_UID_MISMATCH",
+      };
+    }
+    if (
+      hasOwn(backup, "exportedAt") &&
+      (typeof backup.exportedAt !== "string" ||
+        !Number.isFinite(Date.parse(backup.exportedAt)))
+    ) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "INVALID_EXPORTED_AT",
+      };
+    }
+    if (!isValidStoredState(backup.state, backup.ownerUid)) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "INVALID_STATE",
+      };
+    }
+    // v1 predates follower backup coverage: it says nothing about follower state,
+    // so restoring it must leave the current follower state alone.
+    let followerState = null;
+    let followerCovered = false;
+    if (backup.backupVersion >= 2) {
+      if (!hasOwn(backup, "followerState")) {
+        return {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "MISSING_FOLLOWER_STATE",
+        };
+      }
+      if (
+        backup.followerState !== null &&
+        !isValidFollowerStoredState(backup.followerState, backup.ownerUid)
+      ) {
+        return {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "INVALID_FOLLOWER_STATE",
+        };
+      }
+      followerCovered = true;
+      followerState = backup.followerState;
+    }
+    // v1 and v2 predate Friend Notes in exactly the same way: they say nothing
+    // about them, so restoring either must leave the current notes alone.
+    let friendNotesState = null;
+    let friendNotesCovered = false;
+    if (backup.backupVersion >= 3) {
+      if (!hasOwn(backup, "friendNotes")) {
+        return {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "MISSING_FRIEND_NOTES",
+        };
+      }
+      if (
+        backup.friendNotes !== null &&
+        !isValidFriendNotesState(backup.friendNotes, backup.ownerUid)
+      ) {
+        return {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "INVALID_FRIEND_NOTES",
+        };
+      }
+      friendNotesCovered = true;
+      friendNotesState = backup.friendNotes;
+    }
+
+    return {
+      ok: true,
+      backupVersion: backup.backupVersion,
+      ownerUid: backup.ownerUid,
+      exportedAt: hasOwn(backup, "exportedAt") ? backup.exportedAt : null,
+      state: backup.state,
+      stateSerialized: JSON.stringify(backup.state),
+      followerCovered,
+      followerState,
+      followerStateSerialized:
+        followerState === null ? null : JSON.stringify(followerState),
+      friendNotesCovered,
+      friendNotesState,
+      friendNotesSerialized:
+        friendNotesState === null ? null : JSON.stringify(friendNotesState),
+    };
+  }
+
+  function selectBackupFile() {
+    return new Promise((resolve, reject) => {
+      const input = createElement("input");
+      input.type = "file";
+      input.accept = "application/json,.json";
+      input.hidden = true;
+      let settled = false;
+
+      function finish(file) {
+        if (settled) return;
+        settled = true;
+        if (input.parentNode) input.parentNode.removeChild(input);
+        resolve(file || null);
+      }
+
+      input.addEventListener("change", () => {
+        finish(input.files && input.files.length > 0 ? input.files[0] : null);
+      });
+      input.addEventListener("cancel", () => finish(null));
+      document.body.append(input);
+      try {
+        input.click();
+      } catch (error) {
+        if (input.parentNode) input.parentNode.removeChild(input);
+        reject(error);
+      }
+    });
+  }
+
+  // Writes the follower half of a v2 restore. It runs inside the owner-scoped
+  // follower state lock, reads the current value there, and writes exactly what
+  // the backup represents: the stored state, or nothing at all when the backup
+  // explicitly recorded that no durable follower state existed.
+  // Reads the exact follower bytes the user is about to review. Absence is a
+  // real reviewed value, so it is represented as null rather than as a failure.
+  function currentFollowerRestoreToken(ownerUid) {
+    try {
+      const raw = GM_getValue(followerStorageKey(ownerUid), null);
+      return { ok: true, raw: typeof raw === "string" ? raw : null };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "FOLLOWER_STATE_UNREADABLE",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  // Called only after a follower mutator was already attempted. A thrown write,
+  // a thrown delete or a failed verification does not prove the effect did not
+  // land, so one bounded re-read inside the still-held lock is used solely to
+  // prove non-mutation. It never upgrades a failed attempt to success and never
+  // retries the mutation.
+  function classifyAttemptedFollowerMutation(key, expectedRaw, failure) {
+    let observedRaw;
+    try {
+      observedRaw = GM_getValue(key, null);
+    } catch (_) {
+      return { ...failure, ok: false, mutationAttempted: true, outcomeUnknown: true };
+    }
+    const normalized = typeof observedRaw === "string" ? observedRaw : null;
+    if (normalized === expectedRaw) {
+      return { ...failure, ok: false, mutationAttempted: true, outcomeUnknown: false };
+    }
+    return { ...failure, ok: false, mutationAttempted: true, outcomeUnknown: true };
+  }
+
+  // The follower half obeys the same preview-time concurrency principle as the
+  // Friend Radar half: the bytes the user reviewed must still be the stored ones.
+  // The expected value is the preview token, never a read taken immediately
+  // before the write, which would always agree with itself.
+  async function restoreFollowerStateFromBackup(
+    ownerUid,
+    followerState,
+    expectedFollowerRaw
+  ) {
+    return await withFollowerStateLock(ownerUid, async () => {
+      const key = followerStorageKey(ownerUid);
+      let currentRaw;
+      try {
+        currentRaw = GM_getValue(key, null);
+      } catch (error) {
+        return {
+          ok: false,
+          mutationAttempted: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "FOLLOWER_STATE_UNREADABLE",
+          errorName: error && error.name ? String(error.name) : "Error",
+        };
+      }
+      const normalizedCurrent = typeof currentRaw === "string" ? currentRaw : null;
+      if (normalizedCurrent !== expectedFollowerRaw) {
+        return {
+          ok: false,
+          mutationAttempted: false,
+          failureKind: "CONCURRENT_MODIFICATION",
+        };
+      }
+      if (followerState === null) {
+        try {
+          GM_deleteValue(key);
+          if (GM_getValue(key, null) !== null) {
+            return classifyAttemptedFollowerMutation(key, expectedFollowerRaw, {
+              failureKind: "CONCURRENT_MODIFICATION",
+            });
+          }
+          return { ok: true, mutationAttempted: true };
+        } catch (error) {
+          return classifyAttemptedFollowerMutation(key, expectedFollowerRaw, {
+            failureKind: "PERSISTENCE_ERROR",
+            errorName: error && error.name ? String(error.name) : "Error",
+          });
+        }
+      }
+      const persisted = persistFollowerState(
+        ownerUid,
+        followerState,
+        expectedFollowerRaw
+      );
+      if (persisted.ok) return { ok: true, mutationAttempted: true };
+      return classifyAttemptedFollowerMutation(key, expectedFollowerRaw, persisted);
+    });
+  }
+
+  // Two durable module states are replaced, so the write order is fixed: Friend
+  // Radar first with its existing compare-and-verify persistence, then the
+  // follower state inside its own short lock. Nothing else is held while that
+  // lock is taken, and no lock is held while the user is deciding, so no cycle
+  // is possible. If the follower half fails, the Friend Radar half is put back.
+  function restoreStateUncertain(followerFailureKind) {
+    const result = {
+      ok: false,
+      failureKind: "BACKUP_RESTORE_ERROR",
+      reason: "RESTORE_STATE_UNCERTAIN",
+      rollbackSucceeded: false,
+    };
+    if (followerFailureKind) result.followerFailureKind = followerFailureKind;
+    return result;
+  }
+
+  // Reads the exact Friend Notes bytes the user is about to review. Like the
+  // follower token, absence is a real reviewed value. The bytes are not required
+  // to be valid: a restore the user confirmed is also the way out of a damaged
+  // local value, and the preview says so when that is what will be replaced.
+  function currentFriendNotesRestoreToken(ownerUid) {
+    try {
+      const raw = GM_getValue(friendNotesStorageKey(ownerUid), null);
+      return { ok: true, raw: typeof raw === "string" ? raw : null };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "FRIEND_NOTES_UNREADABLE",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  // Runs before the first restore write. Notes are the module most likely to be
+  // edited in another tab while the preview is open, so that case is refused
+  // here, with nothing written, instead of being discovered after two other
+  // modules were already replaced. The check inside the final write below stays
+  // authoritative; this one only keeps the common case free of rollbacks.
+  async function friendNotesUnchangedSincePreview(ownerUid, expectedRaw) {
+    return await withFriendNotesLock(ownerUid, async () => {
+      const token = currentFriendNotesRestoreToken(ownerUid);
+      if (!token.ok) return token;
+      return token.raw === expectedRaw
+        ? { ok: true }
+        : {
+            ok: false,
+            failureKind: "BACKUP_RESTORE_ERROR",
+            reason: "FRIEND_NOTES_CHANGED_SINCE_PREVIEW",
+          };
+    });
+  }
+
+  // Writes the Friend Notes third of a v3 restore inside its own lock: the
+  // stored state, or nothing at all when the backup recorded that none existed.
+  // The expected value is the preview token, never a read taken just before the
+  // write.
+  async function restoreFriendNotesFromBackup(
+    ownerUid,
+    serialized,
+    expectedRaw
+  ) {
+    return await withFriendNotesLock(ownerUid, async () => {
+      const token = currentFriendNotesRestoreToken(ownerUid);
+      if (!token.ok) return { ...token, mutationAttempted: false };
+      if (token.raw !== expectedRaw) {
+        return {
+          ok: false,
+          mutationAttempted: false,
+          failureKind: "CONCURRENT_MODIFICATION",
+        };
+      }
+      const written = writeFriendNotesRaw(ownerUid, serialized, expectedRaw);
+      return written.ok ? { ok: true, mutationAttempted: true } : written;
+    });
+  }
+
+  // Undoes this restore's follower write, and only this restore's write, under
+  // the same rule as the Friend Radar rollback below: bytes another tab has
+  // committed since are left alone and reported, never overwritten.
+  async function rollbackFollowerRestore(ownerUid, restoredRaw, preRestoreRaw) {
+    const outcome = await withFollowerStateLock(ownerUid, async () => {
+      const key = followerStorageKey(ownerUid);
+      try {
+        const currentRaw = GM_getValue(key, null);
+        if ((typeof currentRaw === "string" ? currentRaw : null) !== restoredRaw) {
+          return { reason: "RESTORE_CONCURRENT_STATE_CHANGED" };
+        }
+        if (preRestoreRaw === null) GM_deleteValue(key);
+        else GM_setValue(key, preRestoreRaw);
+        const verified = GM_getValue(key, null);
+        return (typeof verified === "string" ? verified : null) === preRestoreRaw
+          ? { reason: "ROLLED_BACK" }
+          : { reason: "RESTORE_STATE_UNCERTAIN" };
+      } catch (_) {
+        return { reason: "RESTORE_STATE_UNCERTAIN" };
+      }
+    });
+    if (outcome && outcome.failureKind === "STATE_LOCK_UNAVAILABLE") {
+      return { reason: "RESTORE_STATE_UNCERTAIN" };
+    }
+    return outcome;
+  }
+
+  // The last third of a v3 restore. By now Friend Radar and the follower state
+  // hold the backup's values. If the notes cannot be written and are known to
+  // be untouched, both earlier writes are undone, each only while its bytes are
+  // still the ones this restore wrote. The result is "rolled back" only when
+  // both were; anything less is reported as partial or uncertain.
+  async function finishFriendNotesRestore(
+    validated,
+    initial,
+    expectedFollowerRaw,
+    expectedFriendNotesRaw
+  ) {
+    const notesWrite = await restoreFriendNotesFromBackup(
+      validated.ownerUid,
+      validated.friendNotesSerialized,
+      expectedFriendNotesRaw
+    );
+    if (notesWrite.ok) {
+      return {
+        ok: true,
+        state: initial.state,
+        followerRestored: true,
+        friendNotesRestored: true,
+      };
+    }
+    const friendNotesFailureKind = notesWrite.failureKind || "UNKNOWN_FAILURE";
+    if (notesWrite.outcomeUnknown === true) {
+      return { ...restoreStateUncertain(null), friendNotesFailureKind };
+    }
+
+    const followerRollback = await rollbackFollowerRestore(
+      validated.ownerUid,
+      validated.followerStateSerialized,
+      expectedFollowerRaw
+    );
+    const radarRollback = await rollbackFriendRadarRestore(
+      validated.ownerUid,
+      initial.restoredRaw,
+      initial.preRestoreRaw
+    );
+    const followerRolledBack = followerRollback.reason === "ROLLED_BACK";
+    const radarRolledBack =
+      radarRollback.reason === "FOLLOWER_RESTORE_FAILED_ROLLED_BACK";
+    let reason = "FRIEND_NOTES_RESTORE_FAILED_PARTIAL";
+    if (followerRolledBack && radarRolledBack) {
+      reason = "FRIEND_NOTES_RESTORE_FAILED_ROLLED_BACK";
+    } else if (
+      followerRollback.reason === "RESTORE_STATE_UNCERTAIN" ||
+      radarRollback.reason === "RESTORE_STATE_UNCERTAIN"
+    ) {
+      reason = "RESTORE_STATE_UNCERTAIN";
+    }
+    return {
+      ok: false,
+      failureKind: "BACKUP_RESTORE_ERROR",
+      reason,
+      rollbackSucceeded: followerRolledBack && radarRolledBack,
+      friendNotesFailureKind,
+    };
+  }
+
+  async function restoreValidatedBackup(
+    validated,
+    expectedCurrentRaw,
+    expectedFollowerRaw,
+    expectedFriendNotesRaw
+  ) {
+    const currentUid = determineCurrentUid();
+    if (!currentUid.ok || currentUid.uid !== validated.ownerUid) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "OWNER_UID_MISMATCH",
+      };
+    }
+
+    if (validated.friendNotesCovered) {
+      const unchanged = await friendNotesUnchangedSincePreview(
+        validated.ownerUid,
+        expectedFriendNotesRaw
+      );
+      if (!unchanged.ok) return unchanged;
+    }
+
+    // The value previewed to the user is not trusted after the wait: the current
+    // state is read again inside the lock and the restore is refused if another
+    // tab has legitimately changed it in the meantime.
+    const initial = await withFriendRadarStateLock(
+      validated.ownerUid,
+      async () => {
+        const fresh = loadState(validated.ownerUid);
+        if (!fresh.ok) return fresh;
+        if (fresh.raw !== expectedCurrentRaw) {
+          return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
+        }
+        const persisted = persistState(validated.ownerUid, validated.state);
+        // The pre-write comparison above already passed, so from here the write
+        // has been attempted and a failure no longer proves nothing was stored.
+        // One bounded re-read inside this lock is used only to prove that the
+        // bytes are still the pre-restore ones; anything else is uncertain.
+        if (!persisted.ok) {
+          return friendRadarRestoreWriteOutcome(
+            validated.ownerUid,
+            fresh.raw,
+            persisted
+          );
+        }
+        const reloaded = loadState(validated.ownerUid);
+        if (!reloaded.ok) return restoreStateUncertain(null);
+        if (reloaded.raw !== validated.stateSerialized) {
+          return friendRadarRestoreWriteOutcome(validated.ownerUid, fresh.raw, {
+            ok: false,
+            failureKind: "CONCURRENT_MODIFICATION",
+          });
+        }
+        return {
+          ok: true,
+          state: reloaded.state,
+          preRestoreRaw: fresh.raw,
+          restoredRaw: reloaded.raw,
+        };
+      }
+    );
+    if (!initial.ok) return initial;
+
+    // A v1 backup carries no follower information, so the current follower state
+    // is deliberately left exactly as it is.
+    if (!validated.followerCovered) {
+      return {
+        ok: true,
+        state: initial.state,
+        followerRestored: false,
+        friendNotesRestored: false,
+      };
+    }
+
+    // The Friend Radar lock is released before the follower lock is taken, so
+    // the two module locks are never held at the same time.
+    const followerWrite = await restoreFollowerStateFromBackup(
+      validated.ownerUid,
+      validated.followerState,
+      expectedFollowerRaw
+    );
+    if (followerWrite.ok) {
+      // A v2 backup carries no Friend Notes, so the current ones are left
+      // exactly as they are, just as v1 leaves the follower state alone.
+      if (!validated.friendNotesCovered) {
+        return {
+          ok: true,
+          state: initial.state,
+          followerRestored: true,
+          friendNotesRestored: false,
+        };
+      }
+      // The follower lock is released before the notes lock is taken: no two
+      // module locks are ever held at the same time.
+      return await finishFriendNotesRestore(
+        validated,
+        initial,
+        expectedFollowerRaw,
+        expectedFriendNotesRaw
+      );
+    }
+
+    // Rolling Friend Radar back and calling the restore cancelled is only honest
+    // when the follower half is known not to have mutated. Once a follower
+    // mutation may already have landed, the pair is reported as uncertain and
+    // Friend Radar is left where the restore put it.
+    if (followerWrite.outcomeUnknown === true) {
+      return restoreStateUncertain(
+        followerWrite.failureKind || "UNKNOWN_FAILURE"
+      );
+    }
+
+    const rollback = await rollbackFriendRadarRestore(
+      validated.ownerUid,
+      initial.restoredRaw,
+      initial.preRestoreRaw
+    );
+    return {
+      ok: false,
+      failureKind: "BACKUP_RESTORE_ERROR",
+      reason: rollback.reason,
+      rollbackSucceeded: rollback.reason === "FOLLOWER_RESTORE_FAILED_ROLLED_BACK",
+      followerFailureKind: followerWrite.failureKind || "UNKNOWN_FAILURE",
+    };
+  }
+
+  // Runs inside the Friend Radar lock after persistState attempted the restore
+  // write. A single re-read proves non-mutation or nothing at all; it never
+  // retries and never turns a failed attempt into a success.
+  function friendRadarRestoreWriteOutcome(ownerUid, preRestoreRaw, failure) {
+    let observedRaw;
+    try {
+      observedRaw = GM_getValue(storageKey(ownerUid), null);
+    } catch (_) {
+      return restoreStateUncertain(null);
+    }
+    const normalized = typeof observedRaw === "string" ? observedRaw : null;
+    if (normalized === preRestoreRaw) return failure;
+    return restoreStateUncertain(null);
+  }
+
+  // Undoes this restore's Friend Radar write, and only this restore's write. The
+  // whole read/compare/write/verify sequence happens inside one lock callback.
+  //
+  // If the stored bytes are no longer the ones this restore wrote, another tab
+  // has committed something newer and legitimate since; that value is left
+  // alone rather than overwritten, and the outcome is reported as such.
+  async function rollbackFriendRadarRestore(ownerUid, restoredRaw, preRestoreRaw) {
+    const outcome = await withFriendRadarStateLock(ownerUid, async () => {
+      const currentRaw = GM_getValue(storageKey(ownerUid), null);
+      if (currentRaw !== restoredRaw) {
+        return { reason: "RESTORE_CONCURRENT_STATE_CHANGED" };
+      }
+      return writeFriendRadarRaw(ownerUid, preRestoreRaw)
+        ? { reason: "FOLLOWER_RESTORE_FAILED_ROLLED_BACK" }
+        : { reason: "RESTORE_STATE_UNCERTAIN" };
+    });
+    if (outcome && outcome.failureKind === "STATE_LOCK_UNAVAILABLE") {
+      return { reason: "RESTORE_STATE_UNCERTAIN" };
+    }
+    return outcome;
+  }
+
+  function snapshotRecordCount(state) {
+    return state.latestSnapshot ? state.latestSnapshot.records.length : 0;
+  }
+
+  // Every other durable operation refuses to start while any of the three is in
+  // flight. Restore writes both module states, so it must obey the same gate at
+  // entry and again at the confirmation click, after the user wait.
+  function restoreBlockedByRunningOperation() {
+    return Boolean(
+      updateRunning || followerUpdateRunning || followerRemovalInFlight
+    );
+  }
+
+  function friendNoteCount(state) {
+    return state === null ? 0 : Object.keys(state.notes).length;
+  }
+
+  // friendNotesPreview.current is the interpretation of the exact bytes that
+  // become the restore's expected value, so the numbers shown here describe
+  // precisely what a confirmation would replace.
+  function showRestorePreview(
+    validated,
+    currentLoaded,
+    expectedFollowerRaw,
+    friendNotesPreview
+  ) {
+    const body = showPanel("恢复备份", true);
+    body.append(
+      createElement(
+        "p",
+        validated.followerCovered
+          ? "恢复后，当前账号的关系雷达数据、粉丝快照和粉丝变化记录将被此备份完整替换。"
+          : "恢复后，当前账号的关系雷达数据将被此备份完整替换；此备份不包含粉丝快照和粉丝变化记录，它们将保持不变。",
+        "wfr-error"
+      )
+    );
+    const currentNotes = friendNotesPreview.current;
+    if (validated.friendNotesCovered) {
+      body.append(
+        createElement(
+          "p",
+          "此备份还包含友人档案：当前账号手写的全部备注和标签也将被备份中的内容完整替换，不做合并。",
+          "wfr-error"
+        )
+      );
+    } else {
+      body.append(
+        createElement(
+          "p",
+          currentNotes.ok
+            ? `此备份不包含友人档案，当前的 ${friendNoteCount(
+                currentNotes.state
+              )} 条友人档案将保持不变。`
+            : "此备份不包含友人档案，当前的友人档案数据将保持不变。",
+          "wfr-muted"
+        )
+      );
+    }
+    body.append(
+      createElement(
+        "p",
+        "建议先导出当前数据作为备份。",
+        "wfr-muted"
+      )
+    );
+    addLine(body, "备份账号 UID", validated.ownerUid);
+    if (validated.exportedAt !== null) {
+      addLine(body, "备份导出时间", formatTime(validated.exportedAt));
+    }
+    addLine(body, "当前事件数", currentLoaded.state.events.length);
+    addLine(body, "备份事件数", validated.state.events.length);
+    addLine(body, "当前快照记录数", snapshotRecordCount(currentLoaded.state));
+    addLine(body, "备份快照记录数", snapshotRecordCount(validated.state));
+    if (validated.followerCovered) {
+      addLine(
+        body,
+        "备份中的粉丝变化事件数",
+        validated.followerState === null
+          ? "无粉丝快照"
+          : validated.followerState.events.length
+      );
+    }
+    if (validated.friendNotesCovered) {
+      const backupNotes = validated.friendNotesState;
+      addLine(
+        body,
+        "当前友人档案数",
+        currentNotes.ok
+          ? friendNoteCount(currentNotes.state)
+          : "无法读取（将被备份内容替换）"
+      );
+      addLine(
+        body,
+        "备份友人档案数",
+        backupNotes === null ? "无友人档案" : friendNoteCount(backupNotes)
+      );
+      if (currentNotes.ok) {
+        const onlyCurrent = Object.keys(currentNotes.state.notes).filter(
+          (uid) => backupNotes === null || !hasOwn(backupNotes.notes, uid)
+        ).length;
+        addLine(
+          body,
+          "恢复后将被移除的当前档案",
+          `${onlyCurrent} 条（备份中没有）`
+        );
+      }
+    }
+
+    const actions = createElement("div", null, "wfr-actions");
+    const exportButton = createElement("button", "先备份当前数据", "wfr-button");
+    const confirmButton = createElement(
+      "button",
+      "确认完整替换",
+      "wfr-button wfr-primary"
+    );
+    exportButton.type = "button";
+    confirmButton.type = "button";
+    exportButton.addEventListener("click", () => void exportBackup());
+    confirmButton.addEventListener("click", async () => {
+      exportButton.disabled = true;
+      confirmButton.disabled = true;
+      if (restoreBlockedByRunningOperation()) {
+        showFailure("恢复备份失败", {
+          failureKind: "UPDATE_ALREADY_RUNNING",
+        });
+        return;
+      }
+      const restored = await restoreValidatedBackup(
+        validated,
+        currentLoaded.raw,
+        expectedFollowerRaw,
+        friendNotesPreview.expectedRaw
+      );
+      if (!restored.ok) {
+        showFailure("恢复备份失败", restored);
+        return;
+      }
+      // An open profile panel would otherwise keep showing the replaced note.
+      if (restored.friendNotesRestored) rebuildProfileFriendNotes();
+      showUnreadBadgeForState(restored.state);
+      const success = showPanel("备份已恢复", true);
+      success.append(createElement("p", "备份已恢复。", "wfr-success"));
+      addLine(success, "事件数", restored.state.events.length);
+      addLine(success, "快照记录数", snapshotRecordCount(restored.state));
+      addLine(
+        success,
+        "粉丝快照和粉丝变化记录",
+        restored.followerRestored ? "已一并恢复" : "未包含在此备份中，保持不变"
+      );
+      addLine(
+        success,
+        "友人档案",
+        restored.friendNotesRestored
+          ? `已一并恢复（${friendNoteCount(validated.friendNotesState)} 条）`
+          : "未包含在此备份中，保持不变"
+      );
+    });
+    actions.append(exportButton, confirmButton);
+    body.append(actions);
+  }
+
+  async function restoreBackup() {
+    if (restoreBlockedByRunningOperation()) {
+      showFailure("恢复备份", {
+        failureKind: "UPDATE_ALREADY_RUNNING",
+      });
+      return;
+    }
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showFailure("恢复备份", uidResult);
+      return;
+    }
+    const currentLoaded = loadState(uidResult.uid);
+    if (!currentLoaded.ok) {
+      showFailure("恢复备份", currentLoaded);
+      return;
+    }
+
+    let file;
+    try {
+      file = await selectBackupFile();
+    } catch (error) {
+      showFailure("恢复备份", {
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "FILE_READ_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      });
+      return;
+    }
+    if (file === null) {
+      const cancelled = showPanel("恢复已取消", true);
+      cancelled.append(createElement("p", "恢复已取消。", "wfr-muted"));
+      return;
+    }
+
+    let text;
+    try {
+      text = await file.text();
+    } catch (error) {
+      showFailure("恢复备份", {
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "FILE_READ_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      });
+      return;
+    }
+    const validated = validateBackupText(text, uidResult.uid);
+    if (!validated.ok) {
+      showFailure("恢复备份", validated);
+      return;
+    }
+    // The follower bytes the user is about to review become this restore's
+    // expected value, exactly as the Friend Radar raw already does. A v1 backup
+    // touches no follower state, so it neither needs nor reads the token.
+    let expectedFollowerRaw = null;
+    if (validated.followerCovered) {
+      const followerToken = currentFollowerRestoreToken(uidResult.uid);
+      if (!followerToken.ok) {
+        showFailure("恢复备份", followerToken);
+        return;
+      }
+      expectedFollowerRaw = followerToken.raw;
+    }
+    // Friend Notes follow the same rule. For a v1/v2 backup the notes are only
+    // read to tell the user they stay as they are; an unreadable value there
+    // blocks nothing, because that restore never touches it.
+    const friendNotesToken = currentFriendNotesRestoreToken(uidResult.uid);
+    if (validated.friendNotesCovered && !friendNotesToken.ok) {
+      showFailure("恢复备份", friendNotesToken);
+      return;
+    }
+    showRestorePreview(validated, currentLoaded, expectedFollowerRaw, {
+      expectedRaw: friendNotesToken.ok ? friendNotesToken.raw : null,
+      current: friendNotesToken.ok
+        ? friendNotesStateFromRaw(friendNotesToken.raw, uidResult.uid)
+        : friendNotesToken,
+    });
+  }
+
+  function backupExportError(backupStage, error) {
+    const tagged = new Error("Backup export failed");
+    tagged.name = error && error.name ? String(error.name) : "Error";
+    tagged.backupStage = backupStage;
+    return tagged;
+  }
+
+  // Browser-managed Blob download, shared by the backup and event exports.
+  // Failures reuse the export stage names so the failure UI stays consistent.
+  function downloadFile(content, filename, mimeType) {
+    let blob;
+    try {
+      blob = new Blob([content], { type: mimeType });
+    } catch (error) {
+      throw backupExportError("FALLBACK_CREATE_BLOB", error);
+    }
+    let objectUrl;
+    try {
+      objectUrl = URL.createObjectURL(blob);
+    } catch (error) {
+      throw backupExportError("FALLBACK_CREATE_URL", error);
+    }
+    try {
+      const link = createElement("a");
+      link.href = objectUrl;
+      link.download = filename;
+      link.hidden = true;
+      document.body.append(link);
+      try {
+        link.click();
+      } finally {
+        if (link.parentNode) link.parentNode.removeChild(link);
+        setTimeout(
+          () => URL.revokeObjectURL(objectUrl),
+          OBJECT_URL_REVOKE_DELAY_MS
+        );
+      }
+    } catch (error) {
+      throw backupExportError("FALLBACK_TRIGGER_DOWNLOAD", error);
+    }
+  }
+
+  async function saveBackup(json, filename) {
+    if (
+      typeof unsafeWindow !== "undefined" &&
+      typeof unsafeWindow.showSaveFilePicker === "function"
+    ) {
+      let fileHandle;
+      try {
+        fileHandle = await unsafeWindow.showSaveFilePicker.call(
+          unsafeWindow,
+          {
+            suggestedName: filename,
+            types: [
+              {
+                description: "JSON backup",
+                accept: { "application/json": [".json"] },
+              },
+            ],
+          }
+        );
+      } catch (error) {
+        const errorName = error && error.name ? String(error.name) : "Error";
+        if (errorName === "AbortError") return { cancelled: true };
+        if (errorName !== "NotAllowedError" && errorName !== "SecurityError") {
+          throw backupExportError("PICKER_OPEN", error);
+        }
+        downloadFile(json, filename, BACKUP_MIME);
+        return { method: "browser-download", filename };
+      }
+
+      let writable;
+      try {
+        writable = await fileHandle.createWritable();
+      } catch (error) {
+        throw backupExportError("CREATE_WRITABLE", error);
+      }
+      try {
+        await writable.write(json);
+      } catch (error) {
+        throw backupExportError("WRITE_FILE", error);
+      }
+      try {
+        await writable.close();
+      } catch (error) {
+        throw backupExportError("CLOSE_FILE", error);
+      }
+      return {
+        method: "save-picker",
+        filename:
+          typeof fileHandle.name === "string" && fileHandle.name.length > 0
+            ? fileHandle.name
+            : filename,
+      };
+    }
+
+    downloadFile(json, filename, BACKUP_MIME);
+    return { method: "browser-download", filename };
+  }
+
+  async function exportBackup() {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showFailure("导出备份", uidResult);
+      return;
+    }
+    const loaded = loadState(uidResult.uid);
+    if (!loaded.ok) {
+      showFailure("导出备份", loaded);
+      return;
+    }
+    // Only the last successfully persisted follower state is exported; an
+    // unreadable one fails the export rather than silently backing up "none".
+    const followerLoaded = loadFollowerState(uidResult.uid);
+    if (!followerLoaded.ok) {
+      showFailure("导出备份", followerLoaded);
+      return;
+    }
+    const followerStateForBackup =
+      followerLoaded.raw === null ? null : followerLoaded.state;
+    // Hand-written notes obey the same rule: unreadable notes fail the export
+    // instead of producing a backup that claims there were none.
+    const friendNotesLoaded = loadFriendNotesState(uidResult.uid);
+    if (!friendNotesLoaded.ok) {
+      showFailure("导出备份", friendNotesLoaded);
+      return;
+    }
+    const friendNotesForBackup =
+      friendNotesLoaded.raw === null ? null : friendNotesLoaded.state;
+
+    const exportedAt = new Date();
+    const filename = backupFilename(uidResult.uid, exportedAt);
+    let saveResult;
+    try {
+      const backup = createBackup(
+        uidResult.uid,
+        loaded.state,
+        followerStateForBackup,
+        exportedAt,
+        friendNotesForBackup
+      );
+      const json = serializeBackup(backup);
+      saveResult = await saveBackup(json, filename);
+    } catch (error) {
+      showFailure("导出备份", {
+        failureKind: "BACKUP_EXPORT_ERROR",
+        backupStage: error && error.backupStage ? String(error.backupStage) : "PREPARE_BACKUP",
+        errorName: error && error.name ? String(error.name) : "Error",
+      });
+      return;
+    }
+
+    if (saveResult.cancelled) {
+      const body = showPanel("导出已取消", true);
+      body.append(createElement("p", "导出已取消", "wfr-muted"));
+      return;
+    }
+
+    const nativeSave = saveResult.method === "save-picker";
+    const body = showPanel(
+      nativeSave ? "备份已保存" : "已请求浏览器下载备份",
+      true
+    );
+    if (!nativeSave) {
+      body.append(
+        createElement(
+          "p",
+          "备份已交给浏览器下载，保存位置及最终文件名由浏览器下载设置决定。",
+          "wfr-success"
+        )
+      );
+    }
+    addLine(body, "账号 UID", uidResult.uid);
+    addLine(
+      body,
+      "已有快照",
+      loaded.state.latestSnapshot ? "是" : "否"
+    );
+    addLine(body, "事件数", loaded.state.events.length);
+    addLine(
+      body,
+      "粉丝变化事件数",
+      followerStateForBackup === null
+        ? "无粉丝快照"
+        : followerStateForBackup.events.length
+    );
+    addLine(
+      body,
+      "友人档案数",
+      friendNotesForBackup === null
+        ? "无友人档案"
+        : friendNoteCount(friendNotesForBackup)
+    );
+    addLine(body, nativeSave ? "文件名" : "建议文件名", saveResult.filename);
+  }
+
+  // Read-only: builds a document from the already loaded state and hands it to the
+  // browser download path. Friend Radar storage is never touched.
+  function exportEvents(ownerUid, state, format) {
+    const spec = EVENT_EXPORT_FORMATS[format];
+    const exportedAt = new Date();
+    const filename = eventExportFilename(ownerUid, exportedAt, spec.extension);
+    const backToEvents = () => renderEvents(ownerUid, state, null);
+    try {
+      downloadFile(
+        spec.build(ownerUid, state.events, exportedAt),
+        filename,
+        spec.mimeType
+      );
+    } catch (error) {
+      showFailure(
+        "导出事件",
+        {
+          failureKind: "EVENT_EXPORT_ERROR",
+          exportStage: error && error.backupStage ? String(error.backupStage) : "PREPARE_EXPORT",
+          errorName: error && error.name ? String(error.name) : "Error",
+        },
+        backToEvents
+      );
+      return;
+    }
+
+    const body = showPanel("已请求浏览器下载事件", backToEvents);
+    body.append(
+      createElement(
+        "p",
+        "事件文件已交给浏览器下载，保存位置及最终文件名由浏览器下载设置决定。",
+        "wfr-success"
+      )
+    );
+    addLine(body, "格式", spec.label);
+    addLine(body, "建议文件名", filename);
+    addLine(body, "已导出事件数", state.events.length);
+    body.append(
+      createElement(
+        "p",
+        "导出内容仅为 Weibo Toolkit 已观察并保存的事件，本地数据未被修改。",
+        "wfr-muted"
+      )
+    );
+  }
+
+  function showRelationshipOverview() {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showFailure("关系概览", uidResult);
+      return;
+    }
+    const loaded = loadState(uidResult.uid);
+    if (!loaded.ok) {
+      showFailure("关系概览", loaded);
+      return;
+    }
+    showUnreadBadgeForState(loaded.state);
+
+    const overview = deriveRelationshipOverview(loaded.state);
+    const body = showPanel("关系概览", true);
+
+    body.append(createElement("h3", "当前状态"));
+    if (overview.current === null) {
+      body.append(
+        createElement(
+          "p",
+          "尚未保存首次关注快照，暂无当前关系状态可显示。请先完成一次关系雷达更新。",
+          "wfr-muted"
+        )
+      );
+    } else {
+      addLine(body, "快照时间", formatTime(overview.current.capturedAt));
+      addLine(body, "API可见关注", overview.current.visibleFollowing);
+      addLine(body, "互相关注", overview.current.mutual);
+      addLine(body, "单向关注", overview.current.oneWay);
+      body.append(
+        createElement(
+          "p",
+          "“单向关注”指你关注了对方，但在最近一次快照中未观察到对方关注你。",
+          "wfr-muted"
+        )
+      );
+      body.append(
+        createElement(
+          "p",
+          "以上数字只覆盖接口可见的关注列表，不代表微博上的完整关注或粉丝情况。",
+          "wfr-muted"
+        )
+      );
+    }
+
+    body.append(createElement("h3", "历史事件次数"));
+    addLine(body, "事件总数", overview.totalEvents);
+    addLine(body, "未读事件", overview.unreadEvents);
+    for (const type of Object.values(EVENT)) {
+      addLine(body, EVENT_LABELS[type], overview.historicalEventCounts[type]);
+    }
+    body.append(
+      createElement(
+        "p",
+        "历史数字统计的是事件发生次数，不是人数：同一个账号反复变化会被多次计入。",
+        "wfr-muted"
+      )
+    );
+    body.append(
+      createElement(
+        "p",
+        "以上仅为 Weibo Toolkit 实际观察并保存的事件，不是微博上的完整真实关系历史。",
+        "wfr-muted"
+      )
+    );
+  }
+
+  // The button carries an explicit accessible name, so it has to be recomposed
+  // whenever either the label or the badge changes.
+  function syncLauncherAccessibleName() {
+    if (!launcherButton || !launcherLabel || !launcherBadge) return;
+    const unread = launcherBadge.hidden
+      ? ""
+      : `，${launcherBadge.textContent} 条未读事件`;
+    launcherButton.setAttribute(
+      "aria-label",
+      `${launcherLabel.textContent}${unread}`
+    );
+  }
+
+  function setLauncherLabel(text) {
+    if (!launcherLabel) return;
+    launcherLabel.textContent = text;
+    syncLauncherAccessibleName();
+  }
+
+  function setLauncherStatus(text, resetAfterMilliseconds) {
+    if (!launcherButton) return;
+    if (launcherStatusTimer !== null) {
+      clearTimeout(launcherStatusTimer);
+      launcherStatusTimer = null;
+    }
+    setLauncherLabel(text);
+    if (typeof resetAfterMilliseconds === "number") {
+      launcherStatusTimer = setTimeout(() => {
+        setLauncherLabel(LAUNCHER_LABEL);
+        launcherStatusTimer = null;
+      }, resetAfterMilliseconds);
+    }
+  }
+
+  // Purely visual: the badge reads stored state and never writes it or fetches.
+  function showUnreadBadge(unreadEventCount) {
+    if (!launcherBadge) return;
+    const badgeText = formatUnreadBadge(unreadEventCount);
+    launcherBadge.textContent = badgeText === null ? "" : badgeText;
+    launcherBadge.hidden = badgeText === null;
+    syncLauncherAccessibleName();
+  }
+
+  function showUnreadBadgeForState(state) {
+    showUnreadBadge(countUnreadEvents(state.events));
+  }
+
+  function refreshUnreadBadge() {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showUnreadBadge(0);
+      return;
+    }
+    const loaded = loadState(uidResult.uid);
+    showUnreadBadge(loaded.ok ? countUnreadEvents(loaded.state.events) : 0);
+  }
+
+  function pageLockManager() {
+    try {
+      if (
+        typeof unsafeWindow !== "undefined" &&
+        unsafeWindow.navigator &&
+        unsafeWindow.navigator.locks &&
+        typeof unsafeWindow.navigator.locks.request === "function"
+      ) {
+        return unsafeWindow.navigator.locks;
+      }
+    } catch (_) {
+      // Automatic scanning fails safe when the page-realm LockManager is unavailable.
+    }
+    return null;
+  }
+
+  async function checkAutomaticUpdate() {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) return uidResult;
+    const preliminary = evaluateAutomaticUpdateEligibility(
+      uidResult.uid,
+      Date.now()
+    );
+    if (!preliminary.ok || !preliminary.eligible) return preliminary;
+
+    const lockManager = pageLockManager();
+    if (lockManager === null) {
+      return { ok: true, eligible: false, reason: "LOCK_UNAVAILABLE" };
+    }
+
+    try {
+      return await lockManager.request.call(
+        lockManager,
+        `weibo-toolkit-friend-radar-auto-${uidResult.uid}`,
+        { mode: "exclusive", ifAvailable: true },
+        async (lock) => {
+          if (lock === null) {
+            return { ok: true, eligible: false, reason: "LOCK_NOT_ACQUIRED" };
+          }
+
+          const lockedEligibility = evaluateAutomaticUpdateEligibility(
+            uidResult.uid,
+            Date.now()
+          );
+          if (!lockedEligibility.ok || !lockedEligibility.eligible) {
+            return lockedEligibility;
+          }
+          if (
+            updateRunning ||
+            followerUpdateRunning ||
+            followerRemovalInFlight
+          ) {
+            return { ok: true, eligible: false, reason: "UPDATE_ALREADY_RUNNING" };
+          }
+          const currentUid = determineCurrentUid();
+          if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
+            return {
+              ok: false,
+              failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+            };
+          }
+
+          updateRunning = true;
+          setLauncherStatus("关系雷达正在自动更新…");
+          let result;
+          // An outcome is only ever written for an attempt the storage layer
+          // actually accepted, so a rejected attempt cannot leave an orphan
+          // result behind for a run that never happened.
+          let attemptedAt = null;
+          let attemptRecorded = false;
+          try {
+            result = await performUpdate(null, () => {
+              const candidate = new Date().toISOString();
+              const saved = saveLastAutomaticAttempt(
+                uidResult.uid,
+                candidate
+              );
+              if (!saved.ok) return saved;
+              attemptedAt = candidate;
+              attemptRecorded = true;
+              return saved;
+            });
+          } catch (error) {
+            result = {
+              ok: false,
+              failureKind: "UNKNOWN_FAILURE",
+              errorName: error && error.name ? String(error.name) : "Error",
+            };
+          } finally {
+            updateRunning = false;
+          }
+          // Outcome metadata is advisory: a failed record never downgrades the
+          // durable scan result, but it must not be reported as a clean run.
+          const outcomeRecorded =
+            !attemptRecorded ||
+            saveAutomaticOutcome(
+              AUTO_OUTCOME_PREFIX,
+              uidResult.uid,
+              attemptedAt,
+              result
+            ).ok;
+          setLauncherStatus(
+            result.ok
+              ? outcomeRecorded
+                ? "关系雷达自动更新完成"
+                : "关系雷达自动更新完成，但结果记录未保存"
+              : outcomeRecorded
+                ? "关系雷达自动更新失败"
+                : "关系雷达自动更新失败，且结果记录未保存",
+            AUTO_STATUS_DURATION_MS
+          );
+          refreshUnreadBadge();
+          return result;
+        }
+      );
+    } catch (error) {
+      return {
+        ok: true,
+        eligible: false,
+        reason: "LOCK_REQUEST_FAILED",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  async function checkAutomaticFollowerUpdate() {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) return uidResult;
+    const preliminary = evaluateFollowerAutomaticUpdateEligibility(
+      uidResult.uid,
+      Date.now()
+    );
+    if (!preliminary.ok || !preliminary.eligible) return preliminary;
+
+    const lockManager = pageLockManager();
+    if (lockManager === null) {
+      return { ok: true, eligible: false, reason: "LOCK_UNAVAILABLE" };
+    }
+    try {
+      return await lockManager.request.call(
+        lockManager,
+        "weibo-toolkit-friend-radar-auto-" + uidResult.uid,
+        { mode: "exclusive", ifAvailable: true },
+        async (lock) => {
+          if (lock === null) {
+            return { ok: true, eligible: false, reason: "LOCK_NOT_ACQUIRED" };
+          }
+          const lockedEligibility =
+            evaluateFollowerAutomaticUpdateEligibility(
+              uidResult.uid,
+              Date.now()
+            );
+          if (!lockedEligibility.ok || !lockedEligibility.eligible) {
+            return lockedEligibility;
+          }
+          if (
+            updateRunning ||
+            followerUpdateRunning ||
+            followerRemovalInFlight
+          ) {
+            return {
+              ok: true,
+              eligible: false,
+              reason: "UPDATE_ALREADY_RUNNING",
+            };
+          }
+          const currentUid = determineCurrentUid();
+          if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
+            return {
+              ok: false,
+              failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+            };
+          }
+          const attemptedAt = new Date().toISOString();
+          const attemptSaved = saveFollowerLastAutomaticAttempt(
+            uidResult.uid,
+            attemptedAt
+          );
+          if (!attemptSaved.ok) return attemptSaved;
+
+          followerUpdateRunning = true;
+          setLauncherStatus("粉丝快照正在自动更新…");
+          let result;
+          try {
+            result = await performFollowerUpdate(
+              null,
+              () => false,
+              { automatic: true }
+            );
+          } catch (error) {
+            result = {
+              ok: false,
+              failureKind: "UNKNOWN_FAILURE",
+              errorName: error && error.name ? String(error.name) : "Error",
+            };
+          } finally {
+            followerUpdateRunning = false;
+          }
+          // The attempt above is only reached once it is durably recorded, so
+          // this outcome always belongs to a real attempt; only its own
+          // persistence can fail, and that stays visible without changing the
+          // durable scan result.
+          const outcomeSaved = saveAutomaticOutcome(
+            FOLLOWER_AUTO_OUTCOME_PREFIX,
+            uidResult.uid,
+            attemptedAt,
+            result
+          );
+          setLauncherStatus(
+            result.ok
+              ? outcomeSaved.ok
+                ? "粉丝快照自动更新完成"
+                : "粉丝快照自动更新完成，但结果记录未保存"
+              : outcomeSaved.ok
+                ? "粉丝快照自动更新失败"
+                : "粉丝快照自动更新失败，且结果记录未保存",
+            AUTO_STATUS_DURATION_MS
+          );
+          return result;
+        }
+      );
+    } catch (error) {
+      return {
+        ok: true,
+        eligible: false,
+        reason: "LOCK_REQUEST_FAILED",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  async function checkAutomaticUpdatesSequentially() {
+    const friendRadar = await checkAutomaticUpdate();
+    const followerSnapshot = await checkAutomaticFollowerUpdate();
+    markFeedFriendNotesStale();
+    return { friendRadar, followerSnapshot };
+  }
+
+  function showAutoUpdateSettings(notice) {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showFailure("自动更新设置", uidResult);
+      return;
+    }
+    const interval = loadAutoInterval(uidResult.uid);
+    if (!interval.ok) {
+      showFailure("自动更新设置", interval);
+      return;
+    }
+    const loaded = loadState(uidResult.uid);
+    if (!loaded.ok) {
+      showFailure("自动更新设置", loaded);
+      return;
+    }
+    const lastAttempt = loadLastAutomaticAttempt(uidResult.uid);
+    if (!lastAttempt.ok) {
+      showFailure("自动更新设置", lastAttempt);
+      return;
+    }
+    const lastOutcome = loadAutomaticOutcome(
+      AUTO_OUTCOME_PREFIX,
+      uidResult.uid
+    );
+    if (!lastOutcome.ok) {
+      showFailure("自动更新设置", lastOutcome);
+      return;
+    }
+    const followerInterval = loadFollowerAutoInterval(uidResult.uid);
+    if (!followerInterval.ok) {
+      showFailure("自动更新设置", followerInterval);
+      return;
+    }
+    const followerState = loadFollowerState(uidResult.uid);
+    if (!followerState.ok) {
+      showFailure("自动更新设置", followerState);
+      return;
+    }
+    const followerLastAttempt = loadFollowerLastAutomaticAttempt(
+      uidResult.uid
+    );
+    if (!followerLastAttempt.ok) {
+      showFailure("自动更新设置", followerLastAttempt);
+      return;
+    }
+    const followerLastOutcome = loadAutomaticOutcome(
+      FOLLOWER_AUTO_OUTCOME_PREFIX,
+      uidResult.uid
+    );
+    if (!followerLastOutcome.ok) {
+      showFailure("自动更新设置", followerLastOutcome);
+      return;
+    }
+
+    const body = showPanel("自动更新与外观", true);
+    if (notice) body.append(createElement("p", notice, "wfr-success"));
+    body.append(createElement("h3", "关系雷达自动更新"));
+    body.append(
+      createElement(
+        "p",
+        "仅在打开网页版微博时检查，不会在浏览器后台定时运行。",
+        "wfr-muted"
+      )
+    );
+    if (loaded.state.latestSnapshot === null) {
+      body.append(
+        createElement(
+          "p",
+          "请先手动完成一次关系雷达更新，自动更新不会保存首次快照。",
+          "wfr-muted"
+        )
+      );
+    }
+    const label = createElement("label", "自动更新间隔：", "wfr-row");
+    const select = createElement("select", null, "wfr-select");
+    const choices = [
+      [0, "关闭"],
+      [24, "每 24 小时"],
+      [48, "每 48 小时"],
+      [72, "每 72 小时"],
+      [168, "每 7 天"],
+      [360, "每 15 天"],
+    ];
+    for (const [hours, text] of choices) {
+      const option = createElement("option", text);
+      option.value = String(hours);
+      option.selected = hours === interval.value;
+      select.append(option);
+    }
+    select.value = String(interval.value);
+    label.append(select);
+    body.append(label);
+    addLine(
+      body,
+      "上次成功更新",
+      loaded.state.latestSnapshot === null
+        ? "—"
+        : formatTime(loaded.state.latestSnapshot.capturedAt)
+    );
+    addLine(
+      body,
+      "上次自动尝试",
+      lastAttempt.value === null ? "—" : formatTime(lastAttempt.value)
+    );
+    addLine(
+      body,
+      "上次自动结果",
+      describeAutomaticOutcomeForAttempt(lastAttempt.value, lastOutcome.value)
+    );
+    body.append(
+      createElement(
+        "p",
+        "“自动尝试”记录开始请求的时间；“上次成功更新”记录快照完成并保存的时间，两者可能相差本次扫描耗时。",
+        "wfr-muted"
+      )
+    );
+
+    const saveButton = createElement("button", "保存设置", "wfr-button wfr-primary");
+    saveButton.type = "button";
+    saveButton.addEventListener("click", () => {
+      const currentUid = determineCurrentUid();
+      if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
+        showFailure("自动更新设置", {
+          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+        });
+        return;
+      }
+      const value = Number(select.value);
+      if (!AUTO_INTERVAL_HOURS.includes(value)) {
+        showFailure("自动更新设置", {
+          failureKind: "STORAGE_ERROR",
+          reason: "AUTO_INTERVAL_INVALID",
+        });
+        return;
+      }
+      const saved = saveAutoInterval(uidResult.uid, value);
+      if (!saved.ok) {
+        showFailure("自动更新设置", saved);
+        return;
+      }
+      showAutoUpdateSettings("关系雷达自动更新设置已保存。");
+    });
+    body.append(saveButton);
+
+    body.append(createElement("h3", "粉丝快照自动更新"));
+    body.append(
+      createElement(
+        "p",
+        "仅在打开网页版微博时检查，不会在浏览器后台定时运行。",
+        "wfr-muted"
+      )
+    );
+    if (followerState.state.latestSnapshot === null) {
+      body.append(
+        createElement(
+          "p",
+          "首次到期的自动更新会保存首次粉丝快照，不会生成历史变化事件。",
+          "wfr-muted"
+        )
+      );
+    }
+    const followerIntervalLabel = createElement(
+      "label",
+      "自动更新间隔：",
+      "wfr-row"
+    );
+    const followerIntervalSelect = createElement(
+      "select",
+      null,
+      "wfr-select"
+    );
+    for (const [hours, text] of [
+      [0, "关闭"],
+      [24, "每 24 小时"],
+      [48, "每 48 小时"],
+      [72, "每 72 小时"],
+      [168, "每 7 天"],
+      [360, "每 15 天"],
+    ]) {
+      const option = createElement("option", text);
+      option.value = String(hours);
+      followerIntervalSelect.append(option);
+    }
+    followerIntervalSelect.value = String(followerInterval.value);
+    followerIntervalLabel.append(followerIntervalSelect);
+    body.append(followerIntervalLabel);
+    addLine(
+      body,
+      "上次成功更新",
+      followerState.state.latestSnapshot === null
+        ? "—"
+        : formatTime(followerState.state.latestSnapshot.capturedAt)
+    );
+    addLine(
+      body,
+      "上次自动尝试",
+      followerLastAttempt.value === null
+        ? "—"
+        : formatTime(followerLastAttempt.value)
+    );
+    addLine(
+      body,
+      "上次自动结果",
+      describeAutomaticOutcomeForAttempt(
+        followerLastAttempt.value,
+        followerLastOutcome.value
+      )
+    );
+    body.append(
+      createElement(
+        "p",
+        "首次启用建议选择每 72 小时。",
+        "wfr-muted"
+      )
+    );
+    const followerSaveButton = createElement(
+      "button",
+      "保存设置",
+      "wfr-button wfr-primary"
+    );
+    followerSaveButton.type = "button";
+    followerSaveButton.addEventListener("click", () => {
+      const currentUid = determineCurrentUid();
+      if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
+        showFailure("自动更新设置", {
+          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+        });
+        return;
+      }
+      const selectedHours = Number(followerIntervalSelect.value);
+      if (!AUTO_INTERVAL_HOURS.includes(selectedHours)) {
+        showFailure("自动更新设置", {
+          failureKind: "STORAGE_ERROR",
+          reason: "FOLLOWER_AUTO_INTERVAL_INVALID",
+        });
+        return;
+      }
+      const saved = saveFollowerAutoInterval(
+        uidResult.uid,
+        selectedHours
+      );
+      if (!saved.ok) {
+        showFailure("自动更新设置", saved);
+        return;
+      }
+      showAutoUpdateSettings("粉丝快照自动更新设置已保存。");
+    });
+    body.append(followerSaveButton);
+
+    body.append(createElement("h3", "外观"));
+    body.append(buildAppearanceControl());
+    body.append(
+      createElement(
+        "p",
+        "外观仅影响 Weibo Toolkit 自己的界面，不会更改微博页面的主题，也不会跟随微博的主题设置。",
+        "wfr-muted"
+      )
+    );
+  }
+
+  function showPageSettings() {
+    const body = showPanel("浏览体验", true);
+    const status = createElement("p", "", "wfr-muted wfr-browse-status");
+    const tabList = createElement("div", null, "wfr-browse-tabs");
+    tabList.setAttribute("role", "tablist");
+    tabList.setAttribute("aria-label", "浏览体验分类");
+    const tabs = [];
+
+    function createBrowseTab(id, labelText, selected) {
+      const button = createElement("button", labelText, "wfr-browse-tab");
+      button.type = "button";
+      button.id = `wfr-browse-tab-${id}`;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-controls", `wfr-browse-panel-${id}`);
+      button.setAttribute("aria-selected", selected ? "true" : "false");
+      const panel = createElement("section", null, "wfr-browse-panel");
+      panel.id = `wfr-browse-panel-${id}`;
+      panel.setAttribute("role", "tabpanel");
+      panel.setAttribute("aria-labelledby", button.id);
+      panel.hidden = !selected;
+      const tab = { button, panel };
+      tabs.push(tab);
+      button.addEventListener("click", () => {
+        for (const candidate of tabs) {
+          const isSelected = candidate === tab;
+          candidate.button.setAttribute(
+            "aria-selected",
+            isSelected ? "true" : "false"
+          );
+          candidate.panel.hidden = !isSelected;
+        }
+      });
+      tabList.append(button);
+      return panel;
+    }
+
+    const feedPanel = createBrowseTab("feed", "信息流", true);
+    const enhancementPanel = createBrowseTab("enhancement", "增强", false);
+    const cleanupPanel = createBrowseTab("cleanup", "净化", false);
+    body.append(tabList, feedPanel, enhancementPanel, cleanupPanel);
+
+    function appendToggle(container, labelText, key, property, description) {
+      const label = createElement(
+        "label",
+        null,
+        "wfr-toggle wfr-row wfr-setting-label"
+      );
+      const input = createElement("input");
+      input.type = "checkbox";
+      input.checked = pageCleanupPreferences[property];
+      input.setAttribute("aria-label", labelText);
+      label.append(input, createElement("span", labelText));
+      input.addEventListener("change", () => {
+        const previous = pageCleanupPreferences[property];
+        const next = input.checked === true;
+        const saved = savePageCleanupPreference(key, next);
+        if (!saved.ok) {
+          input.checked = previous;
+          status.textContent = "页面净化偏好未能保存，微博页面未改变。";
+          return;
+        }
+        pageCleanupPreferences[property] = next;
+        try {
+          applyPageCleanupStyles();
+        } catch (_) {
+          pageCleanupPreferences[property] = previous;
+          savePageCleanupPreference(key, previous);
+          input.checked = previous;
+          try {
+            applyPageCleanupStyles();
+          } catch (_) {
+            // Preferences remain fail-closed if presentation recovery also fails.
+          }
+          status.textContent = "页面净化偏好未能应用，微博页面未改变。";
+          return;
+        }
+        status.textContent = next ? "已隐藏所选页面组件。" : "已恢复所选页面组件。";
+      });
+      container.append(label);
+      if (description) {
+        container.append(
+          createElement(
+            "p",
+            description,
+            "wfr-muted wfr-setting-description"
+          )
+        );
+      }
+    }
+
+    const latestLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row wfr-setting-label"
+    );
+    const latestInput = createElement("input");
+    latestInput.type = "checkbox";
+    latestInput.checked = preferLatestFeed;
+    latestInput.setAttribute("aria-label", "首页优先进入最新微博");
+    latestLabel.append(latestInput, createElement("span", "首页优先进入最新微博"));
+    latestInput.addEventListener("change", () => {
+      const previous = preferLatestFeed;
+      const next = latestInput.checked === true;
+      const saved = savePageCleanupPreference(PREFER_LATEST_FEED_KEY, next);
+      if (!saved.ok) {
+        latestInput.checked = previous;
+        status.textContent = "浏览体验偏好未能保存。";
+        return;
+      }
+      preferLatestFeed = next;
+      if (!next) latestFeedNavigationPending = false;
+      status.textContent = next
+        ? "每个标签页首次进入微博首页时将打开最新微博。"
+        : "已停止自动进入最新微博。";
+    });
+    feedPanel.append(
+      latestLabel,
+      createElement(
+        "p",
+        "每个标签页首次打开微博首页时自动进入按时间排序的“最新微博”。",
+        "wfr-muted wfr-setting-description"
+      )
+    );
+
+    const latestRecommendedLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row wfr-setting-label"
+    );
+    const latestRecommendedInput = createElement("input");
+    latestRecommendedInput.type = "checkbox";
+    latestRecommendedInput.checked =
+      pageCleanupPreferences.hideLatestRecommended;
+    latestRecommendedInput.setAttribute(
+      "aria-label",
+      "隐藏信息流中的推广内容"
+    );
+    latestRecommendedLabel.append(
+      latestRecommendedInput,
+      createElement("span", "隐藏信息流中的推广内容")
+    );
+    latestRecommendedInput.addEventListener("change", () => {
+      const previous = pageCleanupPreferences.hideLatestRecommended;
+      const next = latestRecommendedInput.checked === true;
+      const saved = savePageCleanupPreference(
+        HIDE_LATEST_RECOMMENDED_KEY,
+        next
+      );
+      if (!saved.ok) {
+        latestRecommendedInput.checked = previous;
+        status.textContent = "浏览体验偏好未能保存。";
+        return;
+      }
+      pageCleanupPreferences.hideLatestRecommended = next;
+      try {
+        applyPageCleanupStyles();
+        installLatestFeedRecommendationFilter();
+      } catch (_) {
+        pageCleanupPreferences.hideLatestRecommended = previous;
+        savePageCleanupPreference(HIDE_LATEST_RECOMMENDED_KEY, previous);
+        latestRecommendedInput.checked = previous;
+        try {
+          applyPageCleanupStyles();
+          installLatestFeedRecommendationFilter();
+        } catch (_) {
+          // The previous fail-closed state remains the recovery boundary.
+        }
+        status.textContent = "“荐读”隐藏设置未能应用，微博内容未改变。";
+        return;
+      }
+      status.textContent = next
+        ? "已隐藏首页和“最新微博”中明确标记为“荐读”的内容。"
+        : "已停止隐藏信息流推广内容；强力规则偏好会保留但不生效。";
+    });
+    feedPanel.append(
+      latestRecommendedLabel,
+      createElement(
+        "p",
+        "默认仅隐藏明确标记为“荐读”的内容。",
+        "wfr-muted wfr-setting-description"
+      )
+    );
+
+    const strongPromotionLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row wfr-setting-label wfr-suboption"
+    );
+    const strongPromotionInput = createElement("input");
+    strongPromotionInput.type = "checkbox";
+    strongPromotionInput.checked =
+      pageCleanupPreferences.strongFeedPromotionFilter;
+    strongPromotionInput.setAttribute(
+      "aria-label",
+      "使用强力规则（可能误伤）"
+    );
+    strongPromotionLabel.append(
+      strongPromotionInput,
+      createElement("span", "使用强力规则（可能误伤）")
+    );
+    strongPromotionInput.addEventListener("change", () => {
+      const previous = pageCleanupPreferences.strongFeedPromotionFilter;
+      const next = strongPromotionInput.checked === true;
+      const saved = savePageCleanupPreference(
+        STRONG_FEED_PROMOTION_FILTER_KEY,
+        next
+      );
+      if (!saved.ok) {
+        strongPromotionInput.checked = previous;
+        status.textContent = "强力过滤偏好未能保存。";
+        return;
+      }
+      pageCleanupPreferences.strongFeedPromotionFilter = next;
+      try {
+        applyPageCleanupStyles();
+        installLatestFeedRecommendationFilter();
+      } catch (_) {
+        pageCleanupPreferences.strongFeedPromotionFilter = previous;
+        savePageCleanupPreference(STRONG_FEED_PROMOTION_FILTER_KEY, previous);
+        strongPromotionInput.checked = previous;
+        try {
+          applyPageCleanupStyles();
+          installLatestFeedRecommendationFilter();
+        } catch (_) {
+          // The previous fail-closed state remains the recovery boundary.
+        }
+        status.textContent = "强力过滤规则未能应用，微博内容未改变。";
+        return;
+      }
+      status.textContent = next
+        ? pageCleanupPreferences.hideLatestRecommended
+          ? "已启用强力推广过滤。"
+          : "已保存强力规则偏好；启用上方推广过滤后才会生效。"
+        : "已停用强力规则，精确“荐读”规则保持不变。";
+    });
+    feedPanel.append(
+      strongPromotionLabel,
+      createElement(
+        "p",
+        "额外识别推荐、广告等推广标签和明确广告模块。",
+        "wfr-muted wfr-setting-description wfr-suboption-description"
+      )
+    );
+
+    const autoExpandLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row wfr-setting-label"
+    );
+    const autoExpandInput = createElement("input");
+    autoExpandInput.type = "checkbox";
+    autoExpandInput.checked = pageCleanupPreferences.autoExpandLongPosts;
+    autoExpandInput.setAttribute("aria-label", "自动展开原创长微博");
+    autoExpandLabel.append(
+      autoExpandInput,
+      createElement("span", "自动展开原创长微博")
+    );
+    autoExpandInput.addEventListener("change", () => {
+      const previous = pageCleanupPreferences.autoExpandLongPosts;
+      const next = autoExpandInput.checked === true;
+      const saved = savePageCleanupPreference(AUTO_EXPAND_LONG_POSTS_KEY, next);
+      if (!saved.ok) {
+        autoExpandInput.checked = previous;
+        status.textContent = "自动展开偏好未能保存。";
+        return;
+      }
+      pageCleanupPreferences.autoExpandLongPosts = next;
+      try {
+        installLatestFeedRecommendationFilter();
+      } catch (_) {
+        pageCleanupPreferences.autoExpandLongPosts = previous;
+        savePageCleanupPreference(AUTO_EXPAND_LONG_POSTS_KEY, previous);
+        autoExpandInput.checked = previous;
+        try {
+          installLatestFeedRecommendationFilter();
+        } catch (_) {
+          // The previous fail-closed state remains the recovery boundary.
+        }
+        status.textContent = "自动展开未能启动，微博正文未改变。";
+        return;
+      }
+      status.textContent = next
+        ? "已启用视口内长微博自动展开。"
+        : "已停止后续自动展开；已经展开的正文不会被强制收起。";
+    });
+    feedPanel.append(
+      autoExpandLabel,
+      createElement(
+        "p",
+        "首页、“最新微博”和个人主页中，在你停下来阅读原创长微博时自动展开；转发微博保持折叠，展开时可能触发微博自身的正文加载。",
+        "wfr-muted wfr-setting-description"
+      )
+    );
+
+    const profileExtrasLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row wfr-setting-label"
+    );
+    const profileExtrasInput = createElement("input");
+    profileExtrasInput.type = "checkbox";
+    profileExtrasInput.checked = pageCleanupPreferences.showProfileExtras;
+    profileExtrasInput.setAttribute("aria-label", "显示主页小档案");
+    profileExtrasLabel.append(
+      profileExtrasInput,
+      createElement("span", "显示主页小档案")
+    );
+    profileExtrasInput.addEventListener("change", () => {
+      const previous = pageCleanupPreferences.showProfileExtras;
+      const next = profileExtrasInput.checked === true;
+      const saved = savePageCleanupPreference(SHOW_PROFILE_EXTRAS_KEY, next);
+      if (!saved.ok) {
+        profileExtrasInput.checked = previous;
+        status.textContent = "主页小档案设置未能保存。";
+        return;
+      }
+      pageCleanupPreferences.showProfileExtras = next;
+      if (next) {
+        ensureProfileExtras();
+      } else {
+        teardownProfileExtras(false);
+      }
+      // The friend-notes panel shows observed facts only while Profile Extras is
+      // off, so it is rebuilt to keep the two from repeating each other.
+      rebuildProfileFriendNotes();
+      status.textContent = next
+        ? "已启用其他用户主页的 Toolkit 本地小档案与访问记录。"
+        : "已停止显示主页小档案和记录主页访问。";
+    });
+    enhancementPanel.append(
+      profileExtrasLabel,
+      createElement(
+        "p",
+        "使用 Toolkit 已有本地关系记录显示历史昵称等资料，并记录当前浏览器的访问次数和上次访问时间；不新增个人主页请求。",
+        "wfr-muted wfr-setting-description"
+      )
+    );
+
+    const friendNotesLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row wfr-setting-label"
+    );
+    const friendNotesInput = createElement("input");
+    friendNotesInput.type = "checkbox";
+    friendNotesInput.checked = pageCleanupPreferences.showProfileFriendNotes;
+    friendNotesInput.setAttribute("aria-label", "在主页显示友人档案");
+    friendNotesLabel.append(
+      friendNotesInput,
+      createElement("span", "在主页显示友人档案")
+    );
+    friendNotesInput.addEventListener("change", () => {
+      const previous = pageCleanupPreferences.showProfileFriendNotes;
+      const next = friendNotesInput.checked === true;
+      const saved = savePageCleanupPreference(
+        SHOW_PROFILE_FRIEND_NOTES_KEY,
+        next
+      );
+      if (!saved.ok) {
+        friendNotesInput.checked = previous;
+        status.textContent = "友人档案显示设置未能保存。";
+        return;
+      }
+      pageCleanupPreferences.showProfileFriendNotes = next;
+      rebuildProfileFriendNotes();
+      status.textContent = next
+        ? "已在其他用户主页显示友人档案。"
+        : "已停止在主页显示友人档案；已保存的备注和标签不受影响。";
+    });
+    enhancementPanel.append(
+      friendNotesLabel,
+      createElement(
+        "p",
+        "在其他用户的主页显示你手写的备注和标签，并可直接编辑。不记录访问，不新增微博请求；工具箱里的“友人档案”始终可用。",
+        "wfr-muted wfr-setting-description"
+      )
+    );
+
+    const feedFriendNotesLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row wfr-setting-label"
+    );
+    const feedFriendNotesInput = createElement("input");
+    feedFriendNotesInput.type = "checkbox";
+    feedFriendNotesInput.checked = pageCleanupPreferences.showFeedFriendNotes;
+    feedFriendNotesInput.setAttribute("aria-label", "在信息流显示友人档案");
+    feedFriendNotesLabel.append(
+      feedFriendNotesInput,
+      createElement("span", "在信息流显示友人档案")
+    );
+    feedFriendNotesInput.addEventListener("change", () => {
+      const previous = pageCleanupPreferences.showFeedFriendNotes;
+      const next = feedFriendNotesInput.checked === true;
+      const saved = savePageCleanupPreference(SHOW_FEED_FRIEND_NOTES_KEY, next);
+      if (!saved.ok) {
+        feedFriendNotesInput.checked = previous;
+        status.textContent = "信息流友人档案设置未能保存。";
+        return;
+      }
+      pageCleanupPreferences.showFeedFriendNotes = next;
+      try {
+        installLatestFeedRecommendationFilter();
+      } catch (_) {
+        pageCleanupPreferences.showFeedFriendNotes = previous;
+        savePageCleanupPreference(SHOW_FEED_FRIEND_NOTES_KEY, previous);
+        feedFriendNotesInput.checked = previous;
+        try {
+          installLatestFeedRecommendationFilter();
+        } catch (_) {
+          // The previous fail-closed state remains the recovery boundary.
+        }
+        status.textContent = "信息流友人档案未能启动，微博页面未改变。";
+        return;
+      }
+      status.textContent = next
+        ? "已在首页和“最新微博”的作者旁显示友人档案入口。"
+        : "已停止在信息流显示友人档案；已保存的备注和标签不受影响。";
+    });
+    enhancementPanel.append(
+      feedFriendNotesLabel,
+      createElement(
+        "p",
+        "在首页和“最新微博”中，为能从页面可靠识别 UID 的微博作者显示“有备注 / 写备注”入口，点击后可查看和编辑。只读取本地数据，不记录浏览，不新增微博请求；不依赖其他页面选项。",
+        "wfr-muted wfr-setting-description"
+      )
+    );
+
+    const usageEnabledLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row wfr-setting-label"
+    );
+    const usageEnabledInput = createElement("input");
+    usageEnabledInput.type = "checkbox";
+    usageEnabledInput.checked = usageEnabledPreference;
+    usageEnabledInput.setAttribute("aria-label", "记录网页版使用统计");
+    usageEnabledLabel.append(
+      usageEnabledInput,
+      createElement("span", "记录网页版使用统计")
+    );
+    usageEnabledInput.addEventListener("change", () => {
+      const previous = usageEnabledPreference;
+      const next = usageEnabledInput.checked === true;
+      const saved = savePageCleanupPreference(USAGE_ENABLED_KEY, next);
+      if (!saved.ok) {
+        usageEnabledInput.checked = previous;
+        status.textContent = "使用统计设置未能保存。";
+        return;
+      }
+      usageEnabledPreference = next;
+      if (next) {
+        const started = startUsageTracking(true);
+        if (!started.ok) {
+          usageEnabledPreference = previous;
+          savePageCleanupPreference(USAGE_ENABLED_KEY, previous);
+          usageEnabledInput.checked = previous;
+          stopUsageTracking(false);
+          status.textContent =
+            "当前无法安全启动使用统计；设置未改变，也没有开始记录。";
+          return;
+        }
+        status.textContent = "已开始在本浏览器记录网页版使用统计。";
+      } else {
+        stopUsageTracking(true);
+        status.textContent = "已停止记录；已有统计会保留到手动清空。";
+      }
+      syncUsageCorner();
+    });
+    enhancementPanel.append(
+      usageEnabledLabel,
+      createElement(
+        "p",
+        "仅在当前浏览器记录估算活跃时间和浏览数量，不保存微博正文或详细浏览历史。",
+        "wfr-muted wfr-setting-description"
+      )
+    );
+
+    const usageCornerLabel = createElement(
+      "label",
+      null,
+      "wfr-toggle wfr-row wfr-setting-label wfr-suboption"
+    );
+    const usageCornerInput = createElement("input");
+    usageCornerInput.type = "checkbox";
+    usageCornerInput.checked = usageCornerPreference;
+    usageCornerInput.setAttribute("aria-label", "在页面角落显示今日统计");
+    usageCornerLabel.append(
+      usageCornerInput,
+      createElement("span", "在页面角落显示今日统计")
+    );
+    usageCornerInput.addEventListener("change", () => {
+      const previous = usageCornerPreference;
+      const next = usageCornerInput.checked === true;
+      const saved = savePageCleanupPreference(USAGE_CORNER_KEY, next);
+      if (!saved.ok) {
+        usageCornerInput.checked = previous;
+        status.textContent = "角落统计设置未能保存。";
+        return;
+      }
+      usageCornerPreference = next;
+      syncUsageCorner();
+      status.textContent = next
+        ? usageEnabledPreference
+          ? "已显示今日统计。"
+          : "角落统计已准备；开启使用统计后显示。"
+        : "已隐藏角落统计。";
+    });
+    const usageActions = createElement(
+      "div",
+      null,
+      "wfr-actions wfr-compact-actions"
+    );
+    const usagePanelButton = createElement(
+      "button",
+      "查看微博计步器",
+      "wfr-button"
+    );
+    usagePanelButton.type = "button";
+    usagePanelButton.addEventListener("click", showUsageStatistics);
+    usageActions.append(usagePanelButton);
+    enhancementPanel.append(
+      usageCornerLabel,
+      createElement(
+        "p",
+        "开启记录后，可在页面角落显示今日分钟数和浏览数量。",
+        "wfr-muted wfr-setting-description wfr-suboption-description"
+      ),
+      usageActions
+    );
+
+    cleanupPanel.append(createElement("h3", "侧栏"));
+    appendToggle(
+      cleanupPanel,
+      "隐藏微博热搜",
+      HIDE_HOT_SEARCH_KEY,
+      "hideHotSearch",
+      "隐藏右侧热搜模块，可随时恢复。"
+    );
+    appendToggle(
+      cleanupPanel,
+      "隐藏整个右侧栏",
+      HIDE_RIGHT_SIDEBAR_KEY,
+      "hideRightSidebar",
+      "隐藏热搜、推荐、创作者中心等整个右侧区域。"
+    );
+
+    cleanupPanel.append(createElement("h3", "顶部导航"));
+    appendToggle(
+      cleanupPanel,
+      "隐藏顶部推荐入口",
+      HIDE_TOP_RECOMMEND_KEY,
+      "hideTopRecommend"
+    );
+    appendToggle(
+      cleanupPanel,
+      "隐藏顶部视频入口",
+      HIDE_TOP_VIDEO_KEY,
+      "hideTopVideo"
+    );
+    cleanupPanel.append(
+      createElement(
+        "p",
+        "仅隐藏明确列出的页面组件，不处理信息流内容。",
+        "wfr-muted wfr-setting-description"
+      )
+    );
+    body.append(status);
+  }
+
+  function showToolkitHome() {
+    const uidResult = determineCurrentUid();
+    if (!uidResult.ok) {
+      showFailure("Weibo Toolkit", uidResult, false);
+      return;
+    }
+    const loaded = loadState(uidResult.uid);
+    if (!loaded.ok) {
+      showFailure("Weibo Toolkit", loaded, false);
+      return;
+    }
+
+    const body = showPanel("Weibo Toolkit");
+    const snapshot = loaded.state.latestSnapshot;
+    const unread = countUnreadEvents(loaded.state.events);
+    showUnreadBadge(unread);
+    const moduleTitle = createElement("p", null, "wfr-row");
+    moduleTitle.append(createElement("strong", "关系雷达"));
+    body.append(moduleTitle);
+    addLine(
+      body,
+      "上次成功更新",
+      snapshot ? formatTime(snapshot.capturedAt) : "—"
+    );
+    addLine(body, "API可见关注", snapshot ? snapshot.visibleCount : "—");
+    addLine(body, "未读事件", unread);
+
+    const actions = createElement("div", null, "wfr-actions");
+    const updateButton = createElement("button", "立即更新", "wfr-button wfr-primary");
+    const eventsButton = createElement("button", "查看事件", "wfr-button");
+    const overviewButton = createElement("button", "关系概览", "wfr-button");
+    const statusButton = createElement("button", "查看状态", "wfr-button");
+    const exportButton = createElement("button", "导出备份", "wfr-button");
+    const restoreButton = createElement("button", "恢复备份", "wfr-button");
+    const autoSettingsButton = createElement(
+      "button",
+      "自动更新与外观",
+      "wfr-button"
+    );
+    for (const button of [
+      updateButton,
+      eventsButton,
+      overviewButton,
+      statusButton,
+      exportButton,
+      restoreButton,
+      autoSettingsButton,
+    ]) {
+      button.type = "button";
+    }
+    updateButton.addEventListener("click", () => void updateNow());
+    eventsButton.addEventListener("click", viewEvents);
+    overviewButton.addEventListener("click", showRelationshipOverview);
+    statusButton.addEventListener("click", viewStatus);
+    exportButton.addEventListener("click", exportBackup);
+    restoreButton.addEventListener("click", () => void restoreBackup());
+    autoSettingsButton.addEventListener("click", showAutoUpdateSettings);
+    actions.append(
+      updateButton,
+      eventsButton,
+      overviewButton,
+      statusButton,
+      exportButton,
+      restoreButton,
+      autoSettingsButton
+    );
+    body.append(actions);
+
+    // The follower module is its own section, so the gap after the Friend Radar
+    // actions belongs to the section and survives button wrapping.
+    const followerSection = createElement("div", null, "wfr-module");
+    body.append(followerSection);
+    const followerModuleTitle = createElement("p", null, "wfr-row");
+    followerModuleTitle.append(createElement("strong", "粉丝变化"));
+    followerSection.append(followerModuleTitle);
+    const followerLoaded = loadFollowerState(uidResult.uid);
+    if (!followerLoaded.ok) {
+      followerSection.append(
+        createElement(
+          "p",
+          "粉丝快照本地状态无法读取。",
+          "wfr-error"
+        )
+      );
+    } else {
+      const followerSnapshot = followerLoaded.state.latestSnapshot;
+      addLine(
+        followerSection,
+        "上次成功更新",
+        followerSnapshot ? formatTime(followerSnapshot.capturedAt) : "—"
+      );
+      addLine(
+        followerSection,
+        "API可见粉丝",
+        followerSnapshot ? followerSnapshot.uniqueRecordCount : "—"
+      );
+      addLine(followerSection, "变化事件", followerLoaded.state.events.length);
+      appendFollowerVisibilityNote(followerSection, followerSnapshot);
+    }
+    const followerActions = createElement("div", null, "wfr-actions");
+    const followerUpdateButton = createElement(
+      "button",
+      "更新粉丝快照",
+      "wfr-button wfr-primary"
+    );
+    const followerEventsButton = createElement(
+      "button",
+      "查看粉丝变化",
+      "wfr-button"
+    );
+    const followerHygieneButton = createElement(
+      "button",
+      "粉丝体检",
+      "wfr-button"
+    );
+    followerUpdateButton.type = "button";
+    followerEventsButton.type = "button";
+    followerHygieneButton.type = "button";
+    followerUpdateButton.addEventListener(
+      "click",
+      () => void updateFollowersNow()
+    );
+    followerEventsButton.addEventListener("click", viewFollowerEvents);
+    followerHygieneButton.addEventListener("click", showFollowerHygiene);
+    followerActions.append(
+      followerUpdateButton,
+      followerEventsButton,
+      followerHygieneButton
+    );
+    followerSection.append(followerActions);
+
+    // Always reachable from Home, whatever the profile-page option is set to.
+    const friendNotesSection = createElement("div", null, "wfr-module");
+    const friendNotesTitle = createElement("p", null, "wfr-row");
+    friendNotesTitle.append(createElement("strong", "友人档案"));
+    friendNotesSection.append(friendNotesTitle);
+    const friendNotesLoaded = loadFriendNotesState(uidResult.uid);
+    if (!friendNotesLoaded.ok) {
+      friendNotesSection.append(
+        createElement("p", "友人档案本地数据无法读取。", "wfr-error")
+      );
+    } else {
+      addLine(
+        friendNotesSection,
+        "已保存档案",
+        Object.keys(friendNotesLoaded.state.notes).length
+      );
+    }
+    const friendNotesActions = createElement("div", null, "wfr-actions");
+    const friendNotesButton = createElement("button", "友人档案", "wfr-button");
+    friendNotesButton.type = "button";
+    friendNotesButton.addEventListener("click", () => showFriendNotesManager());
+    friendNotesActions.append(friendNotesButton);
+    friendNotesSection.append(friendNotesActions);
+    body.append(friendNotesSection);
+
+    const browseSection = createElement("div", null, "wfr-module");
+    const browseTitle = createElement("p", null, "wfr-row");
+    browseTitle.append(createElement("strong", "浏览体验"));
+    const browseActions = createElement("div", null, "wfr-actions");
+    const browseButton = createElement("button", "浏览体验", "wfr-button");
+    browseButton.type = "button";
+    browseButton.addEventListener("click", showPageSettings);
+    browseActions.append(browseButton);
+    browseSection.append(browseTitle, browseActions);
+    body.append(browseSection);
+
+    if (bundledReleaseVersionsThrough(APP_VERSION).length > 0) {
+      const changelogFooter = createElement(
+        "p",
+        null,
+        "wfr-changelog-footer wfr-muted"
+      );
+      const changelogButton = createElement(
+        "button",
+        `v${APP_VERSION} · 更新记录`,
+        "wfr-button wfr-changelog-link"
+      );
+      changelogButton.type = "button";
+      changelogButton.addEventListener("click", () => {
+        showUpdateHistory(APP_VERSION);
+      });
+      changelogFooter.append(changelogButton);
+      body.append(changelogFooter);
+    }
+  }
+
+  // Toolkit-only appearance preference: it changes nothing but Toolkit styling.
+  function buildAppearanceControl() {
+    const row = createElement("label", "外观：", "wfr-row");
+    const select = createElement("select", null, "wfr-select");
+    select.setAttribute("aria-label", "外观");
+    for (const [value, text] of THEME_CHOICES) {
+      const option = createElement("option", text);
+      option.value = value;
+      option.selected = value === currentTheme;
+      select.append(option);
+    }
+    select.value = currentTheme;
+    select.addEventListener("change", () => {
+      const chosen = normalizeTheme(select.value);
+      const saved = saveTheme(chosen);
+      if (!saved.ok) {
+        showFailure("外观设置", saved);
+        return;
+      }
+      currentTheme = chosen;
+      applyTheme();
+    });
+    row.append(select);
+    return row;
+  }
+
+  function installToolkitLauncher() {
+    if (!document.body) return;
+    const button = createElement(
+      "button",
+      null,
+      "wfr-button wfr-toolkit-launcher wfr-root"
+    );
+    button.type = "button";
+    button.setAttribute("aria-label", LAUNCHER_LABEL);
+    applyThemeToRoot(button);
+    launcherLabel = createElement("span", LAUNCHER_LABEL, "wfr-launcher-label");
+    launcherBadge = createElement("span", "", "wfr-launcher-badge");
+    launcherBadge.hidden = true;
+    button.append(launcherLabel, launcherBadge);
+    button.addEventListener("click", showToolkitHome);
+    document.body.append(button);
+    launcherButton = button;
+    refreshUnreadBadge();
+  }
+
+  // Every Toolkit colour is a custom property carried by the Toolkit roots, so a
+  // theme is selected purely by which token block wins on `.wfr-root`.
+  const LIGHT_THEME_TOKENS =
+    "color-scheme: light; --wfr-overlay-bg: rgba(0,0,0,.45); --wfr-panel-bg: #fff; --wfr-panel-text: #222; --wfr-panel-shadow: 0 12px 36px rgba(0,0,0,.25); --wfr-border: #ddd; --wfr-control-border: #bbb; --wfr-button-bg: #fff; --wfr-button-text: #222; --wfr-primary-bg: #1677ff; --wfr-primary-text: #fff; --wfr-danger-bg: #c9330d; --wfr-danger-text: #fff; --wfr-danger-border: #a52708; --wfr-danger-hover-bg: #a52708; --wfr-success: #176b2c; --wfr-error: #a11919; --wfr-muted: #666; --wfr-field-bg: #fff; --wfr-field-text: #222; --wfr-card-bg: transparent; --wfr-launcher-bg: rgba(255,255,255,.9); --wfr-launcher-text: #1f2328; --wfr-launcher-border: rgba(0,0,0,.18); --wfr-launcher-hover-bg: #fff; --wfr-launcher-hover-border: rgba(0,0,0,.32); --wfr-badge-bg: #d4380d; --wfr-badge-text: #fff;";
+
+  const DARK_THEME_TOKENS =
+    "color-scheme: dark; --wfr-overlay-bg: rgba(0,0,0,.6); --wfr-panel-bg: #1f2126; --wfr-panel-text: #e8e8ea; --wfr-panel-shadow: 0 12px 36px rgba(0,0,0,.55); --wfr-border: #3a3d44; --wfr-control-border: #4a4e56; --wfr-button-bg: #2a2d33; --wfr-button-text: #e8e8ea; --wfr-primary-bg: #2d7ff9; --wfr-primary-text: #fff; --wfr-danger-bg: #b23a2f; --wfr-danger-text: #fff; --wfr-danger-border: #d0574a; --wfr-danger-hover-bg: #c4483b; --wfr-success: #6bd18c; --wfr-error: #ff8f8f; --wfr-muted: #a6aab3; --wfr-field-bg: #2a2d33; --wfr-field-text: #e8e8ea; --wfr-card-bg: #24272d; --wfr-launcher-bg: rgba(33,35,40,.92); --wfr-launcher-text: #e8e8ea; --wfr-launcher-border: rgba(255,255,255,.22); --wfr-launcher-hover-bg: rgba(45,48,55,.96); --wfr-launcher-hover-border: rgba(255,255,255,.38); --wfr-badge-bg: #ff6b5e; --wfr-badge-text: #26100c;";
+
+  function installStyles() {
+    const style = createElement("style");
+    style.textContent = `
+      .wfr-root { ${LIGHT_THEME_TOKENS} }
+      .wfr-root.wfr-theme-dark { ${DARK_THEME_TOKENS} }
+      @media (prefers-color-scheme: dark) {
+        .wfr-root.wfr-theme-system { ${DARK_THEME_TOKENS} }
+      }
+      .wfr-overlay { position: fixed; inset: 0; z-index: 2147483647; background: var(--wfr-overlay-bg); padding: 28px; overflow: auto; box-sizing: border-box; }
+      .wfr-panel { max-width: 720px; margin: 0 auto; background: var(--wfr-panel-bg); color: var(--wfr-panel-text); border-radius: 8px; box-shadow: var(--wfr-panel-shadow); font: 14px/1.5 system-ui, sans-serif; }
+      .wfr-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 20px; border-bottom: 1px solid var(--wfr-border); }
+      .wfr-header h2 { margin: 0; font-size: 18px; }
+      .wfr-body { padding: 18px 20px 22px; }
+      .wfr-row { margin: 7px 0; overflow-wrap: anywhere; }
+      .wfr-button { border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-button-bg); color: var(--wfr-button-text); padding: 6px 10px; cursor: pointer; }
+      .wfr-button:disabled { opacity: .55; cursor: default; }
+      .wfr-primary { margin: 10px 0 14px; background: var(--wfr-primary-bg); border-color: var(--wfr-primary-bg); color: var(--wfr-primary-text); }
+      .wfr-danger { background: var(--wfr-danger-bg); border-color: var(--wfr-danger-border); color: var(--wfr-danger-text); font-weight: 600; }
+      .wfr-danger:hover:enabled, .wfr-danger:focus-visible { background: var(--wfr-danger-hover-bg); border-color: var(--wfr-danger-hover-bg); }
+      .wfr-success { color: var(--wfr-success); font-weight: 600; }
+      .wfr-error { color: var(--wfr-error); font-weight: 600; }
+      .wfr-muted { color: var(--wfr-muted); }
+      .wfr-search { width: 100%; box-sizing: border-box; margin-top: 12px; padding: 6px 9px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-select { margin-left: 8px; padding: 5px 8px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-toggle { display: flex; align-items: center; gap: 8px; }
+      .wfr-browse-tabs { display: flex; gap: 4px; margin: -4px 0 8px; border-bottom: 1px solid var(--wfr-border); }
+      .wfr-browse-tab { appearance: none; border: 0; border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0; background: transparent; color: var(--wfr-muted); padding: 6px 11px 5px; font: inherit; font-weight: 600; cursor: pointer; }
+      .wfr-browse-tab:hover { color: var(--wfr-button-text); background: var(--wfr-card-bg); }
+      .wfr-browse-tab[aria-selected="true"] { color: var(--wfr-button-text); border-bottom-color: var(--wfr-primary-bg); background: var(--wfr-card-bg); }
+      .wfr-browse-tab:focus-visible { outline: 2px solid var(--wfr-primary-bg); outline-offset: 2px; }
+      .wfr-browse-panel { padding-top: 2px; }
+      .wfr-browse-panel[hidden] { display: none; }
+      .wfr-setting-label { margin: 5px 0 1px; }
+      .wfr-setting-description { margin: 0 0 7px; padding-left: 22px; font-size: 12.5px; line-height: 1.4; }
+      .wfr-suboption { margin-left: 22px; }
+      .wfr-suboption-description { margin-left: 22px; }
+      .wfr-browse-status { margin: 9px 0 0; }
+      .wfr-browse-status:empty { display: none; }
+      .wfr-event-list { display: grid; gap: 10px; margin-top: 14px; }
+      .wfr-event { border: 1px solid var(--wfr-border); border-radius: 6px; padding: 10px 12px; background: var(--wfr-card-bg); }
+      .wfr-event h3 { margin: 0 0 6px; font-size: 14px; }
+      .wfr-root input[type="checkbox"], .wfr-root input[type="radio"] { accent-color: var(--wfr-primary-bg); width: 14px; height: 14px; margin: 0; }
+      .wfr-hygiene-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px 14px; margin-top: 10px; padding: 10px 12px; border: 1px solid var(--wfr-border); border-radius: 6px; }
+      .wfr-hygiene-controls[hidden] { display: none; }
+      .wfr-hygiene-controls .wfr-hygiene-group, .wfr-hygiene-controls .wfr-actions { grid-column: 1 / -1; }
+      .wfr-hygiene-controls .wfr-actions { margin-top: 2px; }
+      .wfr-hygiene-group-label { font-weight: 600; }
+      .wfr-hygiene-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(116px, 1fr)); gap: 6px 12px; margin-top: 5px; }
+      .wfr-hygiene-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; }
+      .wfr-hygiene-bar[hidden] { display: none; }
+      .wfr-hygiene-bar .wfr-actions { margin-top: 0; }
+      .wfr-hygiene-filter-summary { flex: 1 1 220px; overflow-wrap: anywhere; }
+      .wfr-hygiene-summary { margin: 8px 0 2px; }
+      .wfr-hygiene-control { display: flex; flex-direction: column; align-items: stretch; gap: 5px; }
+      .wfr-hygiene-check { display: flex; align-items: center; gap: 8px; }
+      .wfr-hygiene-input { width: 100%; max-width: none; box-sizing: border-box; padding: 5px 8px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-hygiene-reasons { margin: 6px 0 10px; padding-left: 22px; }
+      .wfr-event-list .wfr-event { padding: 9px 11px; }
+      .wfr-hygiene-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+      .wfr-hygiene-head .wfr-hygiene-check { flex: 0 0 auto; }
+      .wfr-hygiene-head .wfr-hygiene-check span { font-size: 12px; color: var(--wfr-muted); }
+      .wfr-hygiene-name { flex: 1 1 auto; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+      .wfr-hygiene-uid { flex: 0 0 auto; color: var(--wfr-muted); font-size: 12px; }
+      .wfr-hygiene-line { margin: 5px 0 0; overflow-wrap: anywhere; }
+      .wfr-hygiene-facts { font-size: 12px; }
+      .wfr-event .wfr-actions { margin-top: 9px; }
+      .wfr-removal-confirm { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--wfr-border); border-radius: 6px; }
+      .wfr-batch-panel { margin-top: 10px; }
+      .wfr-selection-bar { position: sticky; bottom: 0; z-index: 1; display: flex; flex-direction: column; gap: 6px; margin-top: 14px; padding: 9px 11px; border: 1px solid var(--wfr-border); border-radius: 6px; background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: 0 -2px 10px rgba(0,0,0,.18); }
+      .wfr-selection-bar[hidden], .wfr-selection-row[hidden] { display: none; }
+      .wfr-selection-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+      .wfr-selection-count { font-weight: 600; }
+      .wfr-selection-bar .wfr-muted { margin: 0; }
+      .wfr-selection-bar .wfr-muted:empty { display: none; }
+      .wfr-selection-row .wfr-button:first-child + .wfr-selection-count { margin-right: auto; }
+      .wfr-confirm-list { max-height: 190px; overflow-y: auto; margin: 6px 0 10px; padding: 6px 8px 6px 26px; border: 1px solid var(--wfr-border); border-radius: 5px; }
+      .wfr-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+      .wfr-actions .wfr-primary { margin: 0; }
+      .wfr-compact-actions { margin-top: 6px; }
+      .wfr-module { margin-top: 22px; }
+      .wfr-body h3 { margin: 18px 0 6px; font-size: 15px; }
+      .wfr-body h3:first-child { margin-top: 0; }
+      .wfr-browse-panel h3 { margin: 10px 0 4px; }
+      .wfr-browse-panel h3:first-child { margin-top: 2px; }
+      .wfr-profile-extras { box-sizing: border-box; position: relative; margin: 0 0 7px; padding: 2px 16px 7px; background: transparent; color: var(--wfr-muted); font: 12px/1.35 system-ui, sans-serif; font-weight: 400; }
+      .wfr-profile-row { margin: 2px 0; overflow-wrap: anywhere; font-weight: 400; }
+      .wfr-profile-label { color: var(--wfr-muted); }
+      .wfr-profile-name-row { position: relative; width: max-content; max-width: 100%; margin: 3px 0; }
+      .wfr-profile-name-trigger { appearance: none; border: 0; padding: 0; background: transparent; color: var(--wfr-button-text); font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
+      .wfr-profile-name-trigger:focus-visible, .wfr-profile-name-close:focus-visible { outline: 2px solid var(--wfr-primary-bg); outline-offset: 2px; }
+      .wfr-profile-name-popover { position: absolute; top: calc(100% + 5px); left: 0; z-index: 20; box-sizing: border-box; min-width: 220px; max-width: min(320px, calc(100vw - 48px)); padding: 9px 11px; border: 1px solid var(--wfr-border); border-radius: 6px; background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: 0 6px 18px rgba(0,0,0,.18); }
+      .wfr-profile-name-popover-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+      .wfr-profile-name-close { appearance: none; border: 0; padding: 1px 3px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
+      .wfr-profile-name-list { max-height: 180px; margin: 7px 0 0; padding-left: 20px; overflow-y: auto; }
+      .wfr-note-editor { min-width: 0; }
+      .wfr-note-text { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+      .wfr-note-preview { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; margin: 5px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+      .wfr-note-time, .wfr-note-counter { margin: 3px 0; font-size: 12px; }
+      .wfr-note-tags { display: flex; flex-wrap: wrap; gap: 5px; margin: 5px 0; padding: 0; list-style: none; }
+      .wfr-note-tags[hidden] { display: none; }
+      .wfr-note-tag { display: inline-flex; align-items: center; gap: 3px; max-width: 100%; box-sizing: border-box; padding: 1px 8px; border: 1px solid var(--wfr-border); border-radius: 999px; background: var(--wfr-card-bg); color: var(--wfr-panel-text); font-size: 12px; overflow-wrap: anywhere; }
+      .wfr-note-tag-remove { appearance: none; border: 0; padding: 0 2px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
+      .wfr-note-tag-remove:focus-visible, .wfr-note-textarea:focus-visible, .wfr-note-tag-input:focus-visible { outline: 2px solid var(--wfr-primary-bg); outline-offset: 1px; }
+      .wfr-note-field-label { display: block; margin: 7px 0 3px; font-weight: 600; }
+      .wfr-note-textarea { display: block; width: 100%; min-height: 72px; box-sizing: border-box; resize: vertical; padding: 6px 9px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-note-tag-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+      .wfr-note-tag-input { flex: 1 1 140px; min-width: 0; box-sizing: border-box; padding: 5px 8px; border: 1px solid var(--wfr-control-border); border-radius: 5px; background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-note-status { margin: 6px 0 0; }
+      .wfr-note-status:empty { display: none; }
+      .wfr-note-conflict { margin: 4px 0 8px; padding: 8px 10px; border: 1px solid var(--wfr-error); border-radius: 6px; }
+      .wfr-note-conflict p { margin: 3px 0; }
+      .wfr-note-link { display: inline-block; font-size: 13.3333px; line-height: normal; text-decoration: none; }
+      .wfr-actions[hidden] { display: none; }
+      .wfr-profile-notes { box-sizing: border-box; margin: 0 0 8px; padding: 9px 16px 10px; border: 1px solid var(--wfr-border); border-radius: 8px; background: var(--wfr-panel-bg); color: var(--wfr-panel-text); font: 13px/1.45 system-ui, sans-serif; font-weight: 400; overflow-wrap: anywhere; }
+      .wfr-profile-notes p { margin: 3px 0; }
+      .wfr-profile-notes-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
+      .wfr-profile-notes-head .wfr-muted { font-size: 12px; }
+      .wfr-profile-notes .wfr-button { padding: 3px 9px; font: inherit; font-size: 12px; }
+      .wfr-profile-notes .wfr-removal-confirm { margin-top: 6px; }
+      .wfr-profile-notes-observed { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--wfr-border); color: var(--wfr-muted); font-size: 12px; }
+      .wfr-profile-notes-subhead { font-weight: 600; }
+      .wfr-feed-note { display: inline-flex; flex-wrap: nowrap; align-items: center; gap: 0; min-width: 0; max-width: 100%; margin-left: 5px; vertical-align: middle; color: inherit; font: 12px/1.5 system-ui, sans-serif; }
+      .wfr-feed-note-entry { appearance: none; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: 4px; padding: 0; background: transparent; color: inherit; font-size: 0; opacity: .4; cursor: pointer; vertical-align: middle; }
+      .wfr-feed-note-entry::before { content: ""; width: 14px; height: 14px; background: currentColor; -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 4h12v17l-6-4-6 4z' fill='none' stroke='white' stroke-width='1.7' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 4h12v17l-6-4-6 4z' fill='none' stroke='white' stroke-width='1.7' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; }
+      .wfr-feed-note-entry:hover, .wfr-feed-note-entry:focus-visible, .wfr-feed-note-entry[aria-expanded="true"] { opacity: 1; }
+      .wfr-feed-note-entry:focus-visible { outline: 2px solid var(--wfr-primary-bg); outline-offset: 2px; }
+      .wfr-feed-note-entry.wfr-feed-note-has { color: var(--wfr-primary-bg); opacity: .85; }
+      .wfr-feed-note-hint { display: none; }
+      .wfr-feed-note-hint[hidden] { display: none; }
+      .wfr-feed-note-card { position: absolute; top: 0; left: 0; z-index: 2147482500; box-sizing: border-box; display: flex; flex-direction: column; width: min(360px, calc(100vw - 24px)); max-height: min(560px, calc(100vh - 24px)); overflow: hidden; padding: 10px 14px 12px; border: 1px solid var(--wfr-border); border-radius: 8px; background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: 0 8px 24px rgba(0,0,0,.24); font: 13px/1.45 system-ui, sans-serif; font-weight: 400; overflow-wrap: anywhere; }
+      .wfr-feed-note-card:focus { outline: none; }
+      .wfr-feed-note-card:focus-visible { outline: 2px solid var(--wfr-primary-bg); outline-offset: 1px; }
+      .wfr-feed-note-card p { margin: 3px 0; }
+      .wfr-feed-note-card .wfr-button { padding: 3px 9px; font: inherit; font-size: 12px; }
+      .wfr-feed-note-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+      .wfr-feed-note-card-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 0; }
+      .wfr-feed-note-card-title .wfr-muted { font-size: 12px; }
+      .wfr-feed-note-card-notice:empty { display: none; }
+      .wfr-feed-note-card-head, .wfr-feed-note-card-notice { flex: 0 0 auto; }
+      .wfr-feed-note-card-body { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+      .wfr-feed-note-card.wfr-feed-note-card-docked { position: fixed; top: auto; left: 12px; bottom: 12px; }
+      .wfr-changelog-list { margin: 7px 0; padding-left: 22px; }
+      .wfr-changelog-footer { margin: 18px 0 0; }
+      .wfr-changelog-link { padding: 3px 7px; font-size: 12px; opacity: .78; }
+      .wfr-changelog-link:hover, .wfr-changelog-link:focus-visible { opacity: 1; }
+      .wfr-release-history { padding: 8px 0; border-bottom: 1px solid var(--wfr-border); }
+      .wfr-release-history:first-child { padding-top: 0; }
+      .wfr-release-history summary { cursor: pointer; font-weight: 600; }
+      .wfr-release-history-content { padding: 2px 0 2px 12px; }
+      .wfr-release-history-content h3 { margin: 8px 0 3px; font-size: 13px; }
+      .wfr-release-history-content .wfr-changelog-list { margin: 3px 0 5px; }
+      .wfr-usage-corner { position: fixed; right: 18px; bottom: 58px; z-index: 2147482999; padding: 4px 8px; border: 1px solid var(--wfr-launcher-border); border-radius: 999px; background: var(--wfr-launcher-bg); color: var(--wfr-launcher-text); box-shadow: none; font: 11px/1.35 system-ui, sans-serif; opacity: .68; cursor: pointer; }
+      .wfr-usage-corner:hover, .wfr-usage-corner:focus-visible { opacity: 1; border-color: var(--wfr-launcher-hover-border); }
+      .wfr-toolkit-launcher { position: fixed; right: 18px; bottom: 18px; z-index: 2147483000; display: inline-flex; align-items: center; gap: 7px; padding: 8px 14px; border: 1px solid var(--wfr-launcher-border); border-radius: 999px; background: var(--wfr-launcher-bg); color: var(--wfr-launcher-text); box-shadow: none; font: 13px/1.35 system-ui, sans-serif; opacity: .9; transition: opacity 100ms ease, background-color 100ms ease, border-color 100ms ease; }
+      .wfr-toolkit-launcher:hover, .wfr-toolkit-launcher:focus-visible { border-color: var(--wfr-launcher-hover-border); background: var(--wfr-launcher-hover-bg); opacity: 1; }
+      .wfr-launcher-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 19px; height: 19px; padding: 0 6px; box-sizing: border-box; border-radius: 999px; background: var(--wfr-badge-bg); color: var(--wfr-badge-text); font-size: 11px; font-weight: 700; line-height: 1; }
+      .wfr-launcher-badge[hidden] { display: none; }
+    `;
+    document.head.append(style);
+  }
+
+  function registerMenuCommands() {
+    if (typeof GM_registerMenuCommand !== "function") return;
+    // Single fallback entry: everything else lives in the Toolkit UI itself.
+    GM_registerMenuCommand("Weibo Toolkit：打开工具箱", showToolkitHome);
+  }
+
+  function scheduleNormalSurfaceStartupCoordinators() {
+    scheduleBundledChangelogAutoShow();
+    setTimeout(
+      () => void checkAutomaticUpdatesSequentially(),
+      AUTO_STARTUP_DELAY_MS
+    );
+  }
+
+  currentTheme = loadTheme();
+  pageCleanupPreferences = loadPageCleanupPreferences();
+  preferLatestFeed = loadPageCleanupPreference(PREFER_LATEST_FEED_KEY);
+  usageEnabledPreference = loadPageCleanupPreference(USAGE_ENABLED_KEY);
+  usageCornerPreference = loadPageCleanupPreference(USAGE_CORNER_KEY);
+  installStyles();
+  applyPageCleanupStyles();
+  registerMenuCommands();
+  installToolkitLauncher();
+  installPageRouteHook();
+  syncPageRouteFeatures();
+  if (usageEnabledPreference) startUsageTracking(false);
+  scheduleNormalSurfaceStartupCoordinators();
+})();
