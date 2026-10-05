@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.10.1
+// @version      0.10.2
 // @description  Local-first Weibo toolkit with private friend notes, relationship tracking, follower tools, PM export, and optional page enhancements.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -925,7 +925,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.10.1";
+  const APP_VERSION = "0.10.2";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -1040,6 +1040,18 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.10.2": Object.freeze({
+      improved: Object.freeze([
+        "粉丝体检支持跨页手动保留选择，每批最多移除 200 个；修改筛选条件会清空选择",
+        "长面板随内容增长，粉丝体检操作栏贴底显示，滚动预留随操作栏高度变化更新",
+        "调整事实卡片和事件行，扫描进度改为吃豆人动画，尊重减少动态效果偏好",
+      ]),
+      fixed: Object.freeze([
+        "批量执行期间保护面板和停止入口，拒绝忙碌时的选择变更",
+        "选择或账号状态变化时作废旧确认，执行前重新核对名单，避免重试结果待确认的账号",
+        "修复窄窗口中的长昵称、错误码、设置页签和历史昵称浮层溢出，以及确认按钮被底栏遮挡的问题",
+      ]),
+    }),
     "0.10.1": Object.freeze({
       improved: Object.freeze([
         "工具箱首页改为模块布局，统一深浅色主题、控件和状态显示",
@@ -7511,11 +7523,11 @@
 
   const FOLLOWER_HYGIENE_PAGE_SIZE = 50;
   // A Toolkit product safety limit on one deliberate manual batch, not a claim
-  // about any Weibo server rate limit. It matches the local Hygiene page size, so
-  // one reviewed page is the largest unit of work; fifty sequential writes spaced
-  // by FOLLOWER_BATCH_REMOVE_DELAY_MS mean about 147 seconds of inter-write
+  // about any Weibo server rate limit. A selection may be built up across
+  // several reviewed pages; two hundred sequential writes spaced by
+  // FOLLOWER_BATCH_REMOVE_DELAY_MS mean about ten minutes of inter-write
   // pauses, which the execution-phase progress and stop control are built for.
-  const FOLLOWER_BATCH_MAX_SELECTION = 50;
+  const FOLLOWER_BATCH_MAX_SELECTION = 200;
   const FOLLOWER_BATCH_REMOVE_DELAY_MS = 3000;
 
   function normalizeHygieneThreshold(value) {
@@ -8167,11 +8179,15 @@
     const canonicalUid = normalizeStableUid(record.uid);
     const removed = removalState.successfullyRemovedUids.has(record.uid);
     const uncertain = removalState.uncertainRemovalUids.has(record.uid);
+    const batchActive =
+      typeof removalState.isBatchActive === "function" &&
+      removalState.isBatchActive();
     const selectionEligible =
       canonicalUid !== null &&
       canonicalUid === record.uid &&
       !removed &&
       !uncertain &&
+      !batchActive &&
       !followerRemovalInFlight &&
       !followerUpdateRunning &&
       !updateRunning;
@@ -8262,14 +8278,18 @@
         "wfr-button wfr-danger"
       );
       removeButton.type = "button";
-      removeButton.disabled = followerUpdateRunning || updateRunning;
+      removeButton.disabled =
+        batchActive || followerRemovalInFlight || followerUpdateRunning || updateRunning;
       const status = createElement(
         "p",
         removalState.messages.get(record.uid) || "",
         "wfr-muted"
       );
       removeButton.addEventListener("click", () => {
-        if (followerRemovalInFlight) {
+        if (
+          followerRemovalInFlight ||
+          (typeof removalState.isBatchActive === "function" && removalState.isBatchActive())
+        ) {
           status.textContent = "请等待当前移除操作完成。";
           return;
         }
@@ -8378,6 +8398,8 @@
       return;
     }
     const body = showPanel("粉丝体检", true);
+    // The selection bar docks against the panel's bottom edge.
+    body.classList.add("wfr-body-flush");
     const snapshot = loaded.state.latestSnapshot;
     if (snapshot === null) {
       body.append(
@@ -8404,9 +8426,13 @@
     const selectedUids = new Set();
     let currentPage = 1;
     let currentPageMatches = [];
+    // Every match of the current filters, across pages: the selection can span
+    // pages, so the batch is drawn from here rather than from the visible page.
+    let currentMatches = [];
     let selectionMessage = "";
     let batchStopRequested = false;
     let batchStatus = null;
+    let batchConfirmation = null;
     let filterInputs = [];
     let currentPagination = null;
     // Live handles on the currently rendered page, so selection and per-account
@@ -8422,6 +8448,7 @@
       selectedUids,
       changeSelection,
       registerCard,
+      isBatchActive: () => Boolean(batchStatus && batchStatus.active),
     };
 
     function registerCard(uid, element, selectionInput) {
@@ -8448,13 +8475,28 @@
       for (const uid of [...cardNodes.keys()]) refreshCard(uid);
     }
 
+    function invalidateBatchConfirmation() {
+      if (batchConfirmation === null) return;
+      // A detached confirmation must not execute its old reviewed list later.
+      batchConfirmation = null;
+      clearNode(batchPanel);
+    }
+
     function clearSelection() {
+      invalidateBatchConfirmation();
       selectedUids.clear();
       selectionMessage = "";
       for (const input of cardSelectionInputs.values()) input.checked = false;
     }
 
     function changeSelection(record, checked, input) {
+      if (
+        (batchStatus && batchStatus.active) ||
+        followerRemovalInFlight || followerUpdateRunning || updateRunning
+      ) {
+        input.checked = selectedUids.has(record.uid);
+        return;
+      }
       const canonicalUid = normalizeStableUid(record.uid);
       const eligible =
         canonicalUid !== null &&
@@ -8479,13 +8521,14 @@
         selectedUids.add(record.uid);
         selectionMessage = "";
       }
+      invalidateBatchConfirmation();
       // Selection is ephemeral view state: nothing outside the toolbar depends on
       // it, so no card is rebuilt and the scroll position is untouched.
       renderSelectionToolbar();
     }
 
     async function confirmRemoval(record) {
-      if (followerRemovalInFlight) {
+      if (followerRemovalInFlight || (batchStatus && batchStatus.active)) {
         removalMessages.set(record.uid, "请等待当前移除操作完成。");
         refreshCard(record.uid);
         return;
@@ -8495,6 +8538,7 @@
         refreshCard(record.uid);
         return;
       }
+      invalidateBatchConfirmation();
       followerRemovalInFlight = true;
       let result;
       try {
@@ -8521,6 +8565,7 @@
         }
         selectedUids.delete(record.uid);
       }
+      invalidateBatchConfirmation();
       refreshCard(record.uid);
       renderSelectionToolbar();
     }
@@ -8657,7 +8702,7 @@
       batchRemoveButton
     );
     // Execution phase: progress and the stop control live in the same sticky bar,
-    // so a fifty-account batch never leaves them scrolled out of reach. They are
+    // so a long batch never leaves them scrolled out of reach. They are
     // the only stop control while a batch runs.
     const batchControls = createElement("div", null, "wfr-selection-row");
     const batchProgressNode = createElement("span", "", "wfr-selection-count");
@@ -8783,7 +8828,7 @@
         busy ||
         selectedUids.size >= FOLLOWER_BATCH_MAX_SELECTION ||
         !eligibleVisibleUids().some((uid) => !selectedUids.has(uid));
-      clearSelectionButton.disabled = selectedUids.size === 0;
+      clearSelectionButton.disabled = selectedUids.size === 0 || busy || batchActive;
       batchRemoveButton.disabled = selectedUids.size === 0 || busy;
       if (batchActive) {
         batchProgressNode.textContent =
@@ -8800,15 +8845,47 @@
         selectionMessageNode.textContent = batchStatus.currentName
           ? "当前账号：" + batchStatus.currentName
           : "";
+        reserveSelectionBarSpace();
         return;
       }
       selectionMessageNode.textContent = selectionMessage;
+      reserveSelectionBarSpace();
+    }
+
+    // The bar floats over the bottom of the scroll area. Telling the scroller
+    // how tall it currently is keeps anything scrolled or focused into view,
+    // such as the batch confirmation buttons, clear of it.
+    function reserveSelectionBarSpace() {
+      if (!body.style) return;
+      const height = selectionToolbar.hidden
+        ? 0
+        : Number(selectionToolbar.offsetHeight) || 0;
+      // A little more than the bar itself, so a focused control is not flush
+      // against its top edge.
+      body.style.scrollPaddingBottom =
+        height > 0 ? String(Math.ceil(height) + 8) + "px" : "";
+    }
+
+    // The bar also changes height without being redrawn: narrowing the window
+    // wraps its buttons. The observer is released when the panel is closed or
+    // replaced; the check inside the callback is only a fallback, because a bar
+    // that was hidden all along never reports a change on removal.
+    if (typeof ResizeObserver === "function") {
+      const barObserver = new ResizeObserver(() => {
+        if (body.isConnected === false) {
+          barObserver.disconnect();
+          return;
+        }
+        reserveSelectionBarSpace();
+      });
+      barObserver.observe(selectionToolbar);
+      panelDismissHandler = () => barObserver.disconnect();
     }
 
     // Deliberate, local, current-page only. Ineligible cards carry no checkbox
     // and are simply skipped; fewer than a full page is not an error.
     function selectCurrentPage() {
-      if (followerRemovalInFlight) {
+      if (followerRemovalInFlight || (batchStatus && batchStatus.active)) {
         selectionMessage = "请等待当前移除操作完成。";
         renderSelectionToolbar();
         return;
@@ -8818,6 +8895,7 @@
         renderSelectionToolbar();
         return;
       }
+      invalidateBatchConfirmation();
       let refused = 0;
       for (const uid of eligibleVisibleUids()) {
         if (selectedUids.has(uid)) continue;
@@ -8850,6 +8928,7 @@
     }
 
     function renderBatchPanel() {
+      batchConfirmation = null;
       clearNode(batchPanel);
       if (batchStatus === null) return;
       // While a batch runs, progress and the stop control are shown by the sticky
@@ -8893,14 +8972,19 @@
       if (summary.success > 0) appendManualSnapshotRefresh(batchPanel);
     }
 
-    function selectedVisibleRecords() {
-      return currentPageMatches
-        .filter((match) => selectedUids.has(match.record.uid))
+    function selectedRecords() {
+      return currentMatches
+        .filter((match) =>
+          selectedUids.has(match.record.uid) &&
+          normalizeStableUid(match.record.uid) === match.record.uid &&
+          !successfullyRemovedUids.has(match.record.uid) &&
+          !uncertainRemovalUids.has(match.record.uid)
+        )
         .map((match) => match.record);
     }
 
     function showBatchConfirmation() {
-      if (followerRemovalInFlight) {
+      if (followerRemovalInFlight || (batchStatus && batchStatus.active)) {
         selectionMessage = "请等待当前移除操作完成。";
         renderSelectionToolbar();
         return;
@@ -8910,7 +8994,7 @@
         renderSelectionToolbar();
         return;
       }
-      const records = selectedVisibleRecords();
+      const records = selectedRecords();
       if (
         records.length === 0 ||
         records.length > FOLLOWER_BATCH_MAX_SELECTION
@@ -8918,6 +9002,7 @@
         return;
       }
       batchStatus = null;
+      batchConfirmation = null;
       clearNode(batchPanel);
       const confirmation = createElement(
         "div",
@@ -8952,7 +9037,7 @@
         )
       );
       // Every selected account stays inspectable, but the list scrolls inside the
-      // confirmation so the cancel/confirm controls stay on screen at fifty names.
+      // confirmation so the cancel/confirm controls stay on screen however many.
       const names = createElement("ul", null, "wfr-confirm-list");
       for (const record of records) {
         names.append(createElement("li", record.screenName || record.uid));
@@ -8968,17 +9053,48 @@
       cancel.type = "button";
       confirm.type = "button";
       cancel.addEventListener("click", () => {
-        clearNode(batchPanel);
+        if (batchConfirmation !== confirmation) return;
+        invalidateBatchConfirmation();
         renderSelectionToolbar();
       });
       confirm.addEventListener("click", async () => {
+        if (
+          batchConfirmation !== confirmation ||
+          panelRoot === null || !panelRoot.contains(confirmation)
+        ) {
+          return;
+        }
+        if (
+          followerRemovalInFlight || followerUpdateRunning || updateRunning ||
+          (batchStatus && batchStatus.active)
+        ) {
+          invalidateBatchConfirmation();
+          selectionMessage = "请等待当前操作完成后重新确认。";
+          renderSelectionToolbar();
+          return;
+        }
+        const currentRecords = selectedRecords();
+        if (
+          currentRecords.length === 0 ||
+          currentRecords.length > FOLLOWER_BATCH_MAX_SELECTION ||
+          currentRecords.length !== records.length ||
+          currentRecords.some((record, index) => record.uid !== records[index].uid)
+        ) {
+          invalidateBatchConfirmation();
+          selectionMessage = "选择或账号状态已变化，请重新确认。";
+          showBatchConfirmation();
+          renderSelectionToolbar();
+          return;
+        }
         cancel.disabled = true;
         confirm.disabled = true;
+        batchConfirmation = null;
         await beginBatchRemoval(records);
       });
       actions.append(cancel, confirm);
       confirmation.append(actions);
       batchPanel.append(confirmation);
+      batchConfirmation = confirmation;
       // Deliberate navigation for an explicit action, never a side effect of
       // selecting a card: the confirmation and the later progress/stop control
       // both live here.
@@ -8997,50 +9113,56 @@
         stopRequested: false,
         summary: null,
       };
-      for (const input of filterInputs) input.disabled = true;
-      renderSelectionToolbar();
-      renderPaginationState();
-      renderBatchPanel();
-      refreshVisibleCards();
-      const batchPromise = startFollowerRemovalBatch(records, owner.uid, {
-        isStopRequested: () => batchStopRequested,
-        onProgress(progress) {
-          batchStatus.current = progress.current;
-          batchStatus.currentName =
-            progress.record.screenName || progress.record.uid;
-          renderSelectionToolbar();
-        },
-        onResult(entry) {
-          const record = entry.record;
-          const result = entry.result;
-          selectedUids.delete(record.uid);
-          if (result.ok) {
-            successfullyRemovedUids.add(record.uid);
-            uncertainRemovalUids.delete(record.uid);
-            removalMessages.delete(record.uid);
-          } else {
-            removalMessages.set(
-              record.uid,
-              followerRemovalResultMessage(result)
-            );
-            if (followerRemovalOutcomeIsUncertain(result)) {
-              uncertainRemovalUids.add(record.uid);
+      setPanelExitLocked(true);
+      try {
+        for (const input of filterInputs) input.disabled = true;
+        renderSelectionToolbar();
+        renderPaginationState();
+        renderBatchPanel();
+        refreshVisibleCards();
+        const batchPromise = startFollowerRemovalBatch(records, owner.uid, {
+          isStopRequested: () => batchStopRequested,
+          onProgress(progress) {
+            batchStatus.current = progress.current;
+            batchStatus.currentName =
+              progress.record.screenName || progress.record.uid;
+            renderSelectionToolbar();
+          },
+          onResult(entry) {
+            const record = entry.record;
+            const result = entry.result;
+            selectedUids.delete(record.uid);
+            if (result.ok) {
+              successfullyRemovedUids.add(record.uid);
+              uncertainRemovalUids.delete(record.uid);
+              removalMessages.delete(record.uid);
+            } else {
+              removalMessages.set(
+                record.uid,
+                followerRemovalResultMessage(result)
+              );
+              if (followerRemovalOutcomeIsUncertain(result)) {
+                uncertainRemovalUids.add(record.uid);
+              }
             }
-          }
-          refreshCard(record.uid);
-          renderSelectionToolbar();
-        },
-      });
-      const summary = await batchPromise;
-      batchStatus = {
-        active: false,
-        current: summary.success + summary.failure + summary.uncertain,
-        total: summary.total,
-        currentName: "",
-        stopRequested: summary.stoppedByUser,
-        summary,
-      };
-      for (const input of filterInputs) input.disabled = false;
+            refreshCard(record.uid);
+            renderSelectionToolbar();
+          },
+        });
+        const summary = await batchPromise;
+        batchStatus = {
+          active: false,
+          current: summary.success + summary.failure + summary.uncertain,
+          total: summary.total,
+          currentName: "",
+          stopRequested: summary.stoppedByUser,
+          summary,
+        };
+      } finally {
+        batchStatus.active = false;
+        for (const input of filterInputs) input.disabled = false;
+        setPanelExitLocked(false);
+      }
       renderSelectionToolbar();
       renderPaginationState();
       renderBatchPanel();
@@ -9048,6 +9170,7 @@
     }
 
     function renderResults(resetPage) {
+      if (batchStatus && batchStatus.active) return;
       if (resetPage) {
         currentPage = 1;
         clearSelection();
@@ -9059,6 +9182,7 @@
       cardMatches.clear();
       cardSelectionInputs.clear();
       const result = filterFollowerSnapshot(snapshot, readFilters());
+      currentMatches = result.matches;
       summaryLine.textContent =
         "快照：" +
         formatMinute(snapshot.capturedAt) +
@@ -9119,19 +9243,23 @@
       if (batchStatus && batchStatus.active) return;
       if (currentPage <= 1) return;
       currentPage -= 1;
-      clearSelection();
       batchStatus = null;
       renderResults(false);
     });
     nextButton.addEventListener("click", () => {
       if (batchStatus && batchStatus.active) return;
       currentPage += 1;
-      clearSelection();
       batchStatus = null;
       renderResults(false);
     });
     selectCurrentPageButton.addEventListener("click", selectCurrentPage);
     clearSelectionButton.addEventListener("click", () => {
+      if (
+        (batchStatus && batchStatus.active) ||
+        followerRemovalInFlight || followerUpdateRunning || updateRunning
+      ) {
+        return;
+      }
       clearSelection();
       renderSelectionToolbar();
     });
@@ -15152,9 +15280,9 @@
       .wfr-overlay { position: fixed; inset: 0; z-index: 2147483647; display: grid; place-items: center; background: var(--wfr-overlay-bg); backdrop-filter: blur(3px); padding: 32px; overflow: auto; box-sizing: border-box; }
       .wfr-panel { display: flex; flex-direction: column; width: 100%; max-width: 840px; max-height: calc(100vh - 64px); min-width: 0; margin: 0 auto; overflow: hidden; border: 1px solid var(--wfr-border); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); border-radius: var(--wfr-radius-l); box-shadow: var(--wfr-panel-shadow); font: 14px/1.6 system-ui, sans-serif; }
       .wfr-panel:focus { outline: none; }
-      .wfr-panel-fixed { height: min(640px, calc(100vh - 64px)); }
+      .wfr-panel-fixed { align-self: start; min-height: min(640px, calc(100vh - 64px)); }
       .wfr-header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 24px; border-bottom: 1px solid var(--wfr-border); }
-      .wfr-header h2 { display: flex; align-items: center; gap: 10px; min-width: 0; margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.025em; overflow-wrap: anywhere; }
+      .wfr-header h2 { min-width: 0; margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.025em; overflow-wrap: anywhere; }
       .wfr-header > .wfr-button { flex: 0 0 auto; }
       .wfr-body { flex: 1 1 auto; min-height: 0; padding: 24px; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--wfr-control-border) transparent; }
       .wfr-row { margin: 8px 0; overflow-wrap: anywhere; }
@@ -15165,14 +15293,19 @@
       .wfr-kv > strong { flex: 0 0 auto; color: var(--wfr-muted); font-weight: 400; }
       .wfr-kv > .wfr-value { min-width: 0; text-align: right; }
       .wfr-event .wfr-kv-group, .wfr-home-module .wfr-kv-group { margin: 0; padding: 0; border: 0; background: transparent; }
-      .wfr-event .wfr-kv { display: grid; grid-template-columns: 5em minmax(0, 1fr); gap: 12px; margin: 3px 0; padding: 0; border-top: 0; }
+      .wfr-event .wfr-kv { display: grid; grid-template-columns: 3em minmax(0, 1fr); gap: 10px; margin: 3px 0; padding: 0; border-top: 0; }
       .wfr-event .wfr-kv > .wfr-value { text-align: left; }
-      .wfr-body > .wfr-kv-group:has(> .wfr-kv:first-child:nth-last-child(-n+2)) { display: flex; flex-wrap: wrap; gap: 0 36px; }
-      .wfr-body > .wfr-kv-group:has(> .wfr-kv:first-child:nth-last-child(-n+2)) > .wfr-kv { justify-content: flex-start; gap: 10px; border-top: 0; }
-      .wfr-failure-code { margin: -4px 0 12px; font: 12px/1.6 var(--wfr-mono); }
-      .wfr-progress { height: 2px; margin: 12px 0; overflow: hidden; border-radius: 999px; background: var(--wfr-border); }
-      .wfr-progress::before { content: ""; display: block; width: 35%; height: 100%; border-radius: inherit; background: var(--wfr-accent); animation: wfr-progress-slide 1.4s ease-in-out infinite; }
-      @keyframes wfr-progress-slide { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
+      .wfr-body > .wfr-kv-group { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(190px, 100%), 1fr)); gap: 8px; padding: 0; border: 0; background: transparent; }
+      .wfr-body > .wfr-kv-group > .wfr-kv { flex-direction: column; align-items: flex-start; justify-content: flex-start; gap: 4px; padding: 11px 14px 12px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-card-bg); }
+      .wfr-body > .wfr-kv-group > .wfr-kv > strong { flex: 0 1 auto; font-size: 12px; line-height: 1.5; }
+      .wfr-body > .wfr-kv-group > .wfr-kv > .wfr-value { font-size: 16px; font-weight: 600; line-height: 1.4; text-align: left; overflow-wrap: anywhere; }
+      .wfr-failure-code { margin: -4px 0 12px; font: 12px/1.6 var(--wfr-mono); overflow-wrap: anywhere; }
+      .wfr-progress { position: relative; height: 16px; margin: 12px 0; overflow: hidden; background: radial-gradient(circle, var(--wfr-muted) 1.5px, transparent 2px) 0 50% / 14px 100% repeat-x; }
+      .wfr-progress::after { content: ""; position: absolute; top: 0; bottom: 0; left: 0; right: calc(100% - 8px); background: var(--wfr-panel-bg); animation: wfr-pac-eaten 5s linear infinite; }
+      .wfr-progress::before { content: ""; position: absolute; z-index: 1; top: 0; left: 0; width: 16px; height: 16px; border-radius: 50%; background: #e8b004; clip-path: polygon(0 0, 100% 0, 100% 18%, 50% 50%, 100% 82%, 100% 100%, 0 100%); animation: wfr-pac-run 5s linear infinite, wfr-pac-chomp .26s ease-in-out infinite alternate; }
+      @keyframes wfr-pac-run { 0% { left: 0; transform: scaleX(1); } 50% { left: calc(100% - 16px); transform: scaleX(1); } 50.01% { left: calc(100% - 16px); transform: scaleX(-1); } 100% { left: 0; transform: scaleX(-1); } }
+      @keyframes wfr-pac-chomp { from { clip-path: polygon(0 0, 100% 0, 100% 18%, 50% 50%, 100% 82%, 100% 100%, 0 100%); } to { clip-path: polygon(0 0, 100% 0, 100% 50%, 50% 50%, 100% 50%, 100% 100%, 0 100%); } }
+      @keyframes wfr-pac-eaten { 0% { left: 0; right: calc(100% - 8px); } 50% { left: 0; right: 8px; } 50.01% { left: calc(100% - 8px); right: 0; } 100% { left: 8px; right: 0; } }
       .wfr-empty { margin: 14px 0; padding: 40px 16px; border: 1px dashed var(--wfr-control-border); border-radius: var(--wfr-radius-m); text-align: center; }
       .wfr-value { font-variant-numeric: tabular-nums; }
       .wfr-button { appearance: none; box-sizing: border-box; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-button-bg); color: var(--wfr-button-text); padding: 7px 12px; font: inherit; font-size: 13px; font-weight: 500; line-height: 1.45; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease; }
@@ -15192,7 +15325,7 @@
       .wfr-search::placeholder { color: var(--wfr-muted); opacity: 1; }
       .wfr-select { max-width: 100%; padding: 7px 10px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
       .wfr-toggle { display: flex; align-items: center; gap: 8px; }
-      .wfr-browse-tabs { display: flex; gap: 4px; width: fit-content; max-width: 100%; margin: 0 0 20px; padding: 4px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-card-bg); }
+      .wfr-browse-tabs { display: flex; flex-wrap: wrap; box-sizing: border-box; gap: 4px; width: fit-content; max-width: 100%; margin: 0 0 20px; padding: 4px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-card-bg); }
       .wfr-browse-tab { appearance: none; border: 1px solid transparent; border-radius: var(--wfr-radius-s); background: transparent; color: var(--wfr-muted); padding: 6px 15px; font: inherit; font-weight: 500; cursor: pointer; }
       .wfr-browse-tab:hover { color: var(--wfr-button-text); background: var(--wfr-card-bg); }
       .wfr-browse-tab[aria-selected="true"] { color: var(--wfr-button-text); border-color: var(--wfr-border); background: var(--wfr-panel-bg); box-shadow: 0 1px 3px rgba(0,0,0,.06); }
@@ -15205,8 +15338,8 @@
       .wfr-suboption-description { margin-left: 22px; }
       .wfr-browse-status { margin: 9px 0 0; }
       .wfr-browse-status:empty { display: none; }
-      .wfr-event-list { display: grid; gap: 10px; margin-top: 14px; }
-      .wfr-event { border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); padding: 14px 16px; background: var(--wfr-card-bg); }
+      .wfr-event-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; margin-top: 14px; }
+      .wfr-event { min-width: 0; overflow-wrap: anywhere; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); padding: 14px 16px; background: var(--wfr-card-bg); }
       .wfr-event h3 { margin: 0 0 6px; font-size: 14px; }
       .wfr-event-unread > h3::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 999px; background: var(--wfr-accent); vertical-align: middle; }
       .wfr-root input[type="checkbox"], .wfr-root input[type="radio"] { flex: 0 0 auto; accent-color: var(--wfr-accent); width: 15px; height: 15px; margin: 0; }
@@ -15237,10 +15370,13 @@
       .wfr-removal-confirm { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); }
       .wfr-batch-panel { margin-top: 10px; }
       .wfr-selection-bar { position: sticky; bottom: 0; z-index: 1; display: flex; flex-direction: column; gap: 6px; margin-top: 14px; padding: 9px 11px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: var(--wfr-bar-shadow); }
+      .wfr-body.wfr-body-flush { padding-bottom: 0; }
+      .wfr-body-flush > .wfr-event-list { margin-bottom: 24px; }
+      .wfr-body-flush > .wfr-selection-bar { margin: 0 -24px; padding: 12px 24px; border-width: 1px 0 0; border-radius: 0; }
       .wfr-selection-bar[hidden], .wfr-selection-row[hidden] { display: none; }
       .wfr-selection-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
       .wfr-selection-count { font-weight: 600; }
-      .wfr-selection-bar .wfr-muted { margin: 0; }
+      .wfr-selection-bar .wfr-muted { margin: 0; overflow-wrap: anywhere; }
       .wfr-selection-bar .wfr-muted:empty { display: none; }
       .wfr-selection-row .wfr-button:first-child + .wfr-selection-count { margin-right: auto; }
       .wfr-confirm-list { max-height: 190px; overflow-y: auto; margin: 6px 0 10px; padding: 6px 8px 6px 26px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); }
@@ -15278,7 +15414,7 @@
       .wfr-profile-name-row { position: relative; width: max-content; max-width: 100%; margin: 3px 0; }
       .wfr-profile-name-trigger { appearance: none; border: 0; padding: 0; background: transparent; color: var(--wfr-button-text); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
       .wfr-profile-name-trigger:focus-visible, .wfr-profile-name-close:focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 2px; }
-      .wfr-profile-name-popover { position: absolute; top: calc(100% + 5px); left: 0; z-index: 20; box-sizing: border-box; min-width: 220px; max-width: min(320px, calc(100vw - 48px)); padding: 12px 14px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: var(--wfr-panel-shadow); }
+      .wfr-profile-name-popover { position: absolute; top: calc(100% + 5px); left: 0; z-index: 20; box-sizing: border-box; min-width: min(220px, calc(100vw - 48px)); max-width: min(320px, calc(100vw - 48px)); padding: 12px 14px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: var(--wfr-panel-shadow); }
       .wfr-profile-name-popover-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
       .wfr-profile-name-close { appearance: none; border: 0; padding: 1px 3px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
       .wfr-profile-name-list { max-height: 180px; margin: 7px 0 0; padding-left: 20px; overflow-y: auto; }
@@ -15349,15 +15485,22 @@
       @media (max-width: 680px) {
         .wfr-overlay { padding: 16px; }
         .wfr-panel { max-height: calc(100vh - 32px); }
-        .wfr-panel-fixed { height: min(640px, calc(100vh - 32px)); }
+        .wfr-panel-fixed { min-height: min(640px, calc(100vh - 32px)); }
+        .wfr-body-flush > .wfr-event-list { margin-bottom: 18px; }
+        .wfr-body-flush > .wfr-selection-bar { margin: 0 -18px; padding: 10px 18px; }
         .wfr-header { gap: 10px; padding: 14px 18px; }
         .wfr-body { padding: 18px; }
         .wfr-home-grid { grid-template-columns: minmax(0, 1fr); }
         .wfr-home-module { padding: 16px; }
       }
+      @media (max-width: 360px) {
+        .wfr-header { flex-wrap: wrap; }
+        .wfr-header > .wfr-button:last-child { margin-left: auto; }
+        .wfr-header h2 { order: 3; flex: 1 0 100%; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+      }
       @media (prefers-reduced-motion: reduce) {
         .wfr-button, .wfr-toolkit-launcher { transition: none; }
-        .wfr-progress::before { width: 100%; animation: none; opacity: .5; }
+        .wfr-progress::before, .wfr-progress::after { animation: none; }
       }
     `;
     document.head.append(style);

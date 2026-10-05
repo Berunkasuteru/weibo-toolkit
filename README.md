@@ -4,7 +4,7 @@
 
 一个给**桌面微博网页**用的用户脚本工具箱。记住昵称背后的人，看见关注和粉丝的变化，把一段私信带走，顺手让首页清爽一点。数据留在你自己的浏览器里。
 
-**[从 Greasy Fork 安装](https://greasyfork.org/zh-CN/scripts/591269-weibo-toolkit-friend-radar)** · [GitHub Release](https://github.com/Berunkasuteru/weibo-toolkit/releases/latest) · [更新说明](docs/releases/v0.10.1.md) · [反馈问题](https://github.com/Berunkasuteru/weibo-toolkit/issues)
+**[从 Greasy Fork 安装](https://greasyfork.org/zh-CN/scripts/591269-weibo-toolkit-friend-radar)** · [GitHub Release](https://github.com/Berunkasuteru/weibo-toolkit/releases/latest) · [更新说明](docs/releases/v0.10.2.md) · [反馈问题](https://github.com/Berunkasuteru/weibo-toolkit/issues)
 
 ## 一眼看完
 
@@ -55,14 +55,14 @@
 
 ### 移除粉丝：唯一会动真格的操作
 
-体检结果里可以移除单个粉丝，也可以移除当前页手动勾选的一批。
+体检结果里可以移除单个粉丝，也可以移除手动勾选的一批。
 
 **这会修改真实的微博关系。移除后对方不再是你的粉丝，Toolkit 无法撤销。**
 
 所以它被设计得很慢、很保守：
 
 - 每次都要你明确确认；
-- 只处理当前页手动勾选的账号，每批最多 50 个；
+- 只处理你手动勾选的账号，可以跨页累积，每批最多 200 个；
 - 逐个顺序发送，每次成功后约等 3 秒；
 - 不自动重试；
 - 一旦失败、结果无法确认，或你点了停止，剩下的不再发送。
@@ -185,7 +185,7 @@
 
 **粉丝体检**
 
-- 结果每页 50 条。换页或修改筛选条件会清空当前选择。
+- 结果每页 50 条。翻页会保留已选账号，修改筛选条件会清空选择。
 - 未知的数值不会被当成零去匹配阈值。
 
 **友人档案**
@@ -227,7 +227,7 @@ node tests/run.js                           # 构建一致性检查 + 公开测�
 
 ## 版本
 
-当前 GitHub 发布版本是 `v0.10.1`，见 [更新说明](docs/releases/v0.10.1.md)。工具箱首页的 **更新记录** 里也能随时翻看从 v0.3.0 起的版本历史，内容随脚本内置，不联网读取。
+当前 GitHub 发布版本是 `v0.10.2`，见 [更新说明](docs/releases/v0.10.2.md)。工具箱首页的 **更新记录** 里也能随时翻看从 v0.3.0 起的版本历史，内容随脚本内置，不联网读取。
 
 ## English summary
 

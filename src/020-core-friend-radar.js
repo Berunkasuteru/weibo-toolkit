@@ -3,7 +3,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.10.1";
+  const APP_VERSION = "0.10.2";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -118,6 +118,18 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.10.2": Object.freeze({
+      improved: Object.freeze([
+        "粉丝体检支持跨页手动保留选择，每批最多移除 200 个；修改筛选条件会清空选择",
+        "长面板随内容增长，粉丝体检操作栏贴底显示，滚动预留随操作栏高度变化更新",
+        "调整事实卡片和事件行，扫描进度改为吃豆人动画，尊重减少动态效果偏好",
+      ]),
+      fixed: Object.freeze([
+        "批量执行期间保护面板和停止入口，拒绝忙碌时的选择变更",
+        "选择或账号状态变化时作废旧确认，执行前重新核对名单，避免重试结果待确认的账号",
+        "修复窄窗口中的长昵称、错误码、设置页签和历史昵称浮层溢出，以及确认按钮被底栏遮挡的问题",
+      ]),
+    }),
     "0.10.1": Object.freeze({
       improved: Object.freeze([
         "工具箱首页改为模块布局，统一深浅色主题、控件和状态显示",

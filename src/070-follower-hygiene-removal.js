@@ -1,11 +1,11 @@
 
   const FOLLOWER_HYGIENE_PAGE_SIZE = 50;
   // A Toolkit product safety limit on one deliberate manual batch, not a claim
-  // about any Weibo server rate limit. It matches the local Hygiene page size, so
-  // one reviewed page is the largest unit of work; fifty sequential writes spaced
-  // by FOLLOWER_BATCH_REMOVE_DELAY_MS mean about 147 seconds of inter-write
+  // about any Weibo server rate limit. A selection may be built up across
+  // several reviewed pages; two hundred sequential writes spaced by
+  // FOLLOWER_BATCH_REMOVE_DELAY_MS mean about ten minutes of inter-write
   // pauses, which the execution-phase progress and stop control are built for.
-  const FOLLOWER_BATCH_MAX_SELECTION = 50;
+  const FOLLOWER_BATCH_MAX_SELECTION = 200;
   const FOLLOWER_BATCH_REMOVE_DELAY_MS = 3000;
 
   function normalizeHygieneThreshold(value) {
@@ -657,11 +657,15 @@
     const canonicalUid = normalizeStableUid(record.uid);
     const removed = removalState.successfullyRemovedUids.has(record.uid);
     const uncertain = removalState.uncertainRemovalUids.has(record.uid);
+    const batchActive =
+      typeof removalState.isBatchActive === "function" &&
+      removalState.isBatchActive();
     const selectionEligible =
       canonicalUid !== null &&
       canonicalUid === record.uid &&
       !removed &&
       !uncertain &&
+      !batchActive &&
       !followerRemovalInFlight &&
       !followerUpdateRunning &&
       !updateRunning;
@@ -752,14 +756,18 @@
         "wfr-button wfr-danger"
       );
       removeButton.type = "button";
-      removeButton.disabled = followerUpdateRunning || updateRunning;
+      removeButton.disabled =
+        batchActive || followerRemovalInFlight || followerUpdateRunning || updateRunning;
       const status = createElement(
         "p",
         removalState.messages.get(record.uid) || "",
         "wfr-muted"
       );
       removeButton.addEventListener("click", () => {
-        if (followerRemovalInFlight) {
+        if (
+          followerRemovalInFlight ||
+          (typeof removalState.isBatchActive === "function" && removalState.isBatchActive())
+        ) {
           status.textContent = "请等待当前移除操作完成。";
           return;
         }
@@ -868,6 +876,8 @@
       return;
     }
     const body = showPanel("粉丝体检", true);
+    // The selection bar docks against the panel's bottom edge.
+    body.classList.add("wfr-body-flush");
     const snapshot = loaded.state.latestSnapshot;
     if (snapshot === null) {
       body.append(
@@ -894,9 +904,13 @@
     const selectedUids = new Set();
     let currentPage = 1;
     let currentPageMatches = [];
+    // Every match of the current filters, across pages: the selection can span
+    // pages, so the batch is drawn from here rather than from the visible page.
+    let currentMatches = [];
     let selectionMessage = "";
     let batchStopRequested = false;
     let batchStatus = null;
+    let batchConfirmation = null;
     let filterInputs = [];
     let currentPagination = null;
     // Live handles on the currently rendered page, so selection and per-account
@@ -912,6 +926,7 @@
       selectedUids,
       changeSelection,
       registerCard,
+      isBatchActive: () => Boolean(batchStatus && batchStatus.active),
     };
 
     function registerCard(uid, element, selectionInput) {
@@ -938,13 +953,28 @@
       for (const uid of [...cardNodes.keys()]) refreshCard(uid);
     }
 
+    function invalidateBatchConfirmation() {
+      if (batchConfirmation === null) return;
+      // A detached confirmation must not execute its old reviewed list later.
+      batchConfirmation = null;
+      clearNode(batchPanel);
+    }
+
     function clearSelection() {
+      invalidateBatchConfirmation();
       selectedUids.clear();
       selectionMessage = "";
       for (const input of cardSelectionInputs.values()) input.checked = false;
     }
 
     function changeSelection(record, checked, input) {
+      if (
+        (batchStatus && batchStatus.active) ||
+        followerRemovalInFlight || followerUpdateRunning || updateRunning
+      ) {
+        input.checked = selectedUids.has(record.uid);
+        return;
+      }
       const canonicalUid = normalizeStableUid(record.uid);
       const eligible =
         canonicalUid !== null &&
@@ -969,13 +999,14 @@
         selectedUids.add(record.uid);
         selectionMessage = "";
       }
+      invalidateBatchConfirmation();
       // Selection is ephemeral view state: nothing outside the toolbar depends on
       // it, so no card is rebuilt and the scroll position is untouched.
       renderSelectionToolbar();
     }
 
     async function confirmRemoval(record) {
-      if (followerRemovalInFlight) {
+      if (followerRemovalInFlight || (batchStatus && batchStatus.active)) {
         removalMessages.set(record.uid, "请等待当前移除操作完成。");
         refreshCard(record.uid);
         return;
@@ -985,6 +1016,7 @@
         refreshCard(record.uid);
         return;
       }
+      invalidateBatchConfirmation();
       followerRemovalInFlight = true;
       let result;
       try {
@@ -1011,6 +1043,7 @@
         }
         selectedUids.delete(record.uid);
       }
+      invalidateBatchConfirmation();
       refreshCard(record.uid);
       renderSelectionToolbar();
     }
@@ -1147,7 +1180,7 @@
       batchRemoveButton
     );
     // Execution phase: progress and the stop control live in the same sticky bar,
-    // so a fifty-account batch never leaves them scrolled out of reach. They are
+    // so a long batch never leaves them scrolled out of reach. They are
     // the only stop control while a batch runs.
     const batchControls = createElement("div", null, "wfr-selection-row");
     const batchProgressNode = createElement("span", "", "wfr-selection-count");
@@ -1273,7 +1306,7 @@
         busy ||
         selectedUids.size >= FOLLOWER_BATCH_MAX_SELECTION ||
         !eligibleVisibleUids().some((uid) => !selectedUids.has(uid));
-      clearSelectionButton.disabled = selectedUids.size === 0;
+      clearSelectionButton.disabled = selectedUids.size === 0 || busy || batchActive;
       batchRemoveButton.disabled = selectedUids.size === 0 || busy;
       if (batchActive) {
         batchProgressNode.textContent =
@@ -1290,15 +1323,47 @@
         selectionMessageNode.textContent = batchStatus.currentName
           ? "当前账号：" + batchStatus.currentName
           : "";
+        reserveSelectionBarSpace();
         return;
       }
       selectionMessageNode.textContent = selectionMessage;
+      reserveSelectionBarSpace();
+    }
+
+    // The bar floats over the bottom of the scroll area. Telling the scroller
+    // how tall it currently is keeps anything scrolled or focused into view,
+    // such as the batch confirmation buttons, clear of it.
+    function reserveSelectionBarSpace() {
+      if (!body.style) return;
+      const height = selectionToolbar.hidden
+        ? 0
+        : Number(selectionToolbar.offsetHeight) || 0;
+      // A little more than the bar itself, so a focused control is not flush
+      // against its top edge.
+      body.style.scrollPaddingBottom =
+        height > 0 ? String(Math.ceil(height) + 8) + "px" : "";
+    }
+
+    // The bar also changes height without being redrawn: narrowing the window
+    // wraps its buttons. The observer is released when the panel is closed or
+    // replaced; the check inside the callback is only a fallback, because a bar
+    // that was hidden all along never reports a change on removal.
+    if (typeof ResizeObserver === "function") {
+      const barObserver = new ResizeObserver(() => {
+        if (body.isConnected === false) {
+          barObserver.disconnect();
+          return;
+        }
+        reserveSelectionBarSpace();
+      });
+      barObserver.observe(selectionToolbar);
+      panelDismissHandler = () => barObserver.disconnect();
     }
 
     // Deliberate, local, current-page only. Ineligible cards carry no checkbox
     // and are simply skipped; fewer than a full page is not an error.
     function selectCurrentPage() {
-      if (followerRemovalInFlight) {
+      if (followerRemovalInFlight || (batchStatus && batchStatus.active)) {
         selectionMessage = "请等待当前移除操作完成。";
         renderSelectionToolbar();
         return;
@@ -1308,6 +1373,7 @@
         renderSelectionToolbar();
         return;
       }
+      invalidateBatchConfirmation();
       let refused = 0;
       for (const uid of eligibleVisibleUids()) {
         if (selectedUids.has(uid)) continue;
@@ -1340,6 +1406,7 @@
     }
 
     function renderBatchPanel() {
+      batchConfirmation = null;
       clearNode(batchPanel);
       if (batchStatus === null) return;
       // While a batch runs, progress and the stop control are shown by the sticky
@@ -1383,14 +1450,19 @@
       if (summary.success > 0) appendManualSnapshotRefresh(batchPanel);
     }
 
-    function selectedVisibleRecords() {
-      return currentPageMatches
-        .filter((match) => selectedUids.has(match.record.uid))
+    function selectedRecords() {
+      return currentMatches
+        .filter((match) =>
+          selectedUids.has(match.record.uid) &&
+          normalizeStableUid(match.record.uid) === match.record.uid &&
+          !successfullyRemovedUids.has(match.record.uid) &&
+          !uncertainRemovalUids.has(match.record.uid)
+        )
         .map((match) => match.record);
     }
 
     function showBatchConfirmation() {
-      if (followerRemovalInFlight) {
+      if (followerRemovalInFlight || (batchStatus && batchStatus.active)) {
         selectionMessage = "请等待当前移除操作完成。";
         renderSelectionToolbar();
         return;
@@ -1400,7 +1472,7 @@
         renderSelectionToolbar();
         return;
       }
-      const records = selectedVisibleRecords();
+      const records = selectedRecords();
       if (
         records.length === 0 ||
         records.length > FOLLOWER_BATCH_MAX_SELECTION
@@ -1408,6 +1480,7 @@
         return;
       }
       batchStatus = null;
+      batchConfirmation = null;
       clearNode(batchPanel);
       const confirmation = createElement(
         "div",
@@ -1442,7 +1515,7 @@
         )
       );
       // Every selected account stays inspectable, but the list scrolls inside the
-      // confirmation so the cancel/confirm controls stay on screen at fifty names.
+      // confirmation so the cancel/confirm controls stay on screen however many.
       const names = createElement("ul", null, "wfr-confirm-list");
       for (const record of records) {
         names.append(createElement("li", record.screenName || record.uid));
@@ -1458,17 +1531,48 @@
       cancel.type = "button";
       confirm.type = "button";
       cancel.addEventListener("click", () => {
-        clearNode(batchPanel);
+        if (batchConfirmation !== confirmation) return;
+        invalidateBatchConfirmation();
         renderSelectionToolbar();
       });
       confirm.addEventListener("click", async () => {
+        if (
+          batchConfirmation !== confirmation ||
+          panelRoot === null || !panelRoot.contains(confirmation)
+        ) {
+          return;
+        }
+        if (
+          followerRemovalInFlight || followerUpdateRunning || updateRunning ||
+          (batchStatus && batchStatus.active)
+        ) {
+          invalidateBatchConfirmation();
+          selectionMessage = "请等待当前操作完成后重新确认。";
+          renderSelectionToolbar();
+          return;
+        }
+        const currentRecords = selectedRecords();
+        if (
+          currentRecords.length === 0 ||
+          currentRecords.length > FOLLOWER_BATCH_MAX_SELECTION ||
+          currentRecords.length !== records.length ||
+          currentRecords.some((record, index) => record.uid !== records[index].uid)
+        ) {
+          invalidateBatchConfirmation();
+          selectionMessage = "选择或账号状态已变化，请重新确认。";
+          showBatchConfirmation();
+          renderSelectionToolbar();
+          return;
+        }
         cancel.disabled = true;
         confirm.disabled = true;
+        batchConfirmation = null;
         await beginBatchRemoval(records);
       });
       actions.append(cancel, confirm);
       confirmation.append(actions);
       batchPanel.append(confirmation);
+      batchConfirmation = confirmation;
       // Deliberate navigation for an explicit action, never a side effect of
       // selecting a card: the confirmation and the later progress/stop control
       // both live here.
@@ -1487,50 +1591,56 @@
         stopRequested: false,
         summary: null,
       };
-      for (const input of filterInputs) input.disabled = true;
-      renderSelectionToolbar();
-      renderPaginationState();
-      renderBatchPanel();
-      refreshVisibleCards();
-      const batchPromise = startFollowerRemovalBatch(records, owner.uid, {
-        isStopRequested: () => batchStopRequested,
-        onProgress(progress) {
-          batchStatus.current = progress.current;
-          batchStatus.currentName =
-            progress.record.screenName || progress.record.uid;
-          renderSelectionToolbar();
-        },
-        onResult(entry) {
-          const record = entry.record;
-          const result = entry.result;
-          selectedUids.delete(record.uid);
-          if (result.ok) {
-            successfullyRemovedUids.add(record.uid);
-            uncertainRemovalUids.delete(record.uid);
-            removalMessages.delete(record.uid);
-          } else {
-            removalMessages.set(
-              record.uid,
-              followerRemovalResultMessage(result)
-            );
-            if (followerRemovalOutcomeIsUncertain(result)) {
-              uncertainRemovalUids.add(record.uid);
+      setPanelExitLocked(true);
+      try {
+        for (const input of filterInputs) input.disabled = true;
+        renderSelectionToolbar();
+        renderPaginationState();
+        renderBatchPanel();
+        refreshVisibleCards();
+        const batchPromise = startFollowerRemovalBatch(records, owner.uid, {
+          isStopRequested: () => batchStopRequested,
+          onProgress(progress) {
+            batchStatus.current = progress.current;
+            batchStatus.currentName =
+              progress.record.screenName || progress.record.uid;
+            renderSelectionToolbar();
+          },
+          onResult(entry) {
+            const record = entry.record;
+            const result = entry.result;
+            selectedUids.delete(record.uid);
+            if (result.ok) {
+              successfullyRemovedUids.add(record.uid);
+              uncertainRemovalUids.delete(record.uid);
+              removalMessages.delete(record.uid);
+            } else {
+              removalMessages.set(
+                record.uid,
+                followerRemovalResultMessage(result)
+              );
+              if (followerRemovalOutcomeIsUncertain(result)) {
+                uncertainRemovalUids.add(record.uid);
+              }
             }
-          }
-          refreshCard(record.uid);
-          renderSelectionToolbar();
-        },
-      });
-      const summary = await batchPromise;
-      batchStatus = {
-        active: false,
-        current: summary.success + summary.failure + summary.uncertain,
-        total: summary.total,
-        currentName: "",
-        stopRequested: summary.stoppedByUser,
-        summary,
-      };
-      for (const input of filterInputs) input.disabled = false;
+            refreshCard(record.uid);
+            renderSelectionToolbar();
+          },
+        });
+        const summary = await batchPromise;
+        batchStatus = {
+          active: false,
+          current: summary.success + summary.failure + summary.uncertain,
+          total: summary.total,
+          currentName: "",
+          stopRequested: summary.stoppedByUser,
+          summary,
+        };
+      } finally {
+        batchStatus.active = false;
+        for (const input of filterInputs) input.disabled = false;
+        setPanelExitLocked(false);
+      }
       renderSelectionToolbar();
       renderPaginationState();
       renderBatchPanel();
@@ -1538,6 +1648,7 @@
     }
 
     function renderResults(resetPage) {
+      if (batchStatus && batchStatus.active) return;
       if (resetPage) {
         currentPage = 1;
         clearSelection();
@@ -1549,6 +1660,7 @@
       cardMatches.clear();
       cardSelectionInputs.clear();
       const result = filterFollowerSnapshot(snapshot, readFilters());
+      currentMatches = result.matches;
       summaryLine.textContent =
         "快照：" +
         formatMinute(snapshot.capturedAt) +
@@ -1609,19 +1721,23 @@
       if (batchStatus && batchStatus.active) return;
       if (currentPage <= 1) return;
       currentPage -= 1;
-      clearSelection();
       batchStatus = null;
       renderResults(false);
     });
     nextButton.addEventListener("click", () => {
       if (batchStatus && batchStatus.active) return;
       currentPage += 1;
-      clearSelection();
       batchStatus = null;
       renderResults(false);
     });
     selectCurrentPageButton.addEventListener("click", selectCurrentPage);
     clearSelectionButton.addEventListener("click", () => {
+      if (
+        (batchStatus && batchStatus.active) ||
+        followerRemovalInFlight || followerUpdateRunning || updateRunning
+      ) {
+        return;
+      }
       clearSelection();
       renderSelectionToolbar();
     });
