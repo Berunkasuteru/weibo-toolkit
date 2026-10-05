@@ -1122,7 +1122,7 @@
     body.append(
       createElement(
         "p",
-        "备注和标签由你手写，按账号 UID 保存在当前浏览器；昵称和关系记录来自 Toolkit 的本地观察，可能不是最新状态。",
+        "备注和标签仅保存在当前浏览器。",
         "wfr-muted"
       )
     );
@@ -1277,7 +1277,7 @@
           ? `共 ${entries.length} 条档案`
           : `共 ${entries.length} 条档案，匹配 ${matching.length} 条`;
       if (matching.length === 0) {
-        list.append(createElement("p", "没有匹配的档案", "wfr-muted"));
+        list.append(createElement("p", "没有匹配的档案", "wfr-muted wfr-empty"));
       }
       renderMore();
     }
@@ -1343,13 +1343,6 @@
       );
     }
     for (const row of rows) addLine(body, row.label, row.value);
-    body.append(
-      createElement(
-        "p",
-        "以上仅为 Toolkit 实际记录过的内容和记录时间，之后的变化不会体现在这里。",
-        "wfr-muted"
-      )
-    );
     if (subject.friend.ok) {
       const eventCount = eventsForSubject(
         subject.friend.state.events,

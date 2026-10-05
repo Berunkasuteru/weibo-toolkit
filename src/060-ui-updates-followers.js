@@ -14,6 +14,7 @@
     applyThemeToRoot(launcherButton);
     applyThemeToRoot(usageCornerButton);
     applyThemeToRoot(panelRoot);
+    applyThemeToRoot(document.getElementById(PROFILE_EXTRAS_ID));
     applyThemeToRoot(
       profileFriendNotesContext === null ? null : profileFriendNotesContext.root
     );
@@ -21,23 +22,131 @@
   }
 
   function closePanel() {
+    // Every way of removing the panel ends here, so this is where a locked
+    // panel is held: buttons, Escape, the script menu and late callbacks alike.
+    if (panelExitLocked) return;
     const dismissHandler = panelDismissHandler;
+    const returnFocus = panelReturnFocus;
     panelDismissHandler = null;
+    panelReturnFocus = null;
     if (panelRoot && panelRoot.parentNode) panelRoot.parentNode.removeChild(panelRoot);
     panelRoot = null;
+    panelSizeFixed = false;
+    panelHeaderButtons = [];
+    panelExitLocked = false;
     // Scans, restores and event clearing all run from the panel, so the local
     // facts cached for the feed entries are re-read once it is really closed.
     markFeedFriendNotesStale();
     if (typeof dismissHandler === "function") dismissHandler();
+    if (
+      returnFocus &&
+      typeof returnFocus.focus === "function" &&
+      returnFocus.isConnected !== false
+    ) {
+      returnFocus.focus();
+    }
   }
 
-  function showPanel(title, withBack = false) {
+  // Holds the panel in place for the length of a short local transaction whose
+  // outcome the user must see, such as a restore. closePanel and showPanel
+  // enforce it; disabling the header buttons only makes the state visible.
+  function setPanelExitLocked(locked) {
+    panelExitLocked = locked;
+    for (const button of panelHeaderButtons) button.disabled = locked;
+  }
+
+  function isTextEntryElement(node) {
+    if (!node || typeof node.tagName !== "string") return false;
+    const tag = node.tagName.toUpperCase();
+    if (tag === "TEXTAREA" || node.isContentEditable === true) return true;
+    return (
+      tag === "INPUT" &&
+      !["checkbox", "radio", "button", "submit", "file"].includes(node.type)
+    );
+  }
+
+  function panelHoldsUnsavedNote() {
+    return (
+      friendNoteDetailView !== null &&
+      panelRoot !== null &&
+      panelRoot.contains(friendNoteDetailView.editor.root) &&
+      friendNoteDetailView.editor.hasUnsavedChanges()
+    );
+  }
+
+  // Escape is left alone wherever it could cost the user something: while an
+  // input method is composing, inside a text field (where it cancels a
+  // candidate or clears a search), over an unsaved note, and during a removal
+  // batch, whose only stop control lives in this panel.
+  function handlePanelKeydown(event) {
+    if (event.defaultPrevented || event.isComposing || event.keyCode === 229) {
+      return;
+    }
+    if (event.key === "Escape") {
+      if (
+        panelExitLocked ||
+        followerRemovalInFlight ||
+        isTextEntryElement(event.target) ||
+        panelHoldsUnsavedNote()
+      ) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      closePanel();
+      return;
+    }
+    if (event.key !== "Tab" || panelRoot === null) return;
+    const focusable = [
+      ...panelRoot.querySelectorAll(
+        'button, a[href], input, select, textarea, summary, [tabindex="0"]'
+      ),
+    ].filter((node) => !node.disabled && node.getClientRects().length > 0);
+    if (focusable.length === 0) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !focusable.includes(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && active === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  // Pages reached by navigating inside the Toolkit share one panel size, so the
+  // panel does not jump between them. A panel opened on its own (a notice, a
+  // failure with nothing behind it) keeps the size of its content.
+  function showPanel(title, withBack = false, fixedSize = Boolean(withBack)) {
+    // A locked panel is not replaced. The caller still gets a body to fill, but
+    // one that is never attached, so no entry point needs its own check.
+    if (panelExitLocked) return createElement("div", null, "wfr-body");
+    const keepSize = fixedSize || panelSizeFixed;
+    // Focus goes back to whatever opened the first panel of this visit, not to
+    // a node of a panel that this one replaces.
+    const replacing = panelRoot !== null;
+    const opener = replacing ? panelReturnFocus : document.activeElement;
+    panelReturnFocus = null;
     closePanel();
     const root = createElement("div", null, "wfr-overlay wfr-root");
     applyThemeToRoot(root);
-    const panel = createElement("section", null, "wfr-panel");
+    root.addEventListener("keydown", handlePanelKeydown);
+    const panel = createElement(
+      "section",
+      null,
+      keepSize ? "wfr-panel wfr-panel-fixed" : "wfr-panel"
+    );
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-labelledby", "wfr-panel-title");
+    panel.setAttribute("tabindex", "-1");
     const header = createElement("header", null, "wfr-header");
     const heading = createElement("h2", title);
+    heading.id = "wfr-panel-title";
     const closeButton = createElement("button", "关闭", "wfr-button");
     closeButton.type = "button";
     closeButton.addEventListener("click", closePanel);
@@ -50,22 +159,38 @@
         typeof withBack === "function" ? withBack : showToolkitHome
       );
       header.append(backButton, heading, closeButton);
+      panelHeaderButtons = [backButton, closeButton];
     } else {
       header.append(heading, closeButton);
+      panelHeaderButtons = [closeButton];
     }
     panel.append(header, body);
     root.append(panel);
     document.body.append(root);
     panelRoot = root;
+    panelSizeFixed = keepSize;
+    panelReturnFocus = opener || null;
+    panel.focus();
     return body;
   }
 
+  // Consecutive lines share one group, so a run of facts reads as one list.
   function addLine(body, label, value) {
-    const row = createElement("p", null, "wfr-row");
-    const strong = createElement("strong", `${label}: `);
-    const span = createElement("span", String(value));
+    const last = body.childNodes[body.childNodes.length - 1];
+    let group =
+      last && last.classList && last.classList.contains("wfr-kv-group")
+        ? last
+        : null;
+    if (group === null) {
+      group = createElement("div", null, "wfr-kv-group");
+      body.append(group);
+    }
+    const row = createElement("p", null, "wfr-row wfr-kv");
+    const strong = createElement("strong", label);
+    const span = createElement("span", String(value), "wfr-value");
     row.append(strong, span);
-    body.append(row);
+    group.append(row);
+    return span;
   }
 
   function formatUsageMinutes(seconds) {
@@ -105,7 +230,7 @@
       usageCornerButton.id = USAGE_CORNER_ID;
       usageCornerButton.type = "button";
       usageCornerButton.setAttribute("aria-label", "打开微博计步器");
-      usageCornerButton.addEventListener("click", showUsageStatistics);
+      usageCornerButton.addEventListener("click", () => showUsageStatistics());
       applyThemeToRoot(usageCornerButton);
       document.body.append(usageCornerButton);
     }
@@ -337,13 +462,35 @@
     ) {
       return "本次扫描达到本工具设定的单次请求上限，未保存扫描结果。";
     }
-    const label = FAILURE_LABELS[result.failureKind] || FAILURE_LABELS.UNKNOWN_FAILURE;
-    return result.reason ? `${label} (${result.reason})` : label;
+    if (
+      result.failureKind === "NETWORK_ERROR" &&
+      result.reason === "REQUEST_TIMEOUT"
+    ) {
+      return "请求超时：微博接口在限定时间内没有响应。";
+    }
+    return FAILURE_LABELS[result.failureKind] || FAILURE_LABELS.UNKNOWN_FAILURE;
+  }
+
+  // The internal reason is kept for bug reports, on its own line below the
+  // sentence that explains the failure. Restore reasons and timeouts already
+  // have wording of their own.
+  function appendFailureCode(body, result) {
+    if (
+      typeof result.reason !== "string" ||
+      result.failureKind === "BACKUP_RESTORE_ERROR" ||
+      result.reason === "REQUEST_TIMEOUT"
+    ) {
+      return;
+    }
+    body.append(
+      createElement("p", `错误代码 ${result.reason}`, "wfr-muted wfr-failure-code")
+    );
   }
 
   function showFailure(title, result, withBack = true) {
     const body = showPanel(title, withBack);
     body.append(createElement("p", failureText(result), "wfr-error"));
+    appendFailureCode(body, result);
     if (result.failureKind === "BACKUP_EXPORT_ERROR") {
       body.append(
         createElement(
@@ -473,15 +620,18 @@
   function showScanProgress() {
     const body = showPanel("关系雷达更新");
     body.append(
-      createElement("p", "正在读取可见关注，请保持页面打开。")
+      createElement("p", "正在读取可见关注，请保持页面打开。"),
+      createElement("div", null, "wfr-progress")
     );
     const values = new Map();
+    const rows = createElement("div", null, "wfr-kv-group");
+    body.append(rows);
     for (const [key, label] of PROGRESS_FIELDS) {
-      const row = createElement("p", null, "wfr-row");
-      const value = createElement("span", "—");
-      row.append(createElement("strong", `${label}：`), value);
+      const row = createElement("p", null, "wfr-row wfr-kv");
+      const value = createElement("span", "—", "wfr-value");
+      row.append(createElement("strong", label), value);
       values.set(key, value);
-      body.append(row);
+      rows.append(row);
     }
     return function reportProgress(progress) {
       for (const [key] of PROGRESS_FIELDS) {
@@ -501,6 +651,7 @@
       return;
     }
     const reportProgress = showScanProgress();
+    const progressRoot = panelRoot;
     updateRunning = true;
     let result;
     try {
@@ -515,6 +666,16 @@
       updateRunning = false;
     }
     refreshUnreadBadge();
+    // The user may have closed the progress panel and opened something else,
+    // possibly with typed input in it. That panel is theirs; the outcome is
+    // then only announced on the launcher.
+    if (panelRoot !== progressRoot) {
+      setLauncherStatus(
+        result.ok ? "关系雷达更新完成" : "关系雷达更新失败",
+        AUTO_STATUS_DURATION_MS
+      );
+      return;
+    }
     if (result.ok) showUpdateSuccess(result);
     else showFailure("关系雷达更新失败", result);
   }
@@ -549,8 +710,13 @@
         "暂时无法安全地保存粉丝快照，本次结果未保存，已保留上一次成功的快照。",
       UNKNOWN_FAILURE: "更新结果无法完全确认。",
     };
-    const label = labels[result.failureKind] || labels.UNKNOWN_FAILURE;
-    return result.reason ? label + " (" + result.reason + ")" : label;
+    if (
+      result.failureKind === "NETWORK_ERROR" &&
+      result.reason === "REQUEST_TIMEOUT"
+    ) {
+      return "请求超时：微博接口在限定时间内没有响应。";
+    }
+    return labels[result.failureKind] || labels.UNKNOWN_FAILURE;
   }
 
   function showFollowerFailure(result) {
@@ -566,6 +732,7 @@
         cancelled ? "wfr-muted" : "wfr-error"
       )
     );
+    appendFailureCode(body, result);
     if (typeof result.failedPage === "number") {
       addLine(body, "停止页", result.failedPage);
     }
@@ -623,7 +790,7 @@
     body.append(
       createElement(
         "p",
-        "微博接口可能过滤部分粉丝；此处仅显示当前API可见结果。",
+        "微博接口可能过滤了部分粉丝。",
         "wfr-muted"
       )
     );
@@ -676,18 +843,21 @@
     ["crossPageDuplicateCount", "跨页重复"],
   ]);
 
-  function showFollowerScanProgress() {
+  function showFollowerScanProgress(onCancel) {
     const body = showPanel("粉丝快照更新");
     body.append(
-      createElement("p", "正在读取API可见粉丝，请保持页面打开。")
+      createElement("p", "正在读取API可见粉丝，请保持页面打开。"),
+      createElement("div", null, "wfr-progress")
     );
     const values = new Map();
+    const rows = createElement("div", null, "wfr-kv-group");
+    body.append(rows);
     for (const [key, label] of FOLLOWER_PROGRESS_FIELDS) {
-      const row = createElement("p", null, "wfr-row");
-      const value = createElement("span", "—");
-      row.append(createElement("strong", label + "："), value);
+      const row = createElement("p", null, "wfr-row wfr-kv");
+      const value = createElement("span", "—", "wfr-value");
+      row.append(createElement("strong", label), value);
       values.set(key, value);
-      body.append(row);
+      rows.append(row);
     }
     const cancelButton = createElement("button", "取消", "wfr-button");
     cancelButton.type = "button";
@@ -695,8 +865,11 @@
       followerCancelRequested = true;
       cancelButton.disabled = true;
       cancelButton.textContent = "正在取消…";
+      onCancel();
     });
-    body.append(cancelButton);
+    const actions = createElement("div", null, "wfr-actions");
+    actions.append(cancelButton);
+    body.append(actions);
     return function reportProgress(progress) {
       for (const [key] of FOLLOWER_PROGRESS_FIELDS) {
         const reported = progress[key];
@@ -712,13 +885,19 @@
       return;
     }
     followerCancelRequested = false;
-    const reportProgress = showFollowerScanProgress();
+    // Cancelling also ends the request in flight instead of waiting for it.
+    const cancelController = new AbortController();
+    const reportProgress = showFollowerScanProgress(() =>
+      cancelController.abort()
+    );
+    const progressRoot = panelRoot;
     followerUpdateRunning = true;
     let result;
     try {
       result = await performFollowerUpdate(
         reportProgress,
-        () => followerCancelRequested
+        () => followerCancelRequested,
+        { cancelSignal: cancelController.signal }
       );
     } catch (error) {
       result = {
@@ -729,6 +908,17 @@
     } finally {
       followerUpdateRunning = false;
       followerCancelRequested = false;
+    }
+    if (panelRoot !== progressRoot) {
+      setLauncherStatus(
+        result.ok
+          ? "粉丝快照更新完成"
+          : result.failureKind === "FOLLOWER_SCAN_CANCELLED"
+            ? "粉丝快照已取消"
+            : "粉丝快照更新失败",
+        AUTO_STATUS_DURATION_MS
+      );
+      return;
     }
     if (result.ok) showFollowerUpdateSuccess(result);
     else showFollowerFailure(result);
@@ -786,12 +976,9 @@
     if (snapshot) {
       addLine(body, "上次成功更新", formatTime(snapshot.capturedAt));
       addLine(body, "API可见粉丝", snapshot.uniqueRecordCount);
-      appendFollowerVisibilityNote(body, snapshot);
     }
-    const countRow = createElement("p", null, "wfr-row");
-    const countValue = createElement("span", String(state.events.length));
-    countRow.append(createElement("strong", "变化事件: "), countValue);
-    body.append(countRow);
+    const countValue = addLine(body, "变化事件", state.events.length);
+    appendFollowerVisibilityNote(body, snapshot);
 
     let events = state.events;
     const clearAllActions = createElement("div", null, "wfr-actions");
@@ -804,7 +991,7 @@
     clearAllActions.append(clearAllButton);
     const clearAllPanel = createElement("div", null, "wfr-batch-panel");
     const status = createElement("p", "", "wfr-muted");
-    const emptyNote = createElement("p", "暂无粉丝变化事件。", "wfr-muted");
+    const emptyNote = createElement("p", "暂无粉丝变化事件。", "wfr-muted wfr-empty");
     const list = createElement("div", null, "wfr-event-list");
     body.append(clearAllActions, clearAllPanel, status, emptyNote, list);
 
@@ -873,7 +1060,7 @@
         item.append(
           createElement(
             "p",
-            "仅表示该账号从API可见粉丝结果中消失，无法判断原因。",
+            "无法判断消失的原因。",
             "wfr-muted"
           )
         );

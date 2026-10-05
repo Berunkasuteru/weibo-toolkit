@@ -417,6 +417,33 @@ function onGrant(browser, lockName, occurrence, action) {
     `a failed rollback must be reported as uncertain: ${JSON.stringify(rollbackFailed)}`
   );
 
+  // ---- Damaged current Friend Radar value ---------------------------------
+  // A restore the user confirmed is the way out of a damaged value: its exact
+  // bytes are the expected value, so the restore replaces it...
+  const R_DAMAGED = '{"schemaVersion":1,"ownerUid":';
+  setCurrent(browser, R_DAMAGED);
+  assert(!tab.product.loadState(OWNER).ok, "the damaged value must not load");
+  const overDamaged = await restore(validate(v3File(), OWNER), R_DAMAGED, F_CURRENT, N_CURRENT);
+  assert(overDamaged.ok, `a damaged value must be replaceable: ${JSON.stringify(overDamaged)}`);
+  assertStored(browser, R_BACKUP, F_BACKUP, N_BACKUP, "restore over a damaged value");
+
+  // ...but only those bytes: a different damaged value is still a conflict,
+  // and a value that cannot be read at all is never treated as absent.
+  setCurrent(browser, R_DAMAGED + " ");
+  const otherDamage = await restore(validate(v3File(), OWNER), R_DAMAGED, F_CURRENT, N_CURRENT);
+  assert(
+    !otherDamage.ok && otherDamage.failureKind === "CONCURRENT_MODIFICATION" && browser.writes.length === 0,
+    `changed damaged bytes must be refused: ${JSON.stringify(otherDamage)}`
+  );
+  setCurrent(browser, R_DAMAGED);
+  browser.failRead = (key) => key === radarKey(OWNER);
+  const unreadable = await restore(validate(v3File(), OWNER), null, F_CURRENT, N_CURRENT);
+  browser.failRead = null;
+  assert(
+    !unreadable.ok && unreadable.failureKind === "STORAGE_ERROR" && browser.writes.length === 0,
+    `an unreadable value must stop the restore: ${JSON.stringify(unreadable)}`
+  );
+
   console.log("friend notes backup v3 invariants passed");
 })().catch((error) => {
   console.error(error);

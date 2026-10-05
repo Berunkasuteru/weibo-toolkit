@@ -2237,6 +2237,9 @@
     ) {
       return false;
     }
+    // A modal notice takes focus. While the user is typing on the page it is
+    // left for the next page load; nothing is marked as seen.
+    if (isTextEntryElement(document.activeElement)) return false;
     return showBundledChangelog(version);
   }
 

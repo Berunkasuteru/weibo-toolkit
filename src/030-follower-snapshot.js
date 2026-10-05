@@ -104,36 +104,12 @@
     return url;
   }
 
-  async function requestFollowerPage(ownerUid, page) {
+  async function requestFollowerPage(ownerUid, page, cancelSignal) {
     const url = buildFollowerRequestUrl(ownerUid, page);
-    let response;
-    try {
-      response = await fetch(url.href, {
-        method: "GET",
-        credentials: "same-origin",
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-        redirect: "follow",
-      });
-    } catch (error) {
-      return {
-        ok: false,
-        failureKind: "NETWORK_ERROR",
-        errorName: error && error.name ? String(error.name) : "Error",
-      };
-    }
+    const fetched = await fetchScanPage(url.href, cancelSignal);
+    if (!fetched.ok) return fetched;
+    const { response, body } = fetched;
     const contentType = response.headers.get("content-type") || "unavailable";
-    let body;
-    try {
-      body = await response.text();
-    } catch (error) {
-      return {
-        ok: false,
-        failureKind: "NETWORK_ERROR",
-        httpStatus: response.status,
-        errorName: error && error.name ? String(error.name) : "Error",
-      };
-    }
     let data = null;
     let validJson = false;
     try {
@@ -295,11 +271,17 @@
       }
 
       requestsMade += 1;
-      const request = await requestFollowerPage(ownerUid, page);
-      if (!request.ok) return { ...request, requestsMade, failedPage: page };
+      const request = await requestFollowerPage(
+        ownerUid,
+        page,
+        options.cancelSignal
+      );
+      // Checked before the request outcome: a cancellation aborts the request,
+      // and that must be reported as the cancellation it is.
       if (typeof isCancelled === "function" && isCancelled()) {
         return { ok: false, failureKind: "FOLLOWER_SCAN_CANCELLED", requestsMade };
       }
+      if (!request.ok) return { ...request, requestsMade, failedPage: page };
       const validation = validateFollowerPageData(request.data, page);
       if (!validation.ok) {
         return {
@@ -1010,6 +992,16 @@
     const committed = await withFollowerStateLock(
       ownerAtStart.uid,
       async () => {
+        // Waiting for the lock can take a while, and the cancel control is
+        // still live then. Nothing has been written yet, so a cancellation
+        // requested meanwhile is honoured here, before the first write.
+        if (typeof isCancelled === "function" && isCancelled()) {
+          return {
+            ok: false,
+            failureKind: "FOLLOWER_SCAN_CANCELLED",
+            requestsMade: scan.requestsMade,
+          };
+        }
         const fresh = loadFollowerState(ownerAtStart.uid);
         if (!fresh.ok) return fresh;
         // The baseline this scan was computed against must still be the stored

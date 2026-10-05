@@ -347,6 +347,10 @@
   let followerCancelRequested = false;
   let followerRemovalInFlight = false;
   let panelRoot = null;
+  let panelSizeFixed = false;
+  let panelReturnFocus = null;
+  let panelHeaderButtons = [];
+  let panelExitLocked = false;
   let launcherButton = null;
   let launcherLabel = null;
   let launcherBadge = null;
@@ -437,6 +441,59 @@
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
   }
 
+  const SCAN_REQUEST_TIMEOUT_MS = 30000;
+
+  // One read request for a scan, with a deadline that also covers reading the
+  // body. A request that never settles would otherwise keep the running flag
+  // set for the life of the page. cancelSignal, when given, ends the wait too;
+  // the caller decides whether an aborted request was a cancellation.
+  async function fetchScanPage(href, cancelSignal) {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, SCAN_REQUEST_TIMEOUT_MS);
+    const forwardCancel = () => controller.abort();
+    if (cancelSignal) {
+      if (cancelSignal.aborted) controller.abort();
+      else cancelSignal.addEventListener("abort", forwardCancel);
+    }
+    const networkFailure = (error, httpStatus) => {
+      const failure = {
+        ok: false,
+        failureKind: "NETWORK_ERROR",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+      if (typeof httpStatus === "number") failure.httpStatus = httpStatus;
+      if (timedOut) failure.reason = "REQUEST_TIMEOUT";
+      return failure;
+    };
+    try {
+      let response;
+      try {
+        response = await fetch(href, {
+          method: "GET",
+          credentials: "same-origin",
+          headers: { Accept: "application/json" },
+          cache: "no-store",
+          redirect: "follow",
+          signal: controller.signal,
+        });
+      } catch (error) {
+        return networkFailure(error);
+      }
+      try {
+        return { ok: true, response, body: await response.text() };
+      } catch (error) {
+        return networkFailure(error, response.status);
+      }
+    } finally {
+      clearTimeout(timer);
+      if (cancelSignal) cancelSignal.removeEventListener("abort", forwardCancel);
+    }
+  }
+
   function buildRequestUrl(ownerUid, page) {
     const url = new URL(ENDPOINT, location.origin);
     url.searchParams.set("uid", ownerUid);
@@ -465,35 +522,10 @@
 
   async function requestFollowingPage(ownerUid, page) {
     const url = buildRequestUrl(ownerUid, page);
-    let response;
-    try {
-      response = await fetch(url.href, {
-        method: "GET",
-        credentials: "same-origin",
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-        redirect: "follow",
-      });
-    } catch (error) {
-      return {
-        ok: false,
-        failureKind: "NETWORK_ERROR",
-        errorName: error && error.name ? String(error.name) : "Error",
-      };
-    }
-
+    const fetched = await fetchScanPage(url.href);
+    if (!fetched.ok) return fetched;
+    const { response, body } = fetched;
     const contentType = response.headers.get("content-type") || "unavailable";
-    let body;
-    try {
-      body = await response.text();
-    } catch (error) {
-      return {
-        ok: false,
-        failureKind: "NETWORK_ERROR",
-        httpStatus: response.status,
-        errorName: error && error.name ? String(error.name) : "Error",
-      };
-    }
 
     let data = null;
     let validJson = false;
@@ -1190,6 +1222,15 @@
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) return uidResult;
 
+    // The snapshot this scan will be diffed against is read before the first
+    // request. Only the snapshot is compared at commit time, not the whole
+    // stored value: marking events read during a scan is legitimate and is
+    // merged below, while a snapshot another tab saved or restored meanwhile
+    // makes this scan's pages older than the stored ones in an unknowable way.
+    const baseline = loadState(uidResult.uid);
+    if (!baseline.ok) return baseline;
+    const scanStartSnapshot = JSON.stringify(baseline.state.latestSnapshot);
+
     const scan = await scanFollowing(
       uidResult.uid,
       onProgress,
@@ -1203,13 +1244,21 @@
     }
 
     // The scan is finished before the lock is taken. Everything below is a short
-    // local transaction over state read inside the lock, so a state another tab
-    // committed meanwhile is seen by the freshness check instead of overwritten.
+    // local transaction over state read inside the lock. A snapshot that is no
+    // longer the scan-start one discards the scan whole: no diff, no events, no
+    // write. Completion time alone cannot order two overlapping scans.
     const committed = await withFriendRadarStateLock(
       uidResult.uid,
       async () => {
         const loaded = loadState(uidResult.uid);
         if (!loaded.ok) return loaded;
+        if (JSON.stringify(loaded.state.latestSnapshot) !== scanStartSnapshot) {
+          return {
+            ok: false,
+            failureKind: "CONCURRENT_MODIFICATION",
+            reason: "SNAPSHOT_CHANGED_DURING_SCAN",
+          };
+        }
 
         const freshness = checkScanFreshness(loaded.state, scan.snapshot);
         if (!freshness.ok) return freshness;

@@ -21,6 +21,8 @@ const NAMES = [
   "friendNoteRecordToken",
   "loadFriendNotesState",
   "loadPageCleanupPreferences",
+  "closePanel",
+  "setPanelExitLocked",
   // Startup is skipped by the test loader, so the preference object that
   // startup would have loaded is injected here.
   "setPagePreferences: (value) => { pageCleanupPreferences = value; }",
@@ -580,7 +582,31 @@ async function sameTabSync() {
   assert(browser.fetchCalls === 0, "syncing views sends no request");
 }
 
+// While a panel is locked (a restore is being written), nothing may remove or
+// replace it: not a close, and not another entry point opening its own panel.
+// Otherwise the late outcome would land on, and destroy, whatever was opened.
+async function lockedPanelIsNotReplaced() {
+  const browser = createSharedBrowser();
+  browser.storage.set(notesKey(OWNER), JSON.stringify(notesState([[LAN, "旧备注"]])));
+  const tab = openProfileTab(browser);
+  const overlays = () =>
+    findAll(tab.document.body, (node) => String(node.className).includes("wfr-overlay"));
+  tab.product.showFriendNoteDetail(OWNER, LAN, null);
+  const held = overlays()[0];
+  tab.product.setPanelExitLocked(true);
+  tab.product.closePanel();
+  tab.product.showFriendNotesManager();
+  assert(
+    overlays().length === 1 && overlays()[0] === held && held.textContent.includes("旧备注"),
+    "a locked panel survives a close and another panel being opened"
+  );
+  tab.product.setPanelExitLocked(false);
+  tab.product.showFriendNotesManager();
+  assert(overlays().length === 1 && overlays()[0] !== held, "unlocking restores normal replacement");
+}
+
 (async () => {
+  await lockedPanelIsNotReplaced();
   await profilePanel();
   await observedFactsAreNotDuplicated();
   await manager();

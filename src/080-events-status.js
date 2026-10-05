@@ -142,7 +142,7 @@
     }
 
     if (state.events.length === 0) {
-      body.append(createElement("p", "暂无事件", "wfr-muted"));
+      body.append(createElement("p", "暂无事件", "wfr-muted wfr-empty"));
       return;
     }
 
@@ -160,7 +160,7 @@
     body.append(
       createElement(
         "p",
-        "CSV / Markdown 为已观察事件的导出，恢复数据请使用 JSON 备份。",
+        "恢复数据请使用 JSON 备份。",
         "wfr-muted"
       )
     );
@@ -179,7 +179,7 @@
       while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
       const matching = filterEvents(newestFirst, query);
       if (matching.length === 0) {
-        list.append(createElement("p", "没有匹配的事件", "wfr-muted"));
+        list.append(createElement("p", "没有匹配的事件", "wfr-muted wfr-empty"));
         return;
       }
       for (const event of matching) {
@@ -191,7 +191,11 @@
   }
 
   function buildEventCard(ownerUid, state, event) {
-    const item = createElement("article", null, "wfr-event");
+    const item = createElement(
+      "article",
+      null,
+      event.read ? "wfr-event" : "wfr-event wfr-event-unread"
+    );
     item.append(
       createElement(
         "h3",
@@ -237,7 +241,7 @@
       body.append(
         createElement(
           "p",
-          "本工具只能记录该账号从你的可见关注列表消失，无法判断消失的原因。",
+          "无法判断消失的原因。",
           "wfr-muted"
         )
       );
@@ -265,16 +269,9 @@
     );
     addLine(body, "UID", subjectUid);
     addLine(body, "历史事件", history.length);
-    body.append(
-      createElement(
-        "p",
-        "以下仅为 Weibo Toolkit 实际观察并保存的事件，不是微博上的完整真实关系历史。",
-        "wfr-muted"
-      )
-    );
 
     if (history.length === 0) {
-      body.append(createElement("p", "暂无事件", "wfr-muted"));
+      body.append(createElement("p", "暂无事件", "wfr-muted wfr-empty"));
       return;
     }
 

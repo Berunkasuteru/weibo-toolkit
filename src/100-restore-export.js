@@ -185,6 +185,30 @@
     }
   }
 
+  // Reads the exact Friend Radar bytes a restore may replace. Unlike loadState
+  // it does not require them to be valid: a restore the user confirmed is the
+  // way out of a damaged local value. A value that cannot be read at all, or
+  // that is not a string, is still a failure, so "damaged" is never confused
+  // with "absent".
+  function currentFriendRadarRestoreToken(ownerUid) {
+    let raw;
+    try {
+      raw = GM_getValue(storageKey(ownerUid), null);
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "STATE_UNREADABLE",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+    if (raw === null || typeof raw === "undefined") return { ok: true, raw: null };
+    if (typeof raw !== "string") {
+      return { ok: false, failureKind: "STORAGE_ERROR", reason: "STATE_NOT_STRING" };
+    }
+    return { ok: true, raw };
+  }
+
   // Called only after a follower mutator was already attempted. A thrown write,
   // a thrown delete or a failed verification does not prove the effect did not
   // land, so one bounded re-read inside the still-held lock is used solely to
@@ -449,12 +473,13 @@
     }
 
     // The value previewed to the user is not trusted after the wait: the current
-    // state is read again inside the lock and the restore is refused if another
-    // tab has legitimately changed it in the meantime.
+    // bytes are read again inside the lock and the restore is refused unless
+    // they are exactly the previewed ones. Bytes, not a parsed state: a damaged
+    // value the preview said would be replaced must still match.
     const initial = await withFriendRadarStateLock(
       validated.ownerUid,
       async () => {
-        const fresh = loadState(validated.ownerUid);
+        const fresh = currentFriendRadarRestoreToken(validated.ownerUid);
         if (!fresh.ok) return fresh;
         if (fresh.raw !== expectedCurrentRaw) {
           return { ok: false, failureKind: "CONCURRENT_MODIFICATION" };
@@ -625,6 +650,15 @@
         "wfr-error"
       )
     );
+    if (!currentLoaded.ok) {
+      body.append(
+        createElement(
+          "p",
+          "当前的关系雷达本地数据无法读取：可能已损坏，也可能由更新版本的脚本写入。确认后它将被备份内容替换，且无法先行导出。",
+          "wfr-error"
+        )
+      );
+    }
     const currentNotes = friendNotesPreview.current;
     if (validated.friendNotesCovered) {
       body.append(
@@ -658,9 +692,21 @@
     if (validated.exportedAt !== null) {
       addLine(body, "备份导出时间", formatTime(validated.exportedAt));
     }
-    addLine(body, "当前事件数", currentLoaded.state.events.length);
+    addLine(
+      body,
+      "当前事件数",
+      currentLoaded.ok
+        ? currentLoaded.state.events.length
+        : "无法读取（将被备份内容替换）"
+    );
     addLine(body, "备份事件数", validated.state.events.length);
-    addLine(body, "当前快照记录数", snapshotRecordCount(currentLoaded.state));
+    addLine(
+      body,
+      "当前快照记录数",
+      currentLoaded.ok
+        ? snapshotRecordCount(currentLoaded.state)
+        : "无法读取（将被备份内容替换）"
+    );
     addLine(body, "备份快照记录数", snapshotRecordCount(validated.state));
     if (validated.followerCovered) {
       addLine(
@@ -706,6 +752,7 @@
     );
     exportButton.type = "button";
     confirmButton.type = "button";
+    exportButton.disabled = !currentLoaded.ok;
     exportButton.addEventListener("click", () => void exportBackup());
     confirmButton.addEventListener("click", async () => {
       exportButton.disabled = true;
@@ -716,12 +763,28 @@
         });
         return;
       }
-      const restored = await restoreValidatedBackup(
-        validated,
-        currentLoaded.raw,
-        expectedFollowerRaw,
-        friendNotesPreview.expectedRaw
-      );
+      // The outcome of a restore must be seen, and showing it replaces the
+      // panel. So the preview stays put until the transaction has ended: the
+      // user cannot leave it, open something else and have that replaced.
+      setPanelExitLocked(true);
+      let restored;
+      try {
+        restored = await restoreValidatedBackup(
+          validated,
+          currentLoaded.raw,
+          expectedFollowerRaw,
+          friendNotesPreview.expectedRaw
+        );
+      } catch (error) {
+        restored = {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "RESTORE_STATE_UNCERTAIN",
+          errorName: error && error.name ? String(error.name) : "Error",
+        };
+      } finally {
+        setPanelExitLocked(false);
+      }
       if (!restored.ok) {
         showFailure("恢复备份失败", restored);
         return;
@@ -762,10 +825,17 @@
       showFailure("恢复备份", uidResult);
       return;
     }
-    const currentLoaded = loadState(uidResult.uid);
+    let currentLoaded = loadState(uidResult.uid);
     if (!currentLoaded.ok) {
-      showFailure("恢复备份", currentLoaded);
-      return;
+      // A damaged value does not block the restore that would replace it, as
+      // long as its exact bytes can be read: they become the expected value the
+      // user reviews and the write is checked against.
+      const token = currentFriendRadarRestoreToken(uidResult.uid);
+      if (!token.ok || token.raw === null) {
+        showFailure("恢复备份", currentLoaded);
+        return;
+      }
+      currentLoaded = { ok: false, raw: token.raw };
     }
 
     let file;
@@ -1062,11 +1132,4 @@
     addLine(body, "格式", spec.label);
     addLine(body, "建议文件名", filename);
     addLine(body, "已导出事件数", state.events.length);
-    body.append(
-      createElement(
-        "p",
-        "导出内容仅为 Weibo Toolkit 已观察并保存的事件，本地数据未被修改。",
-        "wfr-muted"
-      )
-    );
   }

@@ -36,13 +36,6 @@
           "wfr-muted"
         )
       );
-      body.append(
-        createElement(
-          "p",
-          "以上数字只覆盖接口可见的关注列表，不代表微博上的完整关注或粉丝情况。",
-          "wfr-muted"
-        )
-      );
     }
 
     body.append(createElement("h3", "历史事件次数"));
@@ -54,14 +47,7 @@
     body.append(
       createElement(
         "p",
-        "历史数字统计的是事件发生次数，不是人数：同一个账号反复变化会被多次计入。",
-        "wfr-muted"
-      )
-    );
-    body.append(
-      createElement(
-        "p",
-        "以上仅为 Weibo Toolkit 实际观察并保存的事件，不是微博上的完整真实关系历史。",
+        "统计的是事件次数，不是人数。",
         "wfr-muted"
       )
     );
@@ -373,11 +359,10 @@
       showFailure("自动更新设置", interval);
       return;
     }
+    // The snapshot states only feed the read-only lines below. When one cannot
+    // be read, its section says so and the settings (and the appearance
+    // control) stay reachable.
     const loaded = loadState(uidResult.uid);
-    if (!loaded.ok) {
-      showFailure("自动更新设置", loaded);
-      return;
-    }
     const lastAttempt = loadLastAutomaticAttempt(uidResult.uid);
     if (!lastAttempt.ok) {
       showFailure("自动更新设置", lastAttempt);
@@ -397,10 +382,6 @@
       return;
     }
     const followerState = loadFollowerState(uidResult.uid);
-    if (!followerState.ok) {
-      showFailure("自动更新设置", followerState);
-      return;
-    }
     const followerLastAttempt = loadFollowerLastAutomaticAttempt(
       uidResult.uid
     );
@@ -423,11 +404,15 @@
     body.append(
       createElement(
         "p",
-        "仅在打开网页版微博时检查，不会在浏览器后台定时运行。",
+        "仅在打开微博网页时检查。",
         "wfr-muted"
       )
     );
-    if (loaded.state.latestSnapshot === null) {
+    if (!loaded.ok) {
+      body.append(
+        createElement("p", "关系雷达本地数据无法读取。", "wfr-error")
+      );
+    } else if (loaded.state.latestSnapshot === null) {
       body.append(
         createElement(
           "p",
@@ -458,9 +443,11 @@
     addLine(
       body,
       "上次成功更新",
-      loaded.state.latestSnapshot === null
-        ? "—"
-        : formatTime(loaded.state.latestSnapshot.capturedAt)
+      !loaded.ok
+        ? "无法读取"
+        : loaded.state.latestSnapshot === null
+          ? "—"
+          : formatTime(loaded.state.latestSnapshot.capturedAt)
     );
     addLine(
       body,
@@ -471,13 +458,6 @@
       body,
       "上次自动结果",
       describeAutomaticOutcomeForAttempt(lastAttempt.value, lastOutcome.value)
-    );
-    body.append(
-      createElement(
-        "p",
-        "“自动尝试”记录开始请求的时间；“上次成功更新”记录快照完成并保存的时间，两者可能相差本次扫描耗时。",
-        "wfr-muted"
-      )
     );
 
     const saveButton = createElement("button", "保存设置", "wfr-button wfr-primary");
@@ -511,11 +491,15 @@
     body.append(
       createElement(
         "p",
-        "仅在打开网页版微博时检查，不会在浏览器后台定时运行。",
+        "仅在打开微博网页时检查。",
         "wfr-muted"
       )
     );
-    if (followerState.state.latestSnapshot === null) {
+    if (!followerState.ok) {
+      body.append(
+        createElement("p", "粉丝快照本地状态无法读取。", "wfr-error")
+      );
+    } else if (followerState.state.latestSnapshot === null) {
       body.append(
         createElement(
           "p",
@@ -552,9 +536,11 @@
     addLine(
       body,
       "上次成功更新",
-      followerState.state.latestSnapshot === null
-        ? "—"
-        : formatTime(followerState.state.latestSnapshot.capturedAt)
+      !followerState.ok
+        ? "无法读取"
+        : followerState.state.latestSnapshot === null
+          ? "—"
+          : formatTime(followerState.state.latestSnapshot.capturedAt)
     );
     addLine(
       body,
@@ -617,7 +603,7 @@
     body.append(
       createElement(
         "p",
-        "外观仅影响 Weibo Toolkit 自己的界面，不会更改微博页面的主题，也不会跟随微博的主题设置。",
+        "仅影响 Toolkit 自己的界面。",
         "wfr-muted"
       )
     );
