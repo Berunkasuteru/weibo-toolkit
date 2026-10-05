@@ -4,7 +4,7 @@
 
 一个给**桌面微博网页**用的用户脚本工具箱。记住昵称背后的人，看见关注和粉丝的变化，把一段私信带走，顺手让首页清爽一点。数据留在你自己的浏览器里。
 
-**[从 Greasy Fork 安装](https://greasyfork.org/zh-CN/scripts/591269-weibo-toolkit-friend-radar)** · [GitHub Release](https://github.com/Berunkasuteru/weibo-toolkit/releases/latest) · [更新说明](docs/releases/v0.10.0.md) · [反馈问题](https://github.com/Berunkasuteru/weibo-toolkit/issues)
+**[从 Greasy Fork 安装](https://greasyfork.org/zh-CN/scripts/591269-weibo-toolkit-friend-radar)** · [GitHub Release](https://github.com/Berunkasuteru/weibo-toolkit/releases/latest) · [更新说明](docs/releases/v0.10.1.md) · [反馈问题](https://github.com/Berunkasuteru/weibo-toolkit/issues)
 
 ## 一眼看完
 
@@ -227,7 +227,7 @@ node tests/run.js                           # 构建一致性检查 + 公开测�
 
 ## 版本
 
-当前发布版本是 `v0.10.0`，见 [更新说明](docs/releases/v0.10.0.md)。工具箱首页的 **更新记录** 里也能随时翻看从 v0.3.0 起的版本历史，内容随脚本内置，不联网读取。
+当前 GitHub 发布版本是 `v0.10.1`，见 [更新说明](docs/releases/v0.10.1.md)。工具箱首页的 **更新记录** 里也能随时翻看从 v0.3.0 起的版本历史，内容随脚本内置，不联网读取。
 
 ## English summary
 

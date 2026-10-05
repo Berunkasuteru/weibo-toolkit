@@ -3,7 +3,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.10.0";
+  const APP_VERSION = "0.10.1";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -118,6 +118,19 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.10.1": Object.freeze({
+      improved: Object.freeze([
+        "工具箱首页改为模块布局，统一深浅色主题、控件和状态显示",
+        "补齐面板和页签的键盘操作与焦点恢复，输入时延后新功能通知",
+        "重写项目介绍，明确功能范围、本地数据与操作边界",
+      ]),
+      fixed: Object.freeze([
+        "修复多标签页关系雷达更新时，较晚返回的旧结果可能覆盖新快照的问题",
+        "修复雷达本地数据损坏后无法打开工具箱或用备份恢复的问题",
+        "关注和粉丝读取增加请求期限，粉丝取消可中断读取并阻止等待提交的写入",
+        "修复扫描结果可能替换当前面板、恢复结果可能覆盖新草稿的问题",
+      ]),
+    }),
     "0.10.0": Object.freeze({
       added: Object.freeze([
         "新增友人档案：为账号写私人备注、添加标签，并按昵称、UID、备注或标签搜索",
