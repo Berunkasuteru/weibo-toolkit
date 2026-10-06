@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.10.2
+// @version      0.11.0
 // @description  Local-first Weibo toolkit with private friend notes, relationship tracking, follower tools, PM export, and optional page enhancements.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -925,7 +925,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.10.2";
+  const APP_VERSION = "0.11.0";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -1040,6 +1040,20 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.11.0": Object.freeze({
+      added: Object.freeze([
+        "粉丝体检可保存筛选方案、按粉丝数等排序，并可按筛选结果的顺序一次选满 200 个",
+        "移除记录：成功移除的粉丝会尽力写入本地记录，可搜索和导出 CSV",
+        "手动更新进行中可回到进度页；离开后才完成的更新，结果可在首页查看",
+        "关系事件按账号归并显示，并可从事件卡片直接写友人档案",
+      ]),
+      improved: Object.freeze([
+        "已移除的账号不再列出，可以连续处理多批，无需先更新粉丝快照",
+        "批量选择默认跳过快照中你也关注或有友人档案的账号，仍可逐个勾选",
+        "友人档案有未保存修改时，关闭或返回前先确认；保存进行中不能离开",
+        "批量移除中某个账号的操作长时间未完成时，提示退出方式及其后果",
+      ]),
+    }),
     "0.10.2": Object.freeze({
       improved: Object.freeze([
         "粉丝体检支持跨页手动保留选择，每批最多移除 200 个；修改筛选条件会清空选择",
@@ -1292,6 +1306,14 @@
   let updateRunning = false;
   let followerUpdateRunning = false;
   let followerCancelRequested = false;
+  // A manual scan in this tab, so its progress panel can be reopened after it
+  // was closed, and the outcome of one that finished while the user was
+  // elsewhere. Both live only as long as the page: they are a convenience for
+  // this visit, not a record.
+  let manualRadarRun = null;
+  let manualFollowerRun = null;
+  let unseenManualRadarResult = null;
+  let unseenManualFollowerResult = null;
   let followerRemovalInFlight = false;
   let panelRoot = null;
   let panelSizeFixed = false;
@@ -6456,6 +6478,22 @@
     );
   }
 
+  // Closing or leaving a note that has unsaved edits asks first. Escape never
+  // gets this far: it does nothing at all over an unsaved note.
+  function confirmLeavingUnsavedNote() {
+    if (!panelHoldsUnsavedNote()) return true;
+    // A save or delete that is already under way cannot be abandoned: saying
+    // "discard" and then storing it anyway would be a lie. Leaving waits.
+    if (friendNoteDetailView.editor.isBusy()) {
+      if (typeof alert === "function") alert("正在保存，请等待完成后再离开。");
+      return false;
+    }
+    return (
+      typeof confirm !== "function" ||
+      confirm("这份友人档案还有未保存的修改。确定放弃这些修改吗？")
+    );
+  }
+
   // Escape is left alone wherever it could cost the user something: while an
   // input method is composing, inside a text field (where it cancels a
   // candidate or clears a search), over an unsaved note, and during a removal
@@ -6531,15 +6569,17 @@
     heading.id = "wfr-panel-title";
     const closeButton = createElement("button", "关闭", "wfr-button");
     closeButton.type = "button";
-    closeButton.addEventListener("click", closePanel);
+    closeButton.addEventListener("click", () => {
+      if (confirmLeavingUnsavedNote()) closePanel();
+    });
     const body = createElement("div", null, "wfr-body");
     if (withBack) {
       const backButton = createElement("button", "← 返回", "wfr-button");
       backButton.type = "button";
-      backButton.addEventListener(
-        "click",
-        typeof withBack === "function" ? withBack : showToolkitHome
-      );
+      const goBack = typeof withBack === "function" ? withBack : showToolkitHome;
+      backButton.addEventListener("click", () => {
+        if (confirmLeavingUnsavedNote()) goBack();
+      });
       header.append(backButton, heading, closeButton);
       panelHeaderButtons = [backButton, closeButton];
     } else {
@@ -7025,19 +7065,76 @@
     };
   }
 
+  function showRadarUpdateResult(result) {
+    if (result.ok) showUpdateSuccess(result);
+    else showFailure("关系雷达更新失败", result);
+  }
+
+  // Opens (or reopens) the progress panel of the manual scan that is running
+  // and replays the latest numbers into it.
+  function attachRadarProgress(run) {
+    run.render = showScanProgress();
+    run.root = panelRoot;
+    if (run.latest !== null) run.render(run.latest);
+  }
+
+  // The stored outcome of a manual scan belongs to the account it ran for. It
+  // is handed out once, and only to that account. The caller's idea of the
+  // account may be as old as the Home it was drawn on, so the logged-in
+  // account is read again here; on any mismatch nothing is shown or consumed.
+  function unseenResultBelongsToCurrentAccount(unseen, ownerUid) {
+    if (unseen === null || unseen.ownerUid !== ownerUid) return false;
+    const current = determineCurrentUid();
+    return current.ok && current.uid === unseen.ownerUid;
+  }
+
+  function takeUnseenRadarResult(ownerUid) {
+    const unseen = unseenManualRadarResult;
+    if (!unseenResultBelongsToCurrentAccount(unseen, ownerUid)) return null;
+    unseenManualRadarResult = null;
+    return unseen.result;
+  }
+
+  function takeUnseenFollowerResult(ownerUid) {
+    const unseen = unseenManualFollowerResult;
+    if (!unseenResultBelongsToCurrentAccount(unseen, ownerUid)) return null;
+    unseenManualFollowerResult = null;
+    return unseen.result;
+  }
+
   async function updateNow() {
+    const startOwner = determineCurrentUid();
+    if (manualRadarRun !== null) {
+      // Only the account that started the scan may look into it.
+      if (startOwner.ok && startOwner.uid === manualRadarRun.ownerUid) {
+        attachRadarProgress(manualRadarRun);
+      } else {
+        showFailure("关系雷达更新", { failureKind: "UPDATE_ALREADY_RUNNING" });
+      }
+      return;
+    }
     if (updateRunning || followerUpdateRunning || followerRemovalInFlight) {
       showFailure("关系雷达更新", {
         failureKind: "UPDATE_ALREADY_RUNNING",
       });
       return;
     }
-    const reportProgress = showScanProgress();
-    const progressRoot = panelRoot;
+    const run = {
+      ownerUid: startOwner.ok ? startOwner.uid : null,
+      latest: null,
+      render: null,
+      root: null,
+    };
+    manualRadarRun = run;
+    unseenManualRadarResult = null;
+    attachRadarProgress(run);
     updateRunning = true;
     let result;
     try {
-      result = await performUpdate(reportProgress);
+      result = await performUpdate((progress) => {
+        run.latest = progress;
+        run.render(progress);
+      });
     } catch (error) {
       result = {
         ok: false,
@@ -7046,20 +7143,21 @@
       };
     } finally {
       updateRunning = false;
+      manualRadarRun = null;
     }
     refreshUnreadBadge();
     // The user may have closed the progress panel and opened something else,
-    // possibly with typed input in it. That panel is theirs; the outcome is
-    // then only announced on the launcher.
-    if (panelRoot !== progressRoot) {
+    // possibly with typed input in it. That panel is theirs: the outcome is
+    // announced on the launcher and kept for Home to show.
+    if (panelRoot !== run.root) {
+      unseenManualRadarResult = { ownerUid: run.ownerUid, result };
       setLauncherStatus(
         result.ok ? "关系雷达更新完成" : "关系雷达更新失败",
         AUTO_STATUS_DURATION_MS
       );
       return;
     }
-    if (result.ok) showUpdateSuccess(result);
-    else showFailure("关系雷达更新失败", result);
+    showRadarUpdateResult(result);
   }
 
   function followerFailureText(result) {
@@ -7243,6 +7341,11 @@
     }
     const cancelButton = createElement("button", "取消", "wfr-button");
     cancelButton.type = "button";
+    // A reopened panel shows a cancellation that was already requested.
+    if (followerCancelRequested) {
+      cancelButton.disabled = true;
+      cancelButton.textContent = "正在取消…";
+    }
     cancelButton.addEventListener("click", () => {
       followerCancelRequested = true;
       cancelButton.disabled = true;
@@ -7261,7 +7364,27 @@
     };
   }
 
+  function showFollowerUpdateResult(result) {
+    if (result.ok) showFollowerUpdateSuccess(result);
+    else showFollowerFailure(result);
+  }
+
+  function attachFollowerProgress(run) {
+    run.render = showFollowerScanProgress(run.cancel);
+    run.root = panelRoot;
+    if (run.latest !== null) run.render(run.latest);
+  }
+
   async function updateFollowersNow() {
+    const startOwner = determineCurrentUid();
+    if (manualFollowerRun !== null) {
+      if (startOwner.ok && startOwner.uid === manualFollowerRun.ownerUid) {
+        attachFollowerProgress(manualFollowerRun);
+      } else {
+        showFollowerFailure({ failureKind: "UPDATE_ALREADY_RUNNING" });
+      }
+      return;
+    }
     if (followerUpdateRunning || updateRunning || followerRemovalInFlight) {
       showFollowerFailure({ failureKind: "UPDATE_ALREADY_RUNNING" });
       return;
@@ -7269,15 +7392,24 @@
     followerCancelRequested = false;
     // Cancelling also ends the request in flight instead of waiting for it.
     const cancelController = new AbortController();
-    const reportProgress = showFollowerScanProgress(() =>
-      cancelController.abort()
-    );
-    const progressRoot = panelRoot;
+    const run = {
+      ownerUid: startOwner.ok ? startOwner.uid : null,
+      latest: null,
+      render: null,
+      root: null,
+      cancel: () => cancelController.abort(),
+    };
+    manualFollowerRun = run;
+    unseenManualFollowerResult = null;
+    attachFollowerProgress(run);
     followerUpdateRunning = true;
     let result;
     try {
       result = await performFollowerUpdate(
-        reportProgress,
+        (progress) => {
+          run.latest = progress;
+          run.render(progress);
+        },
         () => followerCancelRequested,
         { cancelSignal: cancelController.signal }
       );
@@ -7290,8 +7422,13 @@
     } finally {
       followerUpdateRunning = false;
       followerCancelRequested = false;
+      manualFollowerRun = null;
     }
-    if (panelRoot !== progressRoot) {
+    if (panelRoot !== run.root) {
+      // A cancellation the user asked for needs no later reminder.
+      if (result.failureKind !== "FOLLOWER_SCAN_CANCELLED") {
+        unseenManualFollowerResult = { ownerUid: run.ownerUid, result };
+      }
       setLauncherStatus(
         result.ok
           ? "粉丝快照更新完成"
@@ -7302,8 +7439,7 @@
       );
       return;
     }
-    if (result.ok) showFollowerUpdateSuccess(result);
-    else showFollowerFailure(result);
+    showFollowerUpdateResult(result);
   }
 
   // Local notification housekeeping only, run inside the follower state lock. The
@@ -7529,6 +7665,7 @@
   // pauses, which the execution-phase progress and stop control are built for.
   const FOLLOWER_BATCH_MAX_SELECTION = 200;
   const FOLLOWER_BATCH_REMOVE_DELAY_MS = 3000;
+  const FOLLOWER_BATCH_STALL_HINT_MS = 20000;
 
   function normalizeHygieneThreshold(value) {
     if (value === null || typeof value === "undefined" || value === "") {
@@ -7989,6 +8126,300 @@
     return { label, input };
   }
 
+  // Order of the filtered results. It decides which accounts "fill" takes
+  // first, so unknown values always sort last instead of counting as zero.
+  const FOLLOWER_HYGIENE_SORTS = Object.freeze([
+    ["SNAPSHOT", "快照顺序"],
+    ["FOLLOWERS_ASC", "粉丝数从少到多"],
+    ["STATUSES_ASC", "公开微博数从少到多"],
+    ["CREATED_DESC", "注册时间从新到旧"],
+    ["CREATED_ASC", "注册时间从旧到新"],
+  ]);
+
+  function sortHygieneMatches(matches, sort) {
+    let key = null;
+    if (sort === "FOLLOWERS_ASC") key = (record) => record.followersCount;
+    else if (sort === "STATUSES_ASC") key = (record) => record.statusesCount;
+    else if (sort === "CREATED_ASC" || sort === "CREATED_DESC") {
+      const sign = sort === "CREATED_ASC" ? 1 : -1;
+      key = (record) =>
+        record.createdAt === null ? null : sign * Date.parse(record.createdAt);
+    }
+    if (key === null) return matches;
+    return matches
+      .map((match, index) => ({ match, index, value: key(match.record) }))
+      .sort((left, right) => {
+        if (left.value === null || right.value === null) {
+          if (left.value === right.value) return left.index - right.index;
+          return left.value === null ? 1 : -1;
+        }
+        return left.value - right.value || left.index - right.index;
+      })
+      .map((entry) => entry.match);
+  }
+
+  // A local record of the accounts this Toolkit removed. Removal cannot be
+  // undone, so this is the only place to look up afterwards who went and when.
+  // It lives in this browser, per account, outside the backup, and keeps the
+  // most recent entries only.
+  const FOLLOWER_REMOVAL_LOG_PREFIX = "weiboToolkit.followerRemovalLog.v1.";
+  const FOLLOWER_REMOVAL_LOG_LIMIT = 5000;
+
+  function isValidFollowerRemovalLogEntry(entry) {
+    return Boolean(
+      isPlainObject(entry) &&
+        typeof entry.uid === "string" &&
+        normalizeStableUid(entry.uid) === entry.uid &&
+        (entry.screenName === null || typeof entry.screenName === "string") &&
+        typeof entry.removedAt === "string" &&
+        Number.isFinite(Date.parse(entry.removedAt))
+    );
+  }
+
+  // An unreadable log is reported as such. It is never treated as empty: the
+  // next removal would then replace whatever is stored with a one-line log.
+  function loadFollowerRemovalLog(ownerUid) {
+    try {
+      const raw = GM_getValue(FOLLOWER_REMOVAL_LOG_PREFIX + ownerUid, null);
+      if (raw === null || typeof raw === "undefined") return { ok: true, entries: [] };
+      if (typeof raw !== "string") return { ok: false };
+      const parsed = JSON.parse(raw);
+      if (
+        !isPlainObject(parsed) ||
+        parsed.schemaVersion !== 1 ||
+        parsed.ownerUid !== ownerUid ||
+        !Array.isArray(parsed.entries) ||
+        !parsed.entries.every(isValidFollowerRemovalLogEntry)
+      ) {
+        return { ok: false };
+      }
+      return { ok: true, entries: parsed.entries };
+    } catch (_) {
+      return { ok: false };
+    }
+  }
+
+  // Appends one confirmed removal. Tabs may remove at the same time, so the
+  // stored list is read and written inside one lock. A failure here never
+  // changes the outcome of the removal itself; it only means no log line.
+  async function appendFollowerRemovalLog(ownerUid, record) {
+    const lockManager = pageLockManager();
+    if (lockManager === null) return false;
+    const entry = {
+      uid: record.uid,
+      screenName: typeof record.screenName === "string" ? record.screenName : null,
+      removedAt: new Date().toISOString(),
+    };
+    if (!isValidFollowerRemovalLogEntry(entry)) return false;
+    try {
+      return await lockManager.request.call(
+        lockManager,
+        "weibo-toolkit-follower-removal-log-" + ownerUid,
+        { mode: "exclusive" },
+        async (lock) => {
+          if (lock === null) return false;
+          const loaded = loadFollowerRemovalLog(ownerUid);
+          if (!loaded.ok) return false;
+          const entries = [...loaded.entries, entry].slice(-FOLLOWER_REMOVAL_LOG_LIMIT);
+          const serialized = JSON.stringify({ schemaVersion: 1, ownerUid, entries });
+          const key = FOLLOWER_REMOVAL_LOG_PREFIX + ownerUid;
+          GM_setValue(key, serialized);
+          return GM_getValue(key, null) === serialized;
+        }
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function buildFollowerRemovalLogCsv(entries) {
+    const rows = [
+      ["移除时间", "UID", "昵称"],
+      ...entries.map((entry) => [entry.removedAt, entry.uid, entry.screenName || ""]),
+    ];
+    const body = rows.map((row) => row.map(csvField).join(",")).join("\r\n");
+    return `${UTF8_BOM}${body}\r\n`;
+  }
+
+  const FOLLOWER_REMOVAL_LOG_PAGE_SIZE = 100;
+
+  function showFollowerRemovalLog() {
+    const owner = determineCurrentUid();
+    if (!owner.ok) {
+      showFollowerFailure(owner);
+      return;
+    }
+    const body = showPanel("移除记录", showFollowerHygiene);
+    body.append(
+      createElement(
+        "p",
+        "只记录通过 Toolkit 成功移除的粉丝，保存在当前浏览器，不进备份，最多保留最近 " +
+          String(FOLLOWER_REMOVAL_LOG_LIMIT) +
+          " 条。",
+        "wfr-muted"
+      )
+    );
+    const loaded = loadFollowerRemovalLog(owner.uid);
+    if (!loaded.ok) {
+      body.append(createElement("p", "移除记录无法读取。", "wfr-error"));
+      return;
+    }
+    const newestFirst = loaded.entries.slice().reverse();
+    addLine(body, "记录数", newestFirst.length);
+    if (newestFirst.length === 0) {
+      body.append(createElement("p", "还没有移除记录。", "wfr-muted wfr-empty"));
+      return;
+    }
+    const actions = createElement("div", null, "wfr-actions");
+    const exportButton = createElement("button", "导出 CSV", "wfr-button");
+    exportButton.type = "button";
+    const exportStatus = createElement("p", "", "wfr-muted wfr-hygiene-preset-status");
+    exportStatus.setAttribute("role", "status");
+    exportButton.addEventListener("click", () => {
+      // The list on this page belongs to the account it was opened for.
+      const current = determineCurrentUid();
+      if (!current.ok || current.uid !== owner.uid) {
+        exportStatus.textContent = "登录账号已变化，没有导出。请重新打开移除记录。";
+        return;
+      }
+      try {
+        downloadFile(
+          buildFollowerRemovalLogCsv(newestFirst),
+          "weibo-toolkit-removed-followers-" + owner.uid + ".csv",
+          "text/csv;charset=utf-8"
+        );
+        exportStatus.textContent = "已请求浏览器下载。文件是明文，包含账号昵称和 UID。";
+      } catch (_) {
+        exportStatus.textContent = "导出未能完成。";
+      }
+    });
+    actions.append(exportButton);
+    body.append(actions, exportStatus);
+
+    const search = createElement("input", null, "wfr-search");
+    search.type = "search";
+    search.placeholder = "搜索昵称或 UID";
+    search.setAttribute("aria-label", "搜索移除记录");
+    const summary = createElement("p", "", "wfr-muted");
+    summary.setAttribute("role", "status");
+    const list = createElement("div", null, "wfr-event-list");
+    const moreActions = createElement("div", null, "wfr-actions");
+    const moreButton = createElement("button", "加载更多", "wfr-button");
+    moreButton.type = "button";
+    moreActions.append(moreButton);
+    body.append(search, summary, list, moreActions);
+
+    let matching = newestFirst;
+    let shown = 0;
+    function renderMore() {
+      for (const entry of matching.slice(shown, shown + FOLLOWER_REMOVAL_LOG_PAGE_SIZE)) {
+        const item = createElement("article", null, "wfr-event");
+        item.append(createElement("h3", entry.screenName || "未知"));
+        addLine(item, "时间", formatTime(entry.removedAt));
+        addLine(item, "UID", entry.uid);
+        list.append(item);
+      }
+      shown = Math.min(matching.length, shown + FOLLOWER_REMOVAL_LOG_PAGE_SIZE);
+      moreActions.hidden = shown >= matching.length;
+    }
+    function renderList() {
+      while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
+      const needle = String(search.value || "").trim().toLowerCase();
+      matching =
+        needle === ""
+          ? newestFirst
+          : newestFirst.filter(
+              (entry) =>
+                entry.uid.includes(needle) ||
+                (entry.screenName || "").toLowerCase().includes(needle)
+            );
+      shown = 0;
+      summary.textContent =
+        needle === "" ? "" : "匹配 " + String(matching.length) + " 条";
+      if (matching.length === 0) {
+        list.append(createElement("p", "没有匹配的记录", "wfr-muted wfr-empty"));
+        moreActions.hidden = true;
+        return;
+      }
+      renderMore();
+    }
+    search.addEventListener("input", renderList);
+    moreButton.addEventListener("click", renderMore);
+    renderList();
+  }
+
+  // Saved filter sets are a convenience preference of this browser, like the
+  // page options: per account, never part of a backup, and never trusted
+  // blindly. Every stored set goes through normalizeHygieneFilters again.
+  const FOLLOWER_HYGIENE_PRESETS_PREFIX =
+    "weiboToolkit.followerHygienePresets.v1.";
+  const FOLLOWER_HYGIENE_PRESET_LIMIT = 8;
+  const FOLLOWER_HYGIENE_PRESET_NAME_MAX = 20;
+
+  function hygienePresetFilters(raw) {
+    const filters = normalizeHygieneFilters(isPlainObject(raw) ? raw : {});
+    delete filters.activeCount;
+    return filters;
+  }
+
+  function loadHygienePresets(ownerUid) {
+    try {
+      const raw = GM_getValue(FOLLOWER_HYGIENE_PRESETS_PREFIX + ownerUid, null);
+      if (typeof raw !== "string") return [];
+      const parsed = JSON.parse(raw);
+      if (!isPlainObject(parsed) || !Array.isArray(parsed.presets)) return [];
+      const presets = [];
+      for (const entry of parsed.presets) {
+        if (
+          !isPlainObject(entry) ||
+          typeof entry.name !== "string" ||
+          entry.name.trim() === "" ||
+          entry.name.length > FOLLOWER_HYGIENE_PRESET_NAME_MAX ||
+          presets.some((preset) => preset.name === entry.name)
+        ) {
+          continue;
+        }
+        presets.push({
+          name: entry.name,
+          filters: hygienePresetFilters(entry.filters),
+        });
+        if (presets.length >= FOLLOWER_HYGIENE_PRESET_LIMIT) break;
+      }
+      return presets;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  // Two tabs may edit the list. Every change is one read-modify-write of the
+  // stored list under this lock, so a tab never writes back the list it read
+  // when its panel was opened. Returns null when no lock can be had.
+  async function withHygienePresetsLock(ownerUid, transaction) {
+    const lockManager = pageLockManager();
+    if (lockManager === null) return null;
+    try {
+      return await lockManager.request.call(
+        lockManager,
+        "weibo-toolkit-follower-hygiene-presets-" + ownerUid,
+        { mode: "exclusive" },
+        async (lock) => (lock === null ? null : await transaction())
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function saveHygienePresets(ownerUid, presets) {
+    try {
+      const serialized = JSON.stringify({ schemaVersion: 1, presets });
+      const key = FOLLOWER_HYGIENE_PRESETS_PREFIX + ownerUid;
+      GM_setValue(key, serialized);
+      return GM_getValue(key, null) === serialized;
+    } catch (_) {
+      return false;
+    }
+  }
+
   function buildHygieneValueInput(labelText, type, placeholder) {
     const label = createElement("label", null, "wfr-hygiene-control");
     label.append(createElement("span", labelText));
@@ -8223,6 +8654,19 @@
       createElement("span", "UID " + record.uid, "wfr-hygiene-uid")
     );
     item.append(head);
+    const protectedReason =
+      typeof removalState.protectedReason === "function"
+        ? removalState.protectedReason(record.uid)
+        : null;
+    if (protectedReason !== null) {
+      item.append(
+        createElement(
+          "p",
+          "批量选择会跳过：" + protectedReason,
+          "wfr-hygiene-line wfr-hygiene-protected"
+        )
+      );
+    }
     const profile = createElement("a", "查看主页", "wfr-button");
     profile.href = "https://weibo.com/u/" + record.uid;
     profile.target = "_blank";
@@ -8421,6 +8865,19 @@
       return;
     }
     const successfullyRemovedUids = new Set();
+    // Accounts this Toolkit has already removed but the snapshot still lists.
+    // They are left out of the results, so the list moves on by itself and the
+    // next batch can be picked without refreshing the snapshot first. The set
+    // starts from the removals confirmed after this snapshot was taken, which
+    // makes it survive closing the panel or reloading the page.
+    const hiddenRemovedUids = new Set();
+    {
+      const snapshotTime = Date.parse(snapshot.capturedAt);
+      const pending = loadFollowerRemovalPending(owner.uid).pending;
+      for (const uid of Object.keys(pending)) {
+        if (pending[uid].confirmedAt > snapshotTime) hiddenRemovedUids.add(uid);
+      }
+    }
     const uncertainRemovalUids = new Set();
     const removalMessages = new Map();
     const selectedUids = new Set();
@@ -8429,6 +8886,51 @@
     // Every match of the current filters, across pages: the selection can span
     // pages, so the batch is drawn from here rather than from the visible page.
     let currentMatches = [];
+    // Accounts the bulk selectors leave alone: the ones the user also follows
+    // and the ones the user has written a note about. Ticking such a card by
+    // hand still works; that is a decision about one named account.
+    let protectedReasons = new Map();
+    let protectionNotice = "";
+
+    // Recomputed whenever it is about to be relied on, because notes can be
+    // added, removed or become unreadable in another tab while this panel is
+    // open. What the page says is brought in line every time: the warning
+    // below the summary and the note on each visible card. A protection that
+    // has silently weakened would be worse than none.
+    function refreshProtection() {
+      const notes = loadFriendNotesState(owner.uid);
+      const noted = notes.ok ? notes.state.notes : null;
+      protectionNotice = notes.ok
+        ? ""
+        : "友人档案现在无法读取：批量选择只会跳过快照中你也关注的账号，不再跳过有友人档案的账号。";
+      const visibleBefore = visibleProtectionSignature();
+      protectedReasons = new Map();
+      for (const record of snapshot.records) {
+        const reasons = [];
+        if (record.ownerFollowing === true) reasons.push("快照中你也关注");
+        if (noted !== null && hasOwn(noted, record.uid)) reasons.push("有友人档案");
+        if (reasons.length > 0) protectedReasons.set(record.uid, reasons.join("、"));
+      }
+      protectionLine.textContent = protectionNotice;
+      protectionLine.className = notes.ok
+        ? "wfr-muted wfr-hygiene-preset-status"
+        : "wfr-error wfr-hygiene-preset-status";
+      if (visibleProtectionSignature() !== visibleBefore) refreshVisibleCards();
+    }
+
+    function visibleProtectionSignature() {
+      return [...cardNodes.keys()]
+        .map((uid) => uid + ":" + (protectedReasons.get(uid) || ""))
+        .join("|");
+    }
+
+    // The protection each account in a reviewed list had when it was shown.
+    function protectionSignature(records) {
+      return records
+        .map((record) => protectedReasons.get(record.uid) || "")
+        .join("|");
+    }
+
     let selectionMessage = "";
     let batchStopRequested = false;
     let batchStatus = null;
@@ -8449,6 +8951,7 @@
       changeSelection,
       registerCard,
       isBatchActive: () => Boolean(batchStatus && batchStatus.active),
+      protectedReason: (uid) => protectedReasons.get(uid) || null,
     };
 
     function registerCard(uid, element, selectionInput) {
@@ -8558,6 +9061,7 @@
         uncertainRemovalUids.delete(record.uid);
         removalMessages.delete(record.uid);
         selectedUids.delete(record.uid);
+        void appendFollowerRemovalLog(owner.uid, record);
       } else {
         removalMessages.set(record.uid, followerRemovalResultMessage(result));
         if (followerRemovalOutcomeIsUncertain(result)) {
@@ -8573,8 +9077,28 @@
     // One compact factual line instead of four stacked rows. The filtering
     // caveat keeps its own muted line: the API result is never claimed complete.
     const summaryLine = createElement("p", "", "wfr-row wfr-hygiene-summary");
-    body.append(summaryLine);
+    const protectionLine = createElement("p", "", "wfr-muted wfr-hygiene-preset-status");
+    body.append(summaryLine, protectionLine);
     appendFollowerVisibilityNote(body, snapshot);
+
+    // Writes a stored filter set back into the controls. The values pass
+    // through the same normalisation as typed input when they are read again.
+    function applyFilters(filters) {
+      mode.value = filters.mode;
+      ownerNotFollowing.input.checked = filters.ownerNotFollowing;
+      unverified.input.checked = filters.unverified;
+      for (const [field, value] of [
+        [statusesMax, filters.statusesMax],
+        [followersMax, filters.followersMax],
+        [friendsMax, filters.friendsMax],
+        [createdAfter, filters.createdAfter],
+      ]) {
+        field.input.value = value === null ? "" : String(value);
+      }
+      for (const entry of sourceInputs) {
+        entry.input.checked = filters.sourceCategories.includes(entry.key);
+      }
+    }
 
     // Collapsed by default, so the first cards start near the top. This is view
     // state only and is never persisted.
@@ -8583,10 +9107,60 @@
     const filterSummary = createElement("span", "", "wfr-hygiene-filter-summary");
     const filterToggle = createElement("button", "设置筛选", "wfr-button");
     filterToggle.type = "button";
-    filterBar.append(filterSummary, filterToggle);
+    const removalLogButton = createElement("button", "移除记录", "wfr-button");
+    removalLogButton.type = "button";
+    removalLogButton.addEventListener("click", showFollowerRemovalLog);
+    filterBar.append(filterSummary, removalLogButton, filterToggle);
     body.append(filterBar);
 
     const controls = createElement("div", null, "wfr-hygiene-controls");
+    const presetGroup = createElement("div", null, "wfr-hygiene-group");
+    presetGroup.append(
+      createElement("span", "筛选方案", "wfr-hygiene-group-label")
+    );
+    const presetRow = createElement("div", null, "wfr-hygiene-presets");
+    const presetSelect = createElement("select", null, "wfr-select");
+    presetSelect.setAttribute("aria-label", "已保存的筛选方案");
+    const presetName = createElement("input", null, "wfr-hygiene-input");
+    presetName.type = "text";
+    presetName.maxLength = FOLLOWER_HYGIENE_PRESET_NAME_MAX;
+    presetName.placeholder = "方案名称";
+    presetName.setAttribute("aria-label", "方案名称");
+    const presetSave = createElement("button", "保存当前条件", "wfr-button");
+    const presetDelete = createElement("button", "删除方案", "wfr-button");
+    presetSave.type = "button";
+    presetDelete.type = "button";
+    const presetStatus = createElement("p", "", "wfr-muted wfr-hygiene-preset-status");
+    presetStatus.setAttribute("role", "status");
+    presetRow.append(presetSelect, presetName, presetSave, presetDelete);
+    presetGroup.append(presetRow, presetStatus);
+    controls.append(presetGroup);
+    let presets = loadHygienePresets(owner.uid);
+
+    function renderPresetOptions(selectedName) {
+      clearNode(presetSelect);
+      const placeholder = createElement(
+        "option",
+        presets.length === 0 ? "还没有保存的方案" : "选择已保存的方案…"
+      );
+      placeholder.value = "";
+      presetSelect.append(placeholder);
+      for (const preset of presets) {
+        const option = createElement("option", preset.name);
+        option.value = preset.name;
+        presetSelect.append(option);
+      }
+      presetSelect.value = selectedName || "";
+      syncPresetDeleteButton();
+    }
+
+    // A save that was waiting for its lock can finish after a batch has
+    // started and disabled these controls; it must not switch one back on.
+    function syncPresetDeleteButton() {
+      presetDelete.disabled =
+        presetSelect.value === "" || Boolean(batchStatus && batchStatus.active);
+    }
+
     const modeLabel = createElement("label", null, "wfr-hygiene-control");
     modeLabel.append(createElement("span", "匹配方式"));
     const mode = createElement("select", null, "wfr-select");
@@ -8601,6 +9175,17 @@
     mode.value = "ALL";
     modeLabel.append(mode);
     controls.append(modeLabel);
+    const sortLabel = createElement("label", null, "wfr-hygiene-control");
+    sortLabel.append(createElement("span", "排序"));
+    const sortSelect = createElement("select", null, "wfr-select");
+    for (const [value, text] of FOLLOWER_HYGIENE_SORTS) {
+      const option = createElement("option", text);
+      option.value = value;
+      sortSelect.append(option);
+    }
+    sortSelect.value = "SNAPSHOT";
+    sortLabel.append(sortSelect);
+    controls.append(sortLabel);
 
     const ownerNotFollowing = buildHygieneCheckbox("未关注 TA");
     const unverified = buildHygieneCheckbox("未认证");
@@ -8682,6 +9267,12 @@
       "选择当前页",
       "wfr-button"
     );
+    const fillSelectionButton = createElement(
+      "button",
+      "按顺序选满",
+      "wfr-button"
+    );
+    fillSelectionButton.type = "button";
     const clearSelectionButton = createElement(
       "button",
       "清除选择",
@@ -8698,6 +9289,7 @@
     selectionControls.append(
       selectCurrentPageButton,
       selectionCountNode,
+      fillSelectionButton,
       clearSelectionButton,
       batchRemoveButton
     );
@@ -8819,6 +9411,11 @@
         currentPageMatches.length === 0 && !batchActive;
       selectionControls.hidden = batchActive;
       batchControls.hidden = !batchActive;
+      // While a batch runs the bar holds the only stop control, so it floats
+      // in every window size; the style sheet keys on this class.
+      selectionToolbar.className = batchActive
+        ? "wfr-selection-bar wfr-selection-bar-running"
+        : "wfr-selection-bar";
       selectionCountNode.textContent =
         "已选择：" +
         String(selectedUids.size) +
@@ -8828,6 +9425,11 @@
         busy ||
         selectedUids.size >= FOLLOWER_BATCH_MAX_SELECTION ||
         !eligibleVisibleUids().some((uid) => !selectedUids.has(uid));
+      fillSelectionButton.disabled =
+        busy ||
+        batchActive ||
+        selectedUids.size >= FOLLOWER_BATCH_MAX_SELECTION ||
+        !currentMatches.some((match) => fillEligible(match.record));
       clearSelectionButton.disabled = selectedUids.size === 0 || busy || batchActive;
       batchRemoveButton.disabled = selectedUids.size === 0 || busy;
       if (batchActive) {
@@ -8842,9 +9444,15 @@
           ? "正在停止…"
           : "停止后续操作";
         stopBatchButton.disabled = batchStatus.stopRequested;
-        selectionMessageNode.textContent = batchStatus.currentName
-          ? "当前账号：" + batchStatus.currentName
-          : "";
+        selectionMessageNode.textContent = batchStatus.stalled
+          ? "当前操作超过 " +
+            String(FOLLOWER_BATCH_STALL_HINT_MS / 1000) +
+            " 秒没有完成。可以继续等待；刷新页面会立即退出，但“" +
+            batchStatus.currentName +
+            "”的结果将无法确认。"
+          : batchStatus.currentName
+            ? "当前账号：" + batchStatus.currentName
+            : "";
         reserveSelectionBarSpace();
         return;
       }
@@ -8857,9 +9465,15 @@
     // such as the batch confirmation buttons, clear of it.
     function reserveSelectionBarSpace() {
       if (!body.style) return;
-      const height = selectionToolbar.hidden
-        ? 0
-        : Number(selectionToolbar.offsetHeight) || 0;
+      // In a small window the bar is part of the normal flow (see the style
+      // sheet) and covers nothing, so nothing needs to be kept clear of it.
+      const floating =
+        typeof getComputedStyle !== "function" ||
+        getComputedStyle(selectionToolbar).position === "sticky";
+      const height =
+        selectionToolbar.hidden || !floating
+          ? 0
+          : Number(selectionToolbar.offsetHeight) || 0;
       // A little more than the bar itself, so a focused control is not flush
       // against its top edge.
       body.style.scrollPaddingBottom =
@@ -8896,9 +9510,15 @@
         return;
       }
       invalidateBatchConfirmation();
+      refreshProtection();
       let refused = 0;
+      let skipped = 0;
       for (const uid of eligibleVisibleUids()) {
         if (selectedUids.has(uid)) continue;
+        if (protectedReasons.has(uid)) {
+          skipped += 1;
+          continue;
+        }
         if (selectedUids.size >= FOLLOWER_BATCH_MAX_SELECTION) {
           refused += 1;
           continue;
@@ -8908,11 +9528,71 @@
         if (input) input.checked = true;
       }
       selectionMessage =
-        refused > 0
+        (refused > 0
           ? "一次最多选择 " +
             String(FOLLOWER_BATCH_MAX_SELECTION) +
             " 个粉丝。"
-          : "";
+          : "") + skippedProtectedText(skipped);
+      renderSelectionToolbar();
+    }
+
+    function skippedProtectedText(skipped) {
+      return skipped > 0
+        ? "已跳过 " + String(skipped) + " 个受保护的账号，可逐个勾选。"
+        : "";
+    }
+
+    function fillEligible(record) {
+      return (
+        normalizeStableUid(record.uid) === record.uid &&
+        !protectedReasons.has(record.uid) &&
+        !selectedUids.has(record.uid) &&
+        !successfullyRemovedUids.has(record.uid) &&
+        !uncertainRemovalUids.has(record.uid)
+      );
+    }
+
+    // Tops the selection up to the batch limit in the order of the filtered
+    // results, across pages. It selects accounts the user has not scrolled to,
+    // so it says how many; the confirmation still lists every one of them.
+    function fillSelection() {
+      if (followerRemovalInFlight || (batchStatus && batchStatus.active)) {
+        selectionMessage = "请等待当前移除操作完成。";
+        renderSelectionToolbar();
+        return;
+      }
+      if (followerUpdateRunning || updateRunning) {
+        selectionMessage = "关系扫描进行中，暂时无法选择。";
+        renderSelectionToolbar();
+        return;
+      }
+      invalidateBatchConfirmation();
+      refreshProtection();
+      const visible = new Set(currentPageMatches.map((match) => match.record.uid));
+      let added = 0;
+      let offPage = 0;
+      let skipped = 0;
+      for (const match of currentMatches) {
+        if (selectedUids.size >= FOLLOWER_BATCH_MAX_SELECTION) break;
+        const record = match.record;
+        if (protectedReasons.has(record.uid) && !selectedUids.has(record.uid)) {
+          skipped += 1;
+        }
+        if (!fillEligible(record)) continue;
+        selectedUids.add(record.uid);
+        added += 1;
+        if (!visible.has(record.uid)) offPage += 1;
+        const input = cardSelectionInputs.get(record.uid);
+        if (input) input.checked = true;
+      }
+      selectionMessage =
+        (added === 0
+          ? "没有可以再选的账号。"
+          : "已按顺序选中 " +
+            String(added) +
+            " 个" +
+            (offPage > 0 ? "（" + String(offPage) + " 个不在当前页）" : "") +
+            "。") + skippedProtectedText(skipped);
       renderSelectionToolbar();
     }
 
@@ -8948,7 +9628,7 @@
           ),
           createElement(
             "p",
-            "移除已成功。当前粉丝快照仍是操作前的数据。",
+            "移除已成功。已移除的账号不再列出；粉丝快照本身仍是操作前的数据。",
             "wfr-muted"
           )
         );
@@ -8969,6 +9649,28 @@
         addLine(batchPanel, "结果无法确认", summary.uncertain);
       }
       addLine(batchPanel, "未执行", summary.notExecuted);
+      // Straight on to the next batch, but only after a clean one: a failure or
+      // an unknown result is something to look at first.
+      if (
+        summary.outcome === "COMPLETE" &&
+        summary.failure === 0 &&
+        summary.uncertain === 0 &&
+        currentMatches.some((match) => fillEligible(match.record))
+      ) {
+        const actions = createElement("div", null, "wfr-actions");
+        const nextButton = createElement(
+          "button",
+          "选满下一批并预览",
+          "wfr-button wfr-primary"
+        );
+        nextButton.type = "button";
+        nextButton.addEventListener("click", () => {
+          fillSelection();
+          showBatchConfirmation();
+        });
+        actions.append(nextButton);
+        batchPanel.append(actions);
+      }
       if (summary.success > 0) appendManualSnapshotRefresh(batchPanel);
     }
 
@@ -8994,6 +9696,9 @@
         renderSelectionToolbar();
         return;
       }
+      // The list about to be reviewed is marked with the protection as it is
+      // now, not as it was when the accounts were selected.
+      refreshProtection();
       const records = selectedRecords();
       if (
         records.length === 0 ||
@@ -9001,6 +9706,7 @@
       ) {
         return;
       }
+      const reviewedProtection = protectionSignature(records);
       batchStatus = null;
       batchConfirmation = null;
       clearNode(batchPanel);
@@ -9027,7 +9733,7 @@
         ),
         createElement(
           "p",
-          "操作将逐个进行，每次成功后约等待 3 秒。",
+          "操作将逐个进行，每次成功后约等待 3 秒。请保持本标签页在前台：切到后台后，浏览器可能延后计时，批量可能变慢。",
           "wfr-muted"
         ),
         createElement(
@@ -9040,7 +9746,13 @@
       // confirmation so the cancel/confirm controls stay on screen however many.
       const names = createElement("ul", null, "wfr-confirm-list");
       for (const record of records) {
-        names.append(createElement("li", record.screenName || record.uid));
+        const reason = protectedReasons.get(record.uid);
+        names.append(
+          createElement(
+            "li",
+            (record.screenName || record.uid) + (reason ? "（" + reason + "）" : "")
+          )
+        );
       }
       confirmation.append(names);
       const actions = createElement("div", null, "wfr-actions");
@@ -9086,6 +9798,16 @@
           renderSelectionToolbar();
           return;
         }
+        // Same accounts, but one of them has since gained or lost a note: the
+        // list the user reviewed no longer says what it should.
+        refreshProtection();
+        if (protectionSignature(currentRecords) !== reviewedProtection) {
+          invalidateBatchConfirmation();
+          selectionMessage = "名单中有账号的友人档案或关注状态已变化，请重新核对后确认。";
+          showBatchConfirmation();
+          renderSelectionToolbar();
+          return;
+        }
         cancel.disabled = true;
         confirm.disabled = true;
         batchConfirmation = null;
@@ -9101,6 +9823,30 @@
       if (typeof batchPanel.scrollIntoView === "function") {
         batchPanel.scrollIntoView({ block: "nearest" });
       }
+    }
+
+    // A removal request has no deadline on purpose: aborting it would not say
+    // whether Weibo carried it out. The panel is locked for the whole batch,
+    // though, so a request that never returns must at least tell the user the
+    // one way out and what it costs.
+    let stalledRequestTimer = null;
+
+    function clearStalledRequestWatch() {
+      if (stalledRequestTimer !== null) {
+        clearTimeout(stalledRequestTimer);
+        stalledRequestTimer = null;
+      }
+      if (batchStatus && batchStatus.stalled) batchStatus.stalled = false;
+    }
+
+    function watchForStalledRequest() {
+      clearStalledRequestWatch();
+      stalledRequestTimer = setTimeout(() => {
+        stalledRequestTimer = null;
+        if (!batchStatus || !batchStatus.active) return;
+        batchStatus.stalled = true;
+        renderSelectionToolbar();
+      }, FOLLOWER_BATCH_STALL_HINT_MS);
     }
 
     async function beginBatchRemoval(records) {
@@ -9126,16 +9872,19 @@
             batchStatus.current = progress.current;
             batchStatus.currentName =
               progress.record.screenName || progress.record.uid;
+            if (progress.phase === "REQUESTING") watchForStalledRequest();
             renderSelectionToolbar();
           },
           onResult(entry) {
             const record = entry.record;
             const result = entry.result;
+            clearStalledRequestWatch();
             selectedUids.delete(record.uid);
             if (result.ok) {
               successfullyRemovedUids.add(record.uid);
               uncertainRemovalUids.delete(record.uid);
               removalMessages.delete(record.uid);
+              void appendFollowerRemovalLog(owner.uid, record);
             } else {
               removalMessages.set(
                 record.uid,
@@ -9159,14 +9908,17 @@
           summary,
         };
       } finally {
+        clearStalledRequestWatch();
         batchStatus.active = false;
         for (const input of filterInputs) input.disabled = false;
+        syncPresetDeleteButton();
         setPanelExitLocked(false);
       }
-      renderSelectionToolbar();
-      renderPaginationState();
+      // Redraw from the first page: the accounts just removed drop out of the
+      // list and the next candidates move up, ready for another batch.
+      currentPage = 1;
+      renderResults(false);
       renderBatchPanel();
-      refreshVisibleCards();
     }
 
     function renderResults(resetPage) {
@@ -9182,7 +9934,16 @@
       cardMatches.clear();
       cardSelectionInputs.clear();
       const result = filterFollowerSnapshot(snapshot, readFilters());
-      currentMatches = result.matches;
+      // A card that was just removed keeps saying so until the list is next
+      // redrawn; from then on it is one of the hidden ones.
+      for (const uid of successfullyRemovedUids) hiddenRemovedUids.add(uid);
+      refreshProtection();
+      const matches = sortHygieneMatches(
+        result.matches.filter((match) => !hiddenRemovedUids.has(match.record.uid)),
+        sortSelect.value
+      );
+      const hiddenCount = result.matches.length - matches.length;
+      currentMatches = matches;
       summaryLine.textContent =
         "快照：" +
         formatMinute(snapshot.capturedAt) +
@@ -9190,7 +9951,11 @@
         String(snapshot.uniqueRecordCount) +
         (result.filters.activeCount === 0
           ? ""
-          : " · 匹配：" + String(result.matches.length));
+          : " · 匹配：" +
+            String(matches.length) +
+            (hiddenCount > 0
+              ? "（另有 " + String(hiddenCount) + " 个已移除，不再列出）"
+              : ""));
       renderFilterBar(result.filters);
       prompt.hidden = result.filters.activeCount !== 0;
       if (result.filters.activeCount === 0) {
@@ -9203,9 +9968,11 @@
         renderSelectionToolbar();
         return;
       }
-      if (result.matches.length === 0) {
+      if (matches.length === 0) {
         paginationSummary.textContent =
-          "当前快照中没有符合筛选条件的API可见粉丝。";
+          hiddenCount > 0
+            ? "符合筛选条件的粉丝都已移除。"
+            : "当前快照中没有符合筛选条件的API可见粉丝。";
         paginationActions.hidden = true;
         paginationBar.hidden = false;
         currentPageMatches = [];
@@ -9214,10 +9981,7 @@
         renderSelectionToolbar();
         return;
       }
-      const pagination = paginateFollowerHygieneMatches(
-        result.matches,
-        currentPage
-      );
+      const pagination = paginateFollowerHygieneMatches(matches, currentPage);
       currentPage = pagination.page;
       currentPageMatches = pagination.records;
       currentPagination = pagination;
@@ -9253,6 +10017,7 @@
       renderResults(false);
     });
     selectCurrentPageButton.addEventListener("click", selectCurrentPage);
+    fillSelectionButton.addEventListener("click", fillSelection);
     clearSelectionButton.addEventListener("click", () => {
       if (
         (batchStatus && batchStatus.active) ||
@@ -9282,8 +10047,96 @@
       renderFilterBar(normalizeHygieneFilters(readFilters()));
     });
 
+    renderPresetOptions("");
+    presetSelect.addEventListener("change", () => {
+      presetStatus.textContent = "";
+      syncPresetDeleteButton();
+      const chosen = presets.find((preset) => preset.name === presetSelect.value);
+      if (!chosen || (batchStatus && batchStatus.active)) return;
+      presetName.value = chosen.name;
+      applyFilters(chosen.filters);
+      renderResults(true);
+    });
+    presetSave.addEventListener("click", async () => {
+      const name = String(presetName.value || "").trim();
+      const filters = normalizeHygieneFilters(readFilters());
+      if (name === "") {
+        presetStatus.textContent = "请先填写方案名称。";
+        return;
+      }
+      if (filters.activeCount === 0) {
+        presetStatus.textContent = "请先设置至少一个筛选条件。";
+        return;
+      }
+      // Whether this tab already knew the name decides what a clash means:
+      // updating one's own set is intended, replacing a set another tab has
+      // just created under the same name is not.
+      const knownHere = presets.some((preset) => preset.name === name);
+      const outcome = await withHygienePresetsLock(owner.uid, async () => {
+        const latest = loadHygienePresets(owner.uid);
+        const existing = latest.findIndex((preset) => preset.name === name);
+        if (existing >= 0 && !knownHere) return { kind: "CLASH", latest };
+        if (existing < 0 && latest.length >= FOLLOWER_HYGIENE_PRESET_LIMIT) {
+          return { kind: "FULL", latest };
+        }
+        const next = latest.slice();
+        const entry = { name, filters: hygienePresetFilters(filters) };
+        if (existing < 0) next.push(entry);
+        else next[existing] = entry;
+        if (!saveHygienePresets(owner.uid, next)) return { kind: "FAILED", latest };
+        return { kind: existing < 0 ? "ADDED" : "UPDATED", latest: next };
+      });
+      if (outcome === null) {
+        presetStatus.textContent = "暂时无法安全地保存方案，请稍后重试。";
+        return;
+      }
+      presets = outcome.latest;
+      if (outcome.kind === "CLASH") {
+        renderPresetOptions("");
+        presetStatus.textContent =
+          "另一个标签页刚保存了同名方案“" + name + "”，这次没有覆盖它。列表已更新；再次保存会替换它。";
+        return;
+      }
+      if (outcome.kind === "FULL") {
+        renderPresetOptions("");
+        presetStatus.textContent =
+          "最多保存 " + String(FOLLOWER_HYGIENE_PRESET_LIMIT) + " 个方案，请先删除一个。";
+        return;
+      }
+      if (outcome.kind === "FAILED") {
+        renderPresetOptions(presetSelect.value);
+        presetStatus.textContent = "方案未能保存。";
+        return;
+      }
+      renderPresetOptions(name);
+      presetStatus.textContent =
+        outcome.kind === "ADDED" ? "已保存方案“" + name + "”。" : "已更新方案“" + name + "”。";
+    });
+    presetDelete.addEventListener("click", async () => {
+      const name = presetSelect.value;
+      if (name === "") return;
+      const outcome = await withHygienePresetsLock(owner.uid, async () => {
+        const latest = loadHygienePresets(owner.uid);
+        const next = latest.filter((preset) => preset.name !== name);
+        if (!saveHygienePresets(owner.uid, next)) return { ok: false, latest };
+        return { ok: true, latest: next };
+      });
+      if (outcome === null) {
+        presetStatus.textContent = "暂时无法安全地删除方案，请稍后重试。";
+        return;
+      }
+      presets = outcome.latest;
+      renderPresetOptions("");
+      presetStatus.textContent = outcome.ok
+        ? "已删除方案“" + name + "”。当前筛选条件没有变化。"
+        : "方案未能删除。";
+    });
+
     filterInputs = [
       mode,
+      // Not a filter, but it changes which accounts "fill" would take, so it
+      // resets the selection exactly as a filter change does.
+      sortSelect,
       ownerNotFollowing.input,
       unverified.input,
       statusesMax.input,
@@ -9298,6 +10151,9 @@
         input.addEventListener("input", () => renderResults(true));
       }
     }
+    // Disabled together with the filters while a batch runs, but they are not
+    // filters themselves and must not trigger a re-filter on their own.
+    filterInputs.push(presetSelect, presetName, presetSave, presetDelete, removalLogButton);
     renderResults(true);
   }
 
@@ -9477,6 +10333,10 @@
     body.append(list);
 
     const newestFirst = sortEventsNewestFirst(state.events);
+    // Read once per render of the page; the cards only need to know whether a
+    // note exists. Unreadable notes simply mean no shortcut is offered.
+    const notesLoaded = loadFriendNotesState(ownerUid);
+    const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
     function renderList(query) {
       while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
       const matching = filterEvents(newestFirst, query);
@@ -9484,24 +10344,37 @@
         list.append(createElement("p", "没有匹配的事件", "wfr-muted wfr-empty"));
         return;
       }
+      // One card per account, placed where its newest matching event falls.
+      // The card shows that newest event; the rest are one click away in the
+      // account's timeline, so an account that changed often no longer fills
+      // the list.
+      const groups = new Map();
       for (const event of matching) {
-        list.append(buildEventCard(ownerUid, state, event));
+        const group = groups.get(event.subjectUid);
+        if (group) group.push(event);
+        else groups.set(event.subjectUid, [event]);
+      }
+      for (const group of groups.values()) {
+        list.append(buildEventCard(ownerUid, state, group, notedUids));
       }
     }
     search.addEventListener("input", () => renderList(search.value || ""));
     renderList("");
   }
 
-  function buildEventCard(ownerUid, state, event) {
+  // group: the matching events of one account, newest first.
+  function buildEventCard(ownerUid, state, group, notedUids) {
+    const event = group[0];
+    const read = group.every((entry) => entry.read);
     const item = createElement(
       "article",
       null,
-      event.read ? "wfr-event" : "wfr-event wfr-event-unread"
+      read ? "wfr-event" : "wfr-event wfr-event-unread"
     );
     item.append(
       createElement(
         "h3",
-        `${event.read ? "已读" : "未读"} · ${EVENT_LABELS[event.type] || event.type}`
+        `${read ? "已读" : "未读"} · ${EVENT_LABELS[event.type] || event.type}`
       )
     );
     addLine(item, "时间", formatTime(event.detectedAt));
@@ -9509,12 +10382,41 @@
     if (event.type === EVENT.SCREEN_NAME_CHANGED) {
       addLine(item, "变化", describeEvent(event));
     }
+    const actions = createElement("div", null, "wfr-actions");
     const detailButton = createElement("button", "详情", "wfr-button");
     detailButton.type = "button";
     detailButton.addEventListener("click", () =>
       showEventDetail(ownerUid, state, event)
     );
-    item.append(detailButton);
+    actions.append(detailButton);
+    // The whole stored history of the account, not just what the search
+    // matched: that is what the timeline behind the button shows.
+    const historyCount = eventsForSubject(state.events, event.subjectUid).length;
+    if (historyCount > 1) {
+      const moreButton = createElement(
+        "button",
+        `该账号共 ${historyCount} 条事件`,
+        "wfr-button"
+      );
+      moreButton.type = "button";
+      moreButton.addEventListener("click", () =>
+        showTimeline(ownerUid, state, event.subjectUid)
+      );
+      actions.append(moreButton);
+    }
+    if (notedUids !== null) {
+      const noteButton = createElement(
+        "button",
+        hasOwn(notedUids, event.subjectUid) ? "友人档案" : "写档案",
+        "wfr-button"
+      );
+      noteButton.type = "button";
+      noteButton.addEventListener("click", () =>
+        showFriendNoteDetail(ownerUid, event.subjectUid, null)
+      );
+      actions.append(noteButton);
+    }
+    item.append(actions);
     return item;
   }
 
@@ -10250,6 +11152,8 @@
       // True while typed input could be lost: an open edit form or a save or
       // delete still in flight.
       isEditing: () => busy || mode === "edit",
+      // A save or delete is in flight. Unlike a draft, it cannot be discarded.
+      isBusy: () => busy,
       hasUnsavedChanges: () =>
         busy || (mode === "edit" && draftChanged !== null && draftChanged()),
       // Another view in this tab has just stored this version. A view with
@@ -15001,6 +15905,23 @@
     body.append(status);
   }
 
+  // A manual update that finished after its progress panel was left is
+  // mentioned on its Home card until the user has looked at the outcome.
+  function appendUnseenUpdateResult(section, actions, result, show) {
+    if (result === null) return;
+    section.append(
+      createElement(
+        "p",
+        result.ok ? "上次手动更新已完成，结果还没有查看。" : "上次手动更新没有成功。",
+        result.ok ? "wfr-success wfr-home-hint" : "wfr-error wfr-home-hint"
+      )
+    );
+    const button = createElement("button", "查看结果", "wfr-button");
+    button.type = "button";
+    button.addEventListener("click", () => show());
+    actions.append(button);
+  }
+
   function showToolkitHome() {
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
@@ -15046,8 +15967,16 @@
       }
     }
 
+    const radarRunning =
+      manualRadarRun !== null && manualRadarRun.ownerUid === uidResult.uid;
+    const followerRunning =
+      manualFollowerRun !== null && manualFollowerRun.ownerUid === uidResult.uid;
     const actions = createElement("div", null, "wfr-actions");
-    const updateButton = createElement("button", "立即更新", "wfr-button wfr-primary");
+    const updateButton = createElement(
+      "button",
+      radarRunning ? "查看进度" : "立即更新",
+      "wfr-button wfr-primary"
+    );
     const eventsButton = createElement("button", "查看事件", "wfr-button");
     const overviewButton = createElement("button", "关系概览", "wfr-button");
     const statusButton = createElement("button", "查看状态", "wfr-button");
@@ -15069,7 +15998,17 @@
     ]) {
       button.type = "button";
     }
-    updateButton.addEventListener("click", () => void updateNow());
+    updateButton.addEventListener("click", () => {
+      // This Home was drawn while a scan ran. If that scan has ended since, the
+      // button leads to its outcome; it must not quietly start another scan.
+      if (radarRunning && manualRadarRun === null) {
+        const result = takeUnseenRadarResult(uidResult.uid);
+        if (result !== null) showRadarUpdateResult(result);
+        else showToolkitHome();
+        return;
+      }
+      void updateNow();
+    });
     eventsButton.addEventListener("click", viewEvents);
     overviewButton.addEventListener("click", showRelationshipOverview);
     statusButton.addEventListener("click", viewStatus);
@@ -15081,6 +16020,19 @@
       eventsButton,
       overviewButton,
       statusButton
+    );
+    appendUnseenUpdateResult(
+      radarSection,
+      actions,
+      unseenManualRadarResult !== null &&
+        unseenManualRadarResult.ownerUid === uidResult.uid
+        ? unseenManualRadarResult.result
+        : null,
+      () => {
+        const result = takeUnseenRadarResult(uidResult.uid);
+        if (result !== null) showRadarUpdateResult(result);
+        else showToolkitHome();
+      }
     );
     radarSection.append(actions);
 
@@ -15116,7 +16068,7 @@
     const followerActions = createElement("div", null, "wfr-actions");
     const followerUpdateButton = createElement(
       "button",
-      "更新粉丝快照",
+      followerRunning ? "查看进度" : "更新粉丝快照",
       "wfr-button wfr-primary"
     );
     const followerEventsButton = createElement(
@@ -15132,16 +16084,34 @@
     followerUpdateButton.type = "button";
     followerEventsButton.type = "button";
     followerHygieneButton.type = "button";
-    followerUpdateButton.addEventListener(
-      "click",
-      () => void updateFollowersNow()
-    );
+    followerUpdateButton.addEventListener("click", () => {
+      if (followerRunning && manualFollowerRun === null) {
+        const result = takeUnseenFollowerResult(uidResult.uid);
+        if (result !== null) showFollowerUpdateResult(result);
+        else showToolkitHome();
+        return;
+      }
+      void updateFollowersNow();
+    });
     followerEventsButton.addEventListener("click", viewFollowerEvents);
     followerHygieneButton.addEventListener("click", showFollowerHygiene);
     followerActions.append(
       followerUpdateButton,
       followerEventsButton,
       followerHygieneButton
+    );
+    appendUnseenUpdateResult(
+      followerSection,
+      followerActions,
+      unseenManualFollowerResult !== null &&
+        unseenManualFollowerResult.ownerUid === uidResult.uid
+        ? unseenManualFollowerResult.result
+        : null,
+      () => {
+        const result = takeUnseenFollowerResult(uidResult.uid);
+        if (result !== null) showFollowerUpdateResult(result);
+        else showToolkitHome();
+      }
     );
     followerSection.append(followerActions);
 
@@ -15348,6 +16318,11 @@
       .wfr-hygiene-controls .wfr-hygiene-group, .wfr-hygiene-controls .wfr-actions { grid-column: 1 / -1; }
       .wfr-hygiene-controls .wfr-actions { margin-top: 2px; }
       .wfr-hygiene-group-label { font-weight: 600; }
+      .wfr-hygiene-presets { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 5px; }
+      .wfr-hygiene-presets .wfr-select { flex: 1 1 160px; min-width: 0; }
+      .wfr-hygiene-presets .wfr-hygiene-input { flex: 1 1 120px; width: auto; min-width: 0; }
+      .wfr-hygiene-preset-status { margin: 6px 0 0; }
+      .wfr-hygiene-preset-status:empty { display: none; }
       .wfr-hygiene-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(116px, 1fr)); gap: 6px 12px; margin-top: 5px; }
       .wfr-hygiene-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; }
       .wfr-hygiene-bar[hidden] { display: none; }
@@ -15365,6 +16340,7 @@
       .wfr-hygiene-name { flex: 1 1 auto; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
       .wfr-hygiene-uid { flex: 0 0 auto; color: var(--wfr-muted); font: 12px/1.6 var(--wfr-mono); }
       .wfr-hygiene-line { margin: 5px 0 0; overflow-wrap: anywhere; }
+      .wfr-hygiene-protected { color: var(--wfr-accent); font-size: 12px; }
       .wfr-hygiene-facts { font-size: 13px; }
       .wfr-event .wfr-actions { margin-top: 9px; }
       .wfr-removal-confirm { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); }
@@ -15492,6 +16468,10 @@
         .wfr-body { padding: 18px; }
         .wfr-home-grid { grid-template-columns: minmax(0, 1fr); }
         .wfr-home-module { padding: 16px; }
+      }
+      .wfr-selection-bar-running .wfr-muted { max-height: 4.8em; overflow-y: auto; }
+      @media (max-width: 360px), (max-height: 520px) {
+        .wfr-selection-bar:not(.wfr-selection-bar-running) { position: static; }
       }
       @media (max-width: 360px) {
         .wfr-header { flex-wrap: wrap; }

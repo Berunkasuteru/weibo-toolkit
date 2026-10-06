@@ -581,6 +581,23 @@
     body.append(status);
   }
 
+  // A manual update that finished after its progress panel was left is
+  // mentioned on its Home card until the user has looked at the outcome.
+  function appendUnseenUpdateResult(section, actions, result, show) {
+    if (result === null) return;
+    section.append(
+      createElement(
+        "p",
+        result.ok ? "上次手动更新已完成，结果还没有查看。" : "上次手动更新没有成功。",
+        result.ok ? "wfr-success wfr-home-hint" : "wfr-error wfr-home-hint"
+      )
+    );
+    const button = createElement("button", "查看结果", "wfr-button");
+    button.type = "button";
+    button.addEventListener("click", () => show());
+    actions.append(button);
+  }
+
   function showToolkitHome() {
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
@@ -626,8 +643,16 @@
       }
     }
 
+    const radarRunning =
+      manualRadarRun !== null && manualRadarRun.ownerUid === uidResult.uid;
+    const followerRunning =
+      manualFollowerRun !== null && manualFollowerRun.ownerUid === uidResult.uid;
     const actions = createElement("div", null, "wfr-actions");
-    const updateButton = createElement("button", "立即更新", "wfr-button wfr-primary");
+    const updateButton = createElement(
+      "button",
+      radarRunning ? "查看进度" : "立即更新",
+      "wfr-button wfr-primary"
+    );
     const eventsButton = createElement("button", "查看事件", "wfr-button");
     const overviewButton = createElement("button", "关系概览", "wfr-button");
     const statusButton = createElement("button", "查看状态", "wfr-button");
@@ -649,7 +674,17 @@
     ]) {
       button.type = "button";
     }
-    updateButton.addEventListener("click", () => void updateNow());
+    updateButton.addEventListener("click", () => {
+      // This Home was drawn while a scan ran. If that scan has ended since, the
+      // button leads to its outcome; it must not quietly start another scan.
+      if (radarRunning && manualRadarRun === null) {
+        const result = takeUnseenRadarResult(uidResult.uid);
+        if (result !== null) showRadarUpdateResult(result);
+        else showToolkitHome();
+        return;
+      }
+      void updateNow();
+    });
     eventsButton.addEventListener("click", viewEvents);
     overviewButton.addEventListener("click", showRelationshipOverview);
     statusButton.addEventListener("click", viewStatus);
@@ -661,6 +696,19 @@
       eventsButton,
       overviewButton,
       statusButton
+    );
+    appendUnseenUpdateResult(
+      radarSection,
+      actions,
+      unseenManualRadarResult !== null &&
+        unseenManualRadarResult.ownerUid === uidResult.uid
+        ? unseenManualRadarResult.result
+        : null,
+      () => {
+        const result = takeUnseenRadarResult(uidResult.uid);
+        if (result !== null) showRadarUpdateResult(result);
+        else showToolkitHome();
+      }
     );
     radarSection.append(actions);
 
@@ -696,7 +744,7 @@
     const followerActions = createElement("div", null, "wfr-actions");
     const followerUpdateButton = createElement(
       "button",
-      "更新粉丝快照",
+      followerRunning ? "查看进度" : "更新粉丝快照",
       "wfr-button wfr-primary"
     );
     const followerEventsButton = createElement(
@@ -712,16 +760,34 @@
     followerUpdateButton.type = "button";
     followerEventsButton.type = "button";
     followerHygieneButton.type = "button";
-    followerUpdateButton.addEventListener(
-      "click",
-      () => void updateFollowersNow()
-    );
+    followerUpdateButton.addEventListener("click", () => {
+      if (followerRunning && manualFollowerRun === null) {
+        const result = takeUnseenFollowerResult(uidResult.uid);
+        if (result !== null) showFollowerUpdateResult(result);
+        else showToolkitHome();
+        return;
+      }
+      void updateFollowersNow();
+    });
     followerEventsButton.addEventListener("click", viewFollowerEvents);
     followerHygieneButton.addEventListener("click", showFollowerHygiene);
     followerActions.append(
       followerUpdateButton,
       followerEventsButton,
       followerHygieneButton
+    );
+    appendUnseenUpdateResult(
+      followerSection,
+      followerActions,
+      unseenManualFollowerResult !== null &&
+        unseenManualFollowerResult.ownerUid === uidResult.uid
+        ? unseenManualFollowerResult.result
+        : null,
+      () => {
+        const result = takeUnseenFollowerResult(uidResult.uid);
+        if (result !== null) showFollowerUpdateResult(result);
+        else showToolkitHome();
+      }
     );
     followerSection.append(followerActions);
 
@@ -928,6 +994,11 @@
       .wfr-hygiene-controls .wfr-hygiene-group, .wfr-hygiene-controls .wfr-actions { grid-column: 1 / -1; }
       .wfr-hygiene-controls .wfr-actions { margin-top: 2px; }
       .wfr-hygiene-group-label { font-weight: 600; }
+      .wfr-hygiene-presets { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 5px; }
+      .wfr-hygiene-presets .wfr-select { flex: 1 1 160px; min-width: 0; }
+      .wfr-hygiene-presets .wfr-hygiene-input { flex: 1 1 120px; width: auto; min-width: 0; }
+      .wfr-hygiene-preset-status { margin: 6px 0 0; }
+      .wfr-hygiene-preset-status:empty { display: none; }
       .wfr-hygiene-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(116px, 1fr)); gap: 6px 12px; margin-top: 5px; }
       .wfr-hygiene-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; }
       .wfr-hygiene-bar[hidden] { display: none; }
@@ -945,6 +1016,7 @@
       .wfr-hygiene-name { flex: 1 1 auto; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
       .wfr-hygiene-uid { flex: 0 0 auto; color: var(--wfr-muted); font: 12px/1.6 var(--wfr-mono); }
       .wfr-hygiene-line { margin: 5px 0 0; overflow-wrap: anywhere; }
+      .wfr-hygiene-protected { color: var(--wfr-accent); font-size: 12px; }
       .wfr-hygiene-facts { font-size: 13px; }
       .wfr-event .wfr-actions { margin-top: 9px; }
       .wfr-removal-confirm { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); }
@@ -1072,6 +1144,10 @@
         .wfr-body { padding: 18px; }
         .wfr-home-grid { grid-template-columns: minmax(0, 1fr); }
         .wfr-home-module { padding: 16px; }
+      }
+      .wfr-selection-bar-running .wfr-muted { max-height: 4.8em; overflow-y: auto; }
+      @media (max-width: 360px), (max-height: 520px) {
+        .wfr-selection-bar:not(.wfr-selection-bar-running) { position: static; }
       }
       @media (max-width: 360px) {
         .wfr-header { flex-wrap: wrap; }

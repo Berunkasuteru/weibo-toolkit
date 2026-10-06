@@ -3,7 +3,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.10.2";
+  const APP_VERSION = "0.11.0";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -118,6 +118,20 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.11.0": Object.freeze({
+      added: Object.freeze([
+        "粉丝体检可保存筛选方案、按粉丝数等排序，并可按筛选结果的顺序一次选满 200 个",
+        "移除记录：成功移除的粉丝会尽力写入本地记录，可搜索和导出 CSV",
+        "手动更新进行中可回到进度页；离开后才完成的更新，结果可在首页查看",
+        "关系事件按账号归并显示，并可从事件卡片直接写友人档案",
+      ]),
+      improved: Object.freeze([
+        "已移除的账号不再列出，可以连续处理多批，无需先更新粉丝快照",
+        "批量选择默认跳过快照中你也关注或有友人档案的账号，仍可逐个勾选",
+        "友人档案有未保存修改时，关闭或返回前先确认；保存进行中不能离开",
+        "批量移除中某个账号的操作长时间未完成时，提示退出方式及其后果",
+      ]),
+    }),
     "0.10.2": Object.freeze({
       improved: Object.freeze([
         "粉丝体检支持跨页手动保留选择，每批最多移除 200 个；修改筛选条件会清空选择",
@@ -370,6 +384,14 @@
   let updateRunning = false;
   let followerUpdateRunning = false;
   let followerCancelRequested = false;
+  // A manual scan in this tab, so its progress panel can be reopened after it
+  // was closed, and the outcome of one that finished while the user was
+  // elsewhere. Both live only as long as the page: they are a convenience for
+  // this visit, not a record.
+  let manualRadarRun = null;
+  let manualFollowerRun = null;
+  let unseenManualRadarResult = null;
+  let unseenManualFollowerResult = null;
   let followerRemovalInFlight = false;
   let panelRoot = null;
   let panelSizeFixed = false;

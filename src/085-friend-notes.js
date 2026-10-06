@@ -612,6 +612,8 @@
       // True while typed input could be lost: an open edit form or a save or
       // delete still in flight.
       isEditing: () => busy || mode === "edit",
+      // A save or delete is in flight. Unlike a draft, it cannot be discarded.
+      isBusy: () => busy,
       hasUnsavedChanges: () =>
         busy || (mode === "edit" && draftChanged !== null && draftChanged()),
       // Another view in this tab has just stored this version. A view with

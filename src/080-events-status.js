@@ -175,6 +175,10 @@
     body.append(list);
 
     const newestFirst = sortEventsNewestFirst(state.events);
+    // Read once per render of the page; the cards only need to know whether a
+    // note exists. Unreadable notes simply mean no shortcut is offered.
+    const notesLoaded = loadFriendNotesState(ownerUid);
+    const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
     function renderList(query) {
       while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
       const matching = filterEvents(newestFirst, query);
@@ -182,24 +186,37 @@
         list.append(createElement("p", "没有匹配的事件", "wfr-muted wfr-empty"));
         return;
       }
+      // One card per account, placed where its newest matching event falls.
+      // The card shows that newest event; the rest are one click away in the
+      // account's timeline, so an account that changed often no longer fills
+      // the list.
+      const groups = new Map();
       for (const event of matching) {
-        list.append(buildEventCard(ownerUid, state, event));
+        const group = groups.get(event.subjectUid);
+        if (group) group.push(event);
+        else groups.set(event.subjectUid, [event]);
+      }
+      for (const group of groups.values()) {
+        list.append(buildEventCard(ownerUid, state, group, notedUids));
       }
     }
     search.addEventListener("input", () => renderList(search.value || ""));
     renderList("");
   }
 
-  function buildEventCard(ownerUid, state, event) {
+  // group: the matching events of one account, newest first.
+  function buildEventCard(ownerUid, state, group, notedUids) {
+    const event = group[0];
+    const read = group.every((entry) => entry.read);
     const item = createElement(
       "article",
       null,
-      event.read ? "wfr-event" : "wfr-event wfr-event-unread"
+      read ? "wfr-event" : "wfr-event wfr-event-unread"
     );
     item.append(
       createElement(
         "h3",
-        `${event.read ? "已读" : "未读"} · ${EVENT_LABELS[event.type] || event.type}`
+        `${read ? "已读" : "未读"} · ${EVENT_LABELS[event.type] || event.type}`
       )
     );
     addLine(item, "时间", formatTime(event.detectedAt));
@@ -207,12 +224,41 @@
     if (event.type === EVENT.SCREEN_NAME_CHANGED) {
       addLine(item, "变化", describeEvent(event));
     }
+    const actions = createElement("div", null, "wfr-actions");
     const detailButton = createElement("button", "详情", "wfr-button");
     detailButton.type = "button";
     detailButton.addEventListener("click", () =>
       showEventDetail(ownerUid, state, event)
     );
-    item.append(detailButton);
+    actions.append(detailButton);
+    // The whole stored history of the account, not just what the search
+    // matched: that is what the timeline behind the button shows.
+    const historyCount = eventsForSubject(state.events, event.subjectUid).length;
+    if (historyCount > 1) {
+      const moreButton = createElement(
+        "button",
+        `该账号共 ${historyCount} 条事件`,
+        "wfr-button"
+      );
+      moreButton.type = "button";
+      moreButton.addEventListener("click", () =>
+        showTimeline(ownerUid, state, event.subjectUid)
+      );
+      actions.append(moreButton);
+    }
+    if (notedUids !== null) {
+      const noteButton = createElement(
+        "button",
+        hasOwn(notedUids, event.subjectUid) ? "友人档案" : "写档案",
+        "wfr-button"
+      );
+      noteButton.type = "button";
+      noteButton.addEventListener("click", () =>
+        showFriendNoteDetail(ownerUid, event.subjectUid, null)
+      );
+      actions.append(noteButton);
+    }
+    item.append(actions);
     return item;
   }
 

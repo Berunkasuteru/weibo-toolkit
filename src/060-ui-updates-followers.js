@@ -74,6 +74,22 @@
     );
   }
 
+  // Closing or leaving a note that has unsaved edits asks first. Escape never
+  // gets this far: it does nothing at all over an unsaved note.
+  function confirmLeavingUnsavedNote() {
+    if (!panelHoldsUnsavedNote()) return true;
+    // A save or delete that is already under way cannot be abandoned: saying
+    // "discard" and then storing it anyway would be a lie. Leaving waits.
+    if (friendNoteDetailView.editor.isBusy()) {
+      if (typeof alert === "function") alert("正在保存，请等待完成后再离开。");
+      return false;
+    }
+    return (
+      typeof confirm !== "function" ||
+      confirm("这份友人档案还有未保存的修改。确定放弃这些修改吗？")
+    );
+  }
+
   // Escape is left alone wherever it could cost the user something: while an
   // input method is composing, inside a text field (where it cancels a
   // candidate or clears a search), over an unsaved note, and during a removal
@@ -149,15 +165,17 @@
     heading.id = "wfr-panel-title";
     const closeButton = createElement("button", "关闭", "wfr-button");
     closeButton.type = "button";
-    closeButton.addEventListener("click", closePanel);
+    closeButton.addEventListener("click", () => {
+      if (confirmLeavingUnsavedNote()) closePanel();
+    });
     const body = createElement("div", null, "wfr-body");
     if (withBack) {
       const backButton = createElement("button", "← 返回", "wfr-button");
       backButton.type = "button";
-      backButton.addEventListener(
-        "click",
-        typeof withBack === "function" ? withBack : showToolkitHome
-      );
+      const goBack = typeof withBack === "function" ? withBack : showToolkitHome;
+      backButton.addEventListener("click", () => {
+        if (confirmLeavingUnsavedNote()) goBack();
+      });
       header.append(backButton, heading, closeButton);
       panelHeaderButtons = [backButton, closeButton];
     } else {
@@ -643,19 +661,76 @@
     };
   }
 
+  function showRadarUpdateResult(result) {
+    if (result.ok) showUpdateSuccess(result);
+    else showFailure("关系雷达更新失败", result);
+  }
+
+  // Opens (or reopens) the progress panel of the manual scan that is running
+  // and replays the latest numbers into it.
+  function attachRadarProgress(run) {
+    run.render = showScanProgress();
+    run.root = panelRoot;
+    if (run.latest !== null) run.render(run.latest);
+  }
+
+  // The stored outcome of a manual scan belongs to the account it ran for. It
+  // is handed out once, and only to that account. The caller's idea of the
+  // account may be as old as the Home it was drawn on, so the logged-in
+  // account is read again here; on any mismatch nothing is shown or consumed.
+  function unseenResultBelongsToCurrentAccount(unseen, ownerUid) {
+    if (unseen === null || unseen.ownerUid !== ownerUid) return false;
+    const current = determineCurrentUid();
+    return current.ok && current.uid === unseen.ownerUid;
+  }
+
+  function takeUnseenRadarResult(ownerUid) {
+    const unseen = unseenManualRadarResult;
+    if (!unseenResultBelongsToCurrentAccount(unseen, ownerUid)) return null;
+    unseenManualRadarResult = null;
+    return unseen.result;
+  }
+
+  function takeUnseenFollowerResult(ownerUid) {
+    const unseen = unseenManualFollowerResult;
+    if (!unseenResultBelongsToCurrentAccount(unseen, ownerUid)) return null;
+    unseenManualFollowerResult = null;
+    return unseen.result;
+  }
+
   async function updateNow() {
+    const startOwner = determineCurrentUid();
+    if (manualRadarRun !== null) {
+      // Only the account that started the scan may look into it.
+      if (startOwner.ok && startOwner.uid === manualRadarRun.ownerUid) {
+        attachRadarProgress(manualRadarRun);
+      } else {
+        showFailure("关系雷达更新", { failureKind: "UPDATE_ALREADY_RUNNING" });
+      }
+      return;
+    }
     if (updateRunning || followerUpdateRunning || followerRemovalInFlight) {
       showFailure("关系雷达更新", {
         failureKind: "UPDATE_ALREADY_RUNNING",
       });
       return;
     }
-    const reportProgress = showScanProgress();
-    const progressRoot = panelRoot;
+    const run = {
+      ownerUid: startOwner.ok ? startOwner.uid : null,
+      latest: null,
+      render: null,
+      root: null,
+    };
+    manualRadarRun = run;
+    unseenManualRadarResult = null;
+    attachRadarProgress(run);
     updateRunning = true;
     let result;
     try {
-      result = await performUpdate(reportProgress);
+      result = await performUpdate((progress) => {
+        run.latest = progress;
+        run.render(progress);
+      });
     } catch (error) {
       result = {
         ok: false,
@@ -664,20 +739,21 @@
       };
     } finally {
       updateRunning = false;
+      manualRadarRun = null;
     }
     refreshUnreadBadge();
     // The user may have closed the progress panel and opened something else,
-    // possibly with typed input in it. That panel is theirs; the outcome is
-    // then only announced on the launcher.
-    if (panelRoot !== progressRoot) {
+    // possibly with typed input in it. That panel is theirs: the outcome is
+    // announced on the launcher and kept for Home to show.
+    if (panelRoot !== run.root) {
+      unseenManualRadarResult = { ownerUid: run.ownerUid, result };
       setLauncherStatus(
         result.ok ? "关系雷达更新完成" : "关系雷达更新失败",
         AUTO_STATUS_DURATION_MS
       );
       return;
     }
-    if (result.ok) showUpdateSuccess(result);
-    else showFailure("关系雷达更新失败", result);
+    showRadarUpdateResult(result);
   }
 
   function followerFailureText(result) {
@@ -861,6 +937,11 @@
     }
     const cancelButton = createElement("button", "取消", "wfr-button");
     cancelButton.type = "button";
+    // A reopened panel shows a cancellation that was already requested.
+    if (followerCancelRequested) {
+      cancelButton.disabled = true;
+      cancelButton.textContent = "正在取消…";
+    }
     cancelButton.addEventListener("click", () => {
       followerCancelRequested = true;
       cancelButton.disabled = true;
@@ -879,7 +960,27 @@
     };
   }
 
+  function showFollowerUpdateResult(result) {
+    if (result.ok) showFollowerUpdateSuccess(result);
+    else showFollowerFailure(result);
+  }
+
+  function attachFollowerProgress(run) {
+    run.render = showFollowerScanProgress(run.cancel);
+    run.root = panelRoot;
+    if (run.latest !== null) run.render(run.latest);
+  }
+
   async function updateFollowersNow() {
+    const startOwner = determineCurrentUid();
+    if (manualFollowerRun !== null) {
+      if (startOwner.ok && startOwner.uid === manualFollowerRun.ownerUid) {
+        attachFollowerProgress(manualFollowerRun);
+      } else {
+        showFollowerFailure({ failureKind: "UPDATE_ALREADY_RUNNING" });
+      }
+      return;
+    }
     if (followerUpdateRunning || updateRunning || followerRemovalInFlight) {
       showFollowerFailure({ failureKind: "UPDATE_ALREADY_RUNNING" });
       return;
@@ -887,15 +988,24 @@
     followerCancelRequested = false;
     // Cancelling also ends the request in flight instead of waiting for it.
     const cancelController = new AbortController();
-    const reportProgress = showFollowerScanProgress(() =>
-      cancelController.abort()
-    );
-    const progressRoot = panelRoot;
+    const run = {
+      ownerUid: startOwner.ok ? startOwner.uid : null,
+      latest: null,
+      render: null,
+      root: null,
+      cancel: () => cancelController.abort(),
+    };
+    manualFollowerRun = run;
+    unseenManualFollowerResult = null;
+    attachFollowerProgress(run);
     followerUpdateRunning = true;
     let result;
     try {
       result = await performFollowerUpdate(
-        reportProgress,
+        (progress) => {
+          run.latest = progress;
+          run.render(progress);
+        },
         () => followerCancelRequested,
         { cancelSignal: cancelController.signal }
       );
@@ -908,8 +1018,13 @@
     } finally {
       followerUpdateRunning = false;
       followerCancelRequested = false;
+      manualFollowerRun = null;
     }
-    if (panelRoot !== progressRoot) {
+    if (panelRoot !== run.root) {
+      // A cancellation the user asked for needs no later reminder.
+      if (result.failureKind !== "FOLLOWER_SCAN_CANCELLED") {
+        unseenManualFollowerResult = { ownerUid: run.ownerUid, result };
+      }
       setLauncherStatus(
         result.ok
           ? "粉丝快照更新完成"
@@ -920,8 +1035,7 @@
       );
       return;
     }
-    if (result.ok) showFollowerUpdateSuccess(result);
-    else showFollowerFailure(result);
+    showFollowerUpdateResult(result);
   }
 
   // Local notification housekeeping only, run inside the follower state lock. The
