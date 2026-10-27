@@ -1857,7 +1857,12 @@
       closeProfileNicknamePopover();
     };
     const onKeydown = (event) => {
-      if (event && event.key === "Escape") {
+      if (
+        panelRoot === null &&
+        event &&
+        !event.defaultPrevented &&
+        event.key === "Escape"
+      ) {
         closeProfileNicknamePopover(true);
       }
     };

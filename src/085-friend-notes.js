@@ -1296,8 +1296,11 @@
     renderList();
   }
 
-  function showFriendNoteDetail(ownerUid, subjectUid, viewState) {
-    const backToManager = () => showFriendNotesManager(viewState);
+  function showFriendNoteDetail(ownerUid, subjectUid, viewState, onBack) {
+    const backToCaller =
+      typeof onBack === "function"
+        ? onBack
+        : () => showFriendNotesManager(viewState);
     const owner = determineCurrentUid();
     if (!owner.ok || owner.uid !== ownerUid) {
       showFailure("友人档案", { failureKind: "UID_UNAVAILABLE" });
@@ -1306,7 +1309,7 @@
     const subject = loadFriendNoteSubjectView(ownerUid, subjectUid);
     const displayName =
       subject.facts.currentName === null ? subjectUid : subject.facts.currentName;
-    const body = showPanel(`${displayName} · 友人档案`, backToManager);
+    const body = showPanel(`${displayName} · 友人档案`, backToCaller);
     if (!subject.notes.ok) {
       appendFriendNotesUnreadable(body, subject.notes);
       return;
@@ -1330,7 +1333,9 @@
       compact: false,
       onSaved: syncFriendNoteViews,
     });
-    friendNoteDetailView = { ownerUid, subjectUid, editor };
+    if (panelRoot !== null && panelRoot.contains(body)) {
+      friendNoteDetailView = { ownerUid, subjectUid, editor };
+    }
     body.append(editor.root);
 
     body.append(createElement("h3", "Toolkit 本地观察记录"));
@@ -1356,7 +1361,7 @@
       );
       timelineButton.addEventListener("click", () =>
         showTimeline(ownerUid, subject.friend.state, subjectUid, () =>
-          showFriendNoteDetail(ownerUid, subjectUid, viewState)
+          showFriendNoteDetail(ownerUid, subjectUid, viewState, onBack)
         )
       );
       timelineActions.append(timelineButton);

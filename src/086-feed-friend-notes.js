@@ -820,7 +820,13 @@
       entry,
       resizeObserver: null,
       onKeydown: (event) => {
-        if (event && event.key === "Escape" && !isFriendNoteImeKeyEvent(event)) {
+        if (
+          panelRoot === null &&
+          event &&
+          !event.defaultPrevented &&
+          event.key === "Escape" &&
+          !isFriendNoteImeKeyEvent(event)
+        ) {
           requestCloseFeedFriendNoteCard(true);
         }
       },

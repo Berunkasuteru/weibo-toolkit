@@ -23,6 +23,10 @@ const NAMES = [
   "loadPageCleanupPreferences",
   "closePanel",
   "setPanelExitLocked",
+  "showToolkitHome",
+  "renderEvents",
+  "renderFollowerEvents",
+  "showRelationshipOverview",
   // Startup is skipped by the test loader, so the preference object that
   // startup would have loaded is injected here.
   "setPagePreferences: (value) => { pageCleanupPreferences = value; }",
@@ -605,8 +609,83 @@ async function lockedPanelIsNotReplaced() {
   assert(overlays().length === 1 && overlays()[0] !== held, "unlocking restores normal replacement");
 }
 
+async function unsavedNoteGuardAndCallerReturn() {
+  const browser = createSharedBrowser();
+  browser.storage.set(notesKey(OWNER), JSON.stringify(notesState([[LAN, "旧备注"]])));
+  browser.storage.set(
+    radarKey(OWNER),
+    JSON.stringify({
+      schemaVersion: 1,
+      ownerUid: OWNER,
+      latestSnapshot: {
+        capturedAt: T,
+        reportedTotal: 1,
+        visibleCount: 1,
+        unresolvedRelationCount: 0,
+        records: [
+          { uid: LAN, screenName: "阿岚Lan", following: true, followsMe: false, remark: "摄影搭子" },
+        ],
+      },
+      events: [
+        {
+          id: "e1",
+          type: "FOLLOW_ME_LOST",
+          detectedAt: T,
+          subjectUid: LAN,
+          displayName: "阿岚Lan",
+          read: false,
+          previous: { followsMe: true },
+          current: { followsMe: false },
+        },
+      ],
+    })
+  );
+  const dom = createFakeDocument();
+  let confirmAnswers = [false, true];
+  let confirmCalls = 0;
+  const tab = openTab(browser, NAMES, {
+    ownerUid: OWNER,
+    context: {
+      document: dom.document,
+      MutationObserver: dom.MutationObserver,
+      confirm() {
+        confirmCalls += 1;
+        return confirmAnswers.shift();
+      },
+    },
+  });
+  const overlay = () =>
+    findAll(dom.document.body, (node) => String(node.className).includes("wfr-overlay"))[0];
+
+  // Open note detail from Relationship Overview with filter ONE_WAY and a search query.
+  tab.product.showRelationshipOverview({ filter: "ONE_WAY", query: "摄影" });
+  assert(overlay().textContent.includes("阿岚Lan · 单向关注"), "overview lists matching following account");
+  await findButton(overlay(), "友人档案").click();
+  assert(overlay().textContent.includes("阿岚Lan · 友人档案"), "entered note detail from overview");
+
+  // Unsaved edit blocks navigation to Home/Timeline when confirm returns false,
+  // and prompts only once when confirm returns true.
+  await findButton(overlay(), "编辑").click();
+  textarea(overlay()).value = "未保存的草稿";
+  tab.product.showToolkitHome();
+  assert(
+    confirmCalls === 1 &&
+      overlay().textContent.includes("阿岚Lan · 友人档案") &&
+      textarea(overlay()).value === "未保存的草稿",
+    "declining confirm keeps the unsaved note detail open when another panel is requested"
+  );
+  await findButton(overlay(), "← 返回").click();
+  assert(
+    confirmCalls === 2 &&
+      overlay().textContent.includes("关系概览") &&
+      overlay().textContent.includes("阿岚Lan · 单向关注"),
+    "confirming once returns to the caller (Relationship Overview) with filter and query intact"
+  );
+}
+
 (async () => {
   await lockedPanelIsNotReplaced();
+  await unsavedNoteGuardAndCallerReturn();
   await profilePanel();
   await observedFactsAreNotDuplicated();
   await manager();

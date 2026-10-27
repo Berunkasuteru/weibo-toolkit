@@ -3,7 +3,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.11.0";
+  const APP_VERSION = "0.12.0";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -118,6 +118,22 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.12.0": Object.freeze({
+      added: Object.freeze([
+        "关系概览新增当前可见关注名单，可按互关或单向关注筛选，按昵称、微博备注或 UID 搜索",
+        "微博计步器新增近 7 天、近 30 天汇总和历史每日明细，浏览条数按日累计",
+        "粉丝变化支持按昵称或 UID 搜索，并可从事件卡片打开主页或写友人档案",
+      ]),
+      improved: Object.freeze([
+        "从关系概览、关系事件或粉丝变化进入档案与时间线后，可返回原入口并保留筛选条件",
+        "调整深浅色主题、字体、控件和卡片样式，以及私信导出控件的宽度约束",
+      ]),
+      fixed: Object.freeze([
+        "切换工具箱面板时也检查档案未保存修改，拒绝离开后保留原草稿与编辑状态",
+        "工具箱面板打开时，Esc 不再同时关闭底层的历史昵称浮层或信息流档案卡片",
+        "自动更新失败时优先显示具体原因，正确提示请求超时、请求安全上限和浏览器锁不可用",
+      ]),
+    }),
     "0.11.0": Object.freeze({
       added: Object.freeze([
         "粉丝体检可保存筛选方案、按粉丝数等排序，并可按筛选结果的顺序一次选满 200 个",

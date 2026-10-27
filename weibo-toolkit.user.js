@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.11.0
+// @version      0.12.0
 // @description  Local-first Weibo toolkit with private friend notes, relationship tracking, follower tools, PM export, and optional page enhancements.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -902,14 +902,14 @@
     const style = document.createElement("style");
     style.id = "wfr-pm-export-style";
     style.textContent = `
-      .wfr-pm-export-root { color-scheme: light; --wfr-pm-bg: #faf9f6; --wfr-pm-text: #292b2e; --wfr-pm-border: #deddd7; --wfr-pm-hover-bg: #f3f2ee; --wfr-pm-accent: #53776c; --wfr-pm-muted: #71746f; position: absolute; top: 10px; right: 58px; z-index: 20; display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; max-width: 520px; font: 12px/1.4 system-ui, sans-serif; }
-      .wfr-pm-export-button, .wfr-pm-export-choice { appearance: none; border: 1px solid var(--wfr-pm-border); border-radius: 8px; background: var(--wfr-pm-bg); color: var(--wfr-pm-text); font: inherit; cursor: pointer; }
+      .wfr-pm-export-root { color-scheme: light; --wfr-pm-bg: #faf9f6; --wfr-pm-text: #1f2328; --wfr-pm-border: #dcdad2; --wfr-pm-hover-bg: #f0eee8; --wfr-pm-accent: #3d6b5e; --wfr-pm-muted: #656963; position: absolute; top: 10px; right: 58px; z-index: 20; display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; max-width: min(520px, calc(100% - 68px)); font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", system-ui, sans-serif; }
+      .wfr-pm-export-button, .wfr-pm-export-choice { appearance: none; border: 1px solid var(--wfr-pm-border); border-radius: 8px; background: var(--wfr-pm-bg); color: var(--wfr-pm-text); font: inherit; font-weight: 500; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease; }
       .wfr-pm-export-button { padding: 5px 10px; }
       .wfr-pm-export-button:hover:not(:disabled), .wfr-pm-export-choice:hover:not(:disabled) { border-color: var(--wfr-pm-accent); background: var(--wfr-pm-hover-bg); color: var(--wfr-pm-accent); }
       .wfr-pm-export-button:focus-visible, .wfr-pm-export-choice:focus-visible { outline: 2px solid var(--wfr-pm-accent); outline-offset: 2px; }
       .wfr-pm-export-button:disabled, .wfr-pm-export-choice:disabled { opacity: .55; cursor: default; }
       .wfr-pm-export-button[hidden] { display: none; }
-      .wfr-pm-export-status { max-width: 260px; box-sizing: border-box; padding: 4px 7px; border: 1px solid var(--wfr-pm-border); border-radius: 8px; background: var(--wfr-pm-bg); color: var(--wfr-pm-muted); font: 11px/1.4 "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .wfr-pm-export-status { max-width: min(260px, 100%); box-sizing: border-box; padding: 4px 8px; border: 1px solid var(--wfr-pm-border); border-radius: 8px; background: var(--wfr-pm-bg); color: var(--wfr-pm-muted); font: 11px/1.4 "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .wfr-pm-export-status:empty { display: none; }
       .wfr-pm-export-checkpoint { display: inline-flex; align-items: center; gap: 5px; }
       .wfr-pm-export-checkpoint[hidden] { display: none; }
@@ -925,7 +925,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.11.0";
+  const APP_VERSION = "0.12.0";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -1040,6 +1040,22 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.12.0": Object.freeze({
+      added: Object.freeze([
+        "关系概览新增当前可见关注名单，可按互关或单向关注筛选，按昵称、微博备注或 UID 搜索",
+        "微博计步器新增近 7 天、近 30 天汇总和历史每日明细，浏览条数按日累计",
+        "粉丝变化支持按昵称或 UID 搜索，并可从事件卡片打开主页或写友人档案",
+      ]),
+      improved: Object.freeze([
+        "从关系概览、关系事件或粉丝变化进入档案与时间线后，可返回原入口并保留筛选条件",
+        "调整深浅色主题、字体、控件和卡片样式，以及私信导出控件的宽度约束",
+      ]),
+      fixed: Object.freeze([
+        "切换工具箱面板时也检查档案未保存修改，拒绝离开后保留原草稿与编辑状态",
+        "工具箱面板打开时，Esc 不再同时关闭底层的历史昵称浮层或信息流档案卡片",
+        "自动更新失败时优先显示具体原因，正确提示请求超时、请求安全上限和浏览器锁不可用",
+      ]),
+    }),
     "0.11.0": Object.freeze({
       added: Object.freeze([
         "粉丝体检可保存筛选方案、按粉丝数等排序，并可按筛选结果的顺序一次选满 200 个",
@@ -5181,7 +5197,12 @@
       closeProfileNicknamePopover();
     };
     const onKeydown = (event) => {
-      if (event && event.key === "Escape") {
+      if (
+        panelRoot === null &&
+        event &&
+        !event.defaultPrevented &&
+        event.key === "Escape"
+      ) {
         closeProfileNicknamePopover(true);
       }
     };
@@ -5680,6 +5701,52 @@
         uniquePostIds: [],
       },
       days,
+    };
+  }
+
+  function usageDateKeyDaysAgo(baseDateKey, daysAgo) {
+    if (!isValidUsageDateKey(baseDateKey)) return null;
+    const [year, month, day] = baseDateKey.split("-").map(Number);
+    const date = new Date(year, month - 1, day);
+    date.setDate(date.getDate() - daysAgo);
+    return usageLocalDateKey(date.getTime());
+  }
+
+  function deriveUsageHistorySummary(state) {
+    const todayKey = state.currentDay.date;
+    const todayEntry = {
+      date: todayKey,
+      activeSeconds: state.currentDay.activeSeconds,
+      uniquePosts: state.currentDay.uniquePostIds.length,
+    };
+    const historyDays = Object.entries(state.days)
+      .map(([date, day]) => ({
+        date,
+        activeSeconds: day.activeSeconds,
+        uniquePosts: day.uniquePosts,
+      }))
+      .filter((day) => day.activeSeconds > 0 || day.uniquePosts > 0)
+      .sort((left, right) => right.date.localeCompare(left.date));
+    const allDays = [todayEntry, ...historyDays];
+    function sumWindow(windowDays) {
+      const cutoff = usageDateKeyDaysAgo(todayKey, windowDays - 1);
+      let activeSeconds = 0;
+      let uniquePosts = 0;
+      let activeDays = 0;
+      for (const day of allDays) {
+        if (cutoff !== null && (day.date < cutoff || day.date > todayKey)) {
+          continue;
+        }
+        activeSeconds += day.activeSeconds;
+        uniquePosts += day.uniquePosts;
+        if (day.activeSeconds > 0 || day.uniquePosts > 0) activeDays += 1;
+      }
+      return { activeSeconds, uniquePosts, activeDays };
+    }
+    return {
+      last7Days: sumWindow(7),
+      last30Days: sumWindow(30),
+      historyDays,
     };
   }
 
@@ -6435,6 +6502,7 @@
     panelReturnFocus = null;
     if (panelRoot && panelRoot.parentNode) panelRoot.parentNode.removeChild(panelRoot);
     panelRoot = null;
+    friendNoteDetailView = null;
     panelSizeFixed = false;
     panelHeaderButtons = [];
     panelExitLocked = false;
@@ -6488,10 +6556,11 @@
       if (typeof alert === "function") alert("正在保存，请等待完成后再离开。");
       return false;
     }
-    return (
+    const confirmed =
       typeof confirm !== "function" ||
-      confirm("这份友人档案还有未保存的修改。确定放弃这些修改吗？")
-    );
+      confirm("这份友人档案还有未保存的修改。确定放弃这些修改吗？");
+    if (confirmed) friendNoteDetailView = null;
+    return confirmed;
   }
 
   // Escape is left alone wherever it could cost the user something: while an
@@ -6542,9 +6611,13 @@
   // panel does not jump between them. A panel opened on its own (a notice, a
   // failure with nothing behind it) keeps the size of its content.
   function showPanel(title, withBack = false, fixedSize = Boolean(withBack)) {
-    // A locked panel is not replaced. The caller still gets a body to fill, but
-    // one that is never attached, so no entry point needs its own check.
-    if (panelExitLocked) return createElement("div", null, "wfr-body");
+    // A locked panel, or one holding an unsaved note the user chose to keep, is
+    // not replaced. The caller still gets a body to fill, but one that is never
+    // attached, so no entry point needs its own check.
+    if (panelExitLocked || !confirmLeavingUnsavedNote()) {
+      return createElement("div", null, "wfr-body");
+    }
+    closeProfileNicknamePopover(false);
     const keepSize = fixedSize || panelSizeFixed;
     // Focus goes back to whatever opened the first panel of this visit, not to
     // a node of a panel that this one replaces.
@@ -6773,6 +6846,47 @@
         usageSessionOwnerUid === owner.uid ? usageSessionPostIds.size : 0
       } 条不同微博`
     );
+    const summary = deriveUsageHistorySummary(loaded.state);
+    body.append(createElement("h3", "阶段汇总（含今日）"));
+    addLine(
+      body,
+      "近 7 天活跃",
+      `约 ${formatUsageMinutes(summary.last7Days.activeSeconds)} 分钟`
+    );
+    addLine(
+      body,
+      "近 7 天浏览",
+      `${summary.last7Days.uniquePosts} 条（按日累计）`
+    );
+    addLine(
+      body,
+      "近 30 天活跃",
+      `约 ${formatUsageMinutes(summary.last30Days.activeSeconds)} 分钟`
+    );
+    addLine(
+      body,
+      "近 30 天浏览",
+      `${summary.last30Days.uniquePosts} 条（按日累计）`
+    );
+    if (summary.historyDays.length > 0) {
+      const details = createElement("details", null, "wfr-usage-history");
+      details.append(
+        createElement(
+          "summary",
+          `历史每日明细（共 ${summary.historyDays.length} 天，最多保留 ${USAGE_RETENTION_DAYS} 天）`
+        )
+      );
+      for (const day of summary.historyDays) {
+        addLine(
+          details,
+          day.date,
+          `约 ${formatUsageMinutes(day.activeSeconds)} 分钟 · ${
+            day.uniquePosts
+          } 条不同微博`
+        );
+      }
+      body.append(details);
+    }
     body.append(
       createElement(
         "p",
@@ -7487,7 +7601,15 @@
     );
   }
 
-  function renderFollowerEvents(ownerUid, state) {
+  function matchesFollowerEventQuery(event, query) {
+    const needle = String(query || "").trim().toLowerCase();
+    if (needle === "") return true;
+    return [event.displayName, event.uid].some(
+      (value) => typeof value === "string" && value.toLowerCase().includes(needle)
+    );
+  }
+
+  function renderFollowerEvents(ownerUid, state, initialQuery = "") {
     const body = showPanel("粉丝变化", true);
     const snapshot = state.latestSnapshot;
     addLine(body, "已有快照", snapshot ? "是" : "否");
@@ -7499,6 +7621,8 @@
     appendFollowerVisibilityNote(body, snapshot);
 
     let events = state.events;
+    const notesLoaded = loadFriendNotesState(ownerUid);
+    const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
     const clearAllActions = createElement("div", null, "wfr-actions");
     const clearAllButton = createElement(
       "button",
@@ -7508,10 +7632,15 @@
     clearAllButton.type = "button";
     clearAllActions.append(clearAllButton);
     const clearAllPanel = createElement("div", null, "wfr-batch-panel");
+    const search = createElement("input", null, "wfr-search");
+    search.type = "search";
+    search.placeholder = "搜索昵称或 UID";
+    search.setAttribute("aria-label", "搜索昵称或 UID");
+    search.value = initialQuery;
     const status = createElement("p", "", "wfr-muted");
     const emptyNote = createElement("p", "暂无粉丝变化事件。", "wfr-muted wfr-empty");
     const list = createElement("div", null, "wfr-event-list");
-    body.append(clearAllActions, clearAllPanel, status, emptyNote, list);
+    body.append(clearAllActions, clearAllPanel, search, status, emptyNote, list);
 
     function clearNode(node) {
       while (node.childNodes.length > 0) node.removeChild(node.childNodes[0]);
@@ -7522,8 +7651,11 @@
     // Reconciles the rendered cards with the freshly persisted event list. Cards
     // that survived keep their nodes; events another tab added since this view
     // opened appear instead of being silently dropped from the count.
-    function syncList() {
-      const desired = sortFollowerEventsNewestFirst(events);
+    function syncList(preserveExistingOrder = false) {
+      const allSorted = sortFollowerEventsNewestFirst(events);
+      const desired = allSorted.filter((event) =>
+        matchesFollowerEventQuery(event, search.value || "")
+      );
       const desiredIds = new Set(desired.map((event) => event.id));
       for (const [id, node] of [...renderedCards]) {
         if (desiredIds.has(id)) continue;
@@ -7531,21 +7663,26 @@
         renderedCards.delete(id);
       }
       for (const event of desired) {
-        if (renderedCards.has(event.id)) continue;
-        const card = buildEventCard(event);
+        if (preserveExistingOrder && renderedCards.has(event.id)) continue;
+        const card = renderedCards.get(event.id) || buildEventCard(event);
         renderedCards.set(event.id, card);
         list.append(card);
       }
-      renderCounts();
+      renderCounts(desired.length);
     }
 
-    function renderCounts() {
+    function renderCounts(matchingCount) {
       countValue.textContent = String(events.length);
-      const empty = events.length === 0;
-      emptyNote.hidden = !empty;
-      list.hidden = empty;
-      clearAllActions.hidden = empty;
-      if (empty) clearNode(clearAllPanel);
+      const noEvents = events.length === 0;
+      const noMatches = matchingCount === 0;
+      search.hidden = noEvents;
+      emptyNote.textContent = noEvents
+        ? "暂无粉丝变化事件。"
+        : "没有匹配的粉丝变化事件。";
+      emptyNote.hidden = !noMatches;
+      list.hidden = noMatches;
+      clearAllActions.hidden = noEvents;
+      if (noEvents) clearNode(clearAllPanel);
     }
 
     // Local records only: clearing a notification never touches the Weibo
@@ -7595,12 +7732,33 @@
         }
         // Targeted reconciliation: surviving cards keep their nodes and the
         // reading position stays where it is.
-        syncList();
+        syncList(true);
       });
-      actions.append(clearButton);
+      actions.append(clearButton, createFriendNoteProfileLink(event.uid));
+      if (notedUids !== null) {
+        const noteButton = createElement(
+          "button",
+          hasOwn(notedUids, event.uid) ? "友人档案" : "写档案",
+          "wfr-button"
+        );
+        noteButton.type = "button";
+        noteButton.addEventListener("click", () =>
+          showFriendNoteDetail(ownerUid, event.uid, null, () => {
+            const fresh = loadFollowerState(ownerUid);
+            renderFollowerEvents(
+              ownerUid,
+              fresh.ok ? fresh.state : { ...state, events },
+              String(search.value || "")
+            );
+          })
+        );
+        actions.append(noteButton);
+      }
       item.append(actions);
       return item;
     }
+
+    search.addEventListener("input", () => syncList(false));
 
     clearAllButton.addEventListener("click", () => {
       clearNode(clearAllPanel);
@@ -10261,7 +10419,7 @@
     return events.filter((event) => matchesEventQuery(event, query));
   }
 
-  function renderEvents(ownerUid, state, notice) {
+  function renderEvents(ownerUid, state, notice, initialQuery = "") {
     const body = showPanel("关系事件", true);
     if (notice) body.append(createElement("p", notice, "wfr-success"));
     // Opening the list only reflects read state; it never changes it.
@@ -10294,7 +10452,12 @@
           showFailure("标记失败", saved);
           return;
         }
-        renderEvents(ownerUid, saved.state, "全部事件已标为已读。");
+        renderEvents(
+          ownerUid,
+          saved.state,
+          "全部事件已标为已读。",
+          String(search ? search.value || "" : initialQuery)
+        );
       });
       body.append(markButton);
     }
@@ -10327,6 +10490,7 @@
     search.type = "search";
     search.placeholder = "搜索昵称或 UID";
     search.setAttribute("aria-label", "搜索昵称或 UID");
+    search.value = initialQuery;
     body.append(search);
 
     const list = createElement("div", null, "wfr-event-list");
@@ -10337,6 +10501,8 @@
     // note exists. Unreadable notes simply mean no shortcut is offered.
     const notesLoaded = loadFriendNotesState(ownerUid);
     const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
+    const returnToEvents = () =>
+      renderEvents(ownerUid, state, null, String(search.value || ""));
     function renderList(query) {
       while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
       const matching = filterEvents(newestFirst, query);
@@ -10355,15 +10521,21 @@
         else groups.set(event.subjectUid, [event]);
       }
       for (const group of groups.values()) {
-        list.append(buildEventCard(ownerUid, state, group, notedUids));
+        list.append(
+          buildEventCard(ownerUid, state, group, notedUids, returnToEvents)
+        );
       }
     }
     search.addEventListener("input", () => renderList(search.value || ""));
-    renderList("");
+    renderList(initialQuery);
   }
 
   // group: the matching events of one account, newest first.
-  function buildEventCard(ownerUid, state, group, notedUids) {
+  function buildEventCard(ownerUid, state, group, notedUids, onReturn) {
+    const returnToEvents =
+      typeof onReturn === "function"
+        ? onReturn
+        : () => renderEvents(ownerUid, state, null);
     const event = group[0];
     const read = group.every((entry) => entry.read);
     const item = createElement(
@@ -10386,7 +10558,7 @@
     const detailButton = createElement("button", "详情", "wfr-button");
     detailButton.type = "button";
     detailButton.addEventListener("click", () =>
-      showEventDetail(ownerUid, state, event)
+      showEventDetail(ownerUid, state, event, returnToEvents)
     );
     actions.append(detailButton);
     // The whole stored history of the account, not just what the search
@@ -10400,7 +10572,7 @@
       );
       moreButton.type = "button";
       moreButton.addEventListener("click", () =>
-        showTimeline(ownerUid, state, event.subjectUid)
+        showTimeline(ownerUid, state, event.subjectUid, returnToEvents)
       );
       actions.append(moreButton);
     }
@@ -10412,7 +10584,7 @@
       );
       noteButton.type = "button";
       noteButton.addEventListener("click", () =>
-        showFriendNoteDetail(ownerUid, event.subjectUid, null)
+        showFriendNoteDetail(ownerUid, event.subjectUid, null, returnToEvents)
       );
       actions.append(noteButton);
     }
@@ -10420,8 +10592,12 @@
     return item;
   }
 
-  function showEventDetail(ownerUid, state, event) {
-    const body = showPanel("事件详情", () => renderEvents(ownerUid, state, null));
+  function showEventDetail(ownerUid, state, event, onBack) {
+    const backToEvents =
+      typeof onBack === "function"
+        ? onBack
+        : () => renderEvents(ownerUid, state, null);
+    const body = showPanel("事件详情", backToEvents);
     body.append(
       createElement("h3", EVENT_LABELS[event.type] || event.type)
     );
@@ -10458,7 +10634,9 @@
     );
     timelineButton.type = "button";
     timelineButton.addEventListener("click", () =>
-      showTimeline(ownerUid, state, event.subjectUid)
+      showTimeline(ownerUid, state, event.subjectUid, () =>
+        showEventDetail(ownerUid, state, event, backToEvents)
+      )
     );
     body.append(timelineButton);
   }
@@ -11836,8 +12014,11 @@
     renderList();
   }
 
-  function showFriendNoteDetail(ownerUid, subjectUid, viewState) {
-    const backToManager = () => showFriendNotesManager(viewState);
+  function showFriendNoteDetail(ownerUid, subjectUid, viewState, onBack) {
+    const backToCaller =
+      typeof onBack === "function"
+        ? onBack
+        : () => showFriendNotesManager(viewState);
     const owner = determineCurrentUid();
     if (!owner.ok || owner.uid !== ownerUid) {
       showFailure("友人档案", { failureKind: "UID_UNAVAILABLE" });
@@ -11846,7 +12027,7 @@
     const subject = loadFriendNoteSubjectView(ownerUid, subjectUid);
     const displayName =
       subject.facts.currentName === null ? subjectUid : subject.facts.currentName;
-    const body = showPanel(`${displayName} · 友人档案`, backToManager);
+    const body = showPanel(`${displayName} · 友人档案`, backToCaller);
     if (!subject.notes.ok) {
       appendFriendNotesUnreadable(body, subject.notes);
       return;
@@ -11870,7 +12051,9 @@
       compact: false,
       onSaved: syncFriendNoteViews,
     });
-    friendNoteDetailView = { ownerUid, subjectUid, editor };
+    if (panelRoot !== null && panelRoot.contains(body)) {
+      friendNoteDetailView = { ownerUid, subjectUid, editor };
+    }
     body.append(editor.root);
 
     body.append(createElement("h3", "Toolkit 本地观察记录"));
@@ -11896,7 +12079,7 @@
       );
       timelineButton.addEventListener("click", () =>
         showTimeline(ownerUid, subject.friend.state, subjectUid, () =>
-          showFriendNoteDetail(ownerUid, subjectUid, viewState)
+          showFriendNoteDetail(ownerUid, subjectUid, viewState, onBack)
         )
       );
       timelineActions.append(timelineButton);
@@ -12965,7 +13148,13 @@
       entry,
       resizeObserver: null,
       onKeydown: (event) => {
-        if (event && event.key === "Escape" && !isFriendNoteImeKeyEvent(event)) {
+        if (
+          panelRoot === null &&
+          event &&
+          !event.defaultPrevented &&
+          event.key === "Escape" &&
+          !isFriendNoteImeKeyEvent(event)
+        ) {
           requestCloseFeedFriendNoteCard(true);
         }
       },
@@ -13284,6 +13473,7 @@
   const AUTOMATIC_OUTCOME_REASON_LABELS = Object.freeze({
     STALE_SCAN: "已有更新的快照",
     NETWORK_ERROR: "网络请求失败",
+    REQUEST_TIMEOUT: "请求超时",
     HTTP_ERROR: "接口请求失败",
     LOGIN_REQUIRED: "登录状态失效",
     CHALLENGE_OR_UNEXPECTED_RESPONSE: "遇到验证页面或异常响应",
@@ -13291,12 +13481,15 @@
     UNEXPECTED_CONTENT_TYPE: "接口响应类型异常",
     UNEXPECTED_SCHEMA: "接口数据校验失败",
     PAGINATION_FAILURE: "分页完整性校验失败",
+    HARD_REQUEST_CEILING_REACHED: "达到请求安全上限",
+    FOLLOWER_SAFETY_CEILING_REACHED: "达到请求安全上限",
     MAX_REQUESTS_REACHED: "达到请求安全上限",
     FOLLOWER_REQUEST_CEILING_REACHED: "达到请求安全上限",
     ACCOUNT_CHANGED_DURING_SCAN: "扫描期间账号发生变化",
     STORAGE_ERROR: "本地数据读取失败",
     PERSISTENCE_ERROR: "本地保存失败",
     CONCURRENT_MODIFICATION: "检测到并发修改",
+    STATE_LOCK_UNAVAILABLE: "浏览器锁不可用",
     LOCK_UNAVAILABLE: "浏览器锁不可用",
     LOCK_REQUEST_FAILED: "浏览器锁请求失败",
     UNKNOWN_FAILURE: "未能确认原因",
@@ -13379,9 +13572,10 @@
   function describeAutomaticOutcome(value) {
     if (value === null) return "—";
     if (value.outcome === "SUCCESS") return "成功";
-    const code = value.failureKind || value.reason || null;
     const detail =
-      AUTOMATIC_OUTCOME_REASON_LABELS[code] || "原因未能确认";
+      AUTOMATIC_OUTCOME_REASON_LABELS[value.reason] ||
+      AUTOMATIC_OUTCOME_REASON_LABELS[value.failureKind] ||
+      "原因未能确认";
     return value.outcome === "SKIPPED"
       ? "已跳过（" + detail + "）"
       : "失败（" + detail + "）";
@@ -14713,13 +14907,35 @@
     addLine(body, "已导出事件数", state.events.length);
   }
 
-  function showRelationshipOverview() {
+  function filterOverviewFollowingRecords(records, filter, query) {
+    const mode =
+      filter === "MUTUAL" || filter === "ONE_WAY" ? filter : "ALL";
+    const needle = String(query || "").trim().toLowerCase();
+    return records.filter((record) => {
+      if (mode === "MUTUAL" && !record.followsMe) return false;
+      if (mode === "ONE_WAY" && record.followsMe) return false;
+      if (needle === "") return true;
+      return [record.screenName, record.remark, record.uid].some(
+        (value) =>
+          typeof value === "string" && value.toLowerCase().includes(needle)
+      );
+    });
+  }
+
+  function showRelationshipOverview(viewState) {
+    const view =
+      isPlainObject(viewState) &&
+      typeof viewState.filter === "string" &&
+      typeof viewState.query === "string"
+        ? { filter: viewState.filter, query: viewState.query }
+        : { filter: "ALL", query: "" };
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
       showFailure("关系概览", uidResult);
       return;
     }
-    const loaded = loadState(uidResult.uid);
+    const ownerUid = uidResult.uid;
+    const loaded = loadState(ownerUid);
     if (!loaded.ok) {
       showFailure("关系概览", loaded);
       return;
@@ -14765,6 +14981,144 @@
         "wfr-muted"
       )
     );
+
+    if (overview.current !== null && loaded.state.latestSnapshot !== null) {
+      const records = loaded.state.latestSnapshot.records;
+      const notesLoaded = loadFriendNotesState(ownerUid);
+      const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
+
+      body.append(createElement("h3", "当前关注名单"));
+      const filterRow = createElement("label", "关系筛选：", "wfr-row");
+      const filterSelect = createElement("select", null, "wfr-select");
+      filterSelect.setAttribute("aria-label", "按关系状态筛选");
+      for (const [value, label] of [
+        ["ALL", `全部可见关注（${overview.current.visibleFollowing}）`],
+        ["MUTUAL", `互相关注（${overview.current.mutual}）`],
+        ["ONE_WAY", `单向关注（${overview.current.oneWay}）`],
+      ]) {
+        const option = createElement("option", label);
+        option.value = value;
+        option.selected = value === view.filter;
+        filterSelect.append(option);
+      }
+      filterSelect.value =
+        view.filter === "MUTUAL" || view.filter === "ONE_WAY"
+          ? view.filter
+          : "ALL";
+      filterRow.append(filterSelect);
+      body.append(filterRow);
+
+      const search = createElement("input", null, "wfr-search");
+      search.type = "search";
+      search.placeholder = "搜索昵称、微博备注或 UID";
+      search.setAttribute("aria-label", "搜索当前关注名单");
+      search.value = view.query;
+      body.append(search);
+
+      const summary = createElement("p", "", "wfr-muted");
+      const list = createElement("div", null, "wfr-event-list");
+      const moreActions = createElement("div", null, "wfr-actions");
+      const moreButton = createElement("button", "加载更多", "wfr-button");
+      moreButton.type = "button";
+      moreActions.append(moreButton);
+      body.append(summary, list, moreActions);
+
+      let matching = [];
+      let shown = 0;
+      const returnToOverview = () =>
+        showRelationshipOverview({
+          filter: filterSelect.value,
+          query: String(search.value || ""),
+        });
+
+      function buildRecordCard(record) {
+        const item = createElement("article", null, "wfr-event");
+        item.append(
+          createElement(
+            "h3",
+            `${record.screenName} · ${
+              record.followsMe ? "互相关注" : "单向关注"
+            }`
+          )
+        );
+        addLine(item, "UID", record.uid);
+        if (typeof record.remark === "string" && record.remark.trim() !== "") {
+          addLine(item, "微博备注", record.remark);
+        }
+        const actions = createElement("div", null, "wfr-actions");
+        actions.append(createFriendNoteProfileLink(record.uid));
+        const eventCount = eventsForSubject(
+          loaded.state.events,
+          record.uid
+        ).length;
+        if (eventCount > 0) {
+          const timelineButton = createElement(
+            "button",
+            `关系时间线（${eventCount}）`,
+            "wfr-button"
+          );
+          timelineButton.type = "button";
+          timelineButton.addEventListener("click", () =>
+            showTimeline(ownerUid, loaded.state, record.uid, returnToOverview)
+          );
+          actions.append(timelineButton);
+        }
+        if (notedUids !== null) {
+          const noteButton = createElement(
+            "button",
+            hasOwn(notedUids, record.uid) ? "友人档案" : "写档案",
+            "wfr-button"
+          );
+          noteButton.type = "button";
+          noteButton.addEventListener("click", () =>
+            showFriendNoteDetail(ownerUid, record.uid, null, returnToOverview)
+          );
+          actions.append(noteButton);
+        }
+        item.append(actions);
+        return item;
+      }
+
+      function renderMore() {
+        const next = matching.slice(shown, shown + FRIEND_NOTES_PAGE_SIZE);
+        for (const record of next) list.append(buildRecordCard(record));
+        shown += next.length;
+        const remaining = matching.length - shown;
+        moreActions.hidden = remaining <= 0;
+        moreButton.textContent = `加载更多（还有 ${remaining} 个）`;
+      }
+
+      function renderList() {
+        while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
+        matching = filterOverviewFollowingRecords(
+          records,
+          view.filter,
+          view.query
+        );
+        shown = 0;
+        summary.textContent =
+          matching.length === records.length
+            ? `共 ${records.length} 个关注账号`
+            : `共 ${records.length} 个关注账号，匹配 ${matching.length} 个`;
+        if (matching.length === 0) {
+          list.append(
+            createElement("p", "没有匹配的关注账号", "wfr-muted wfr-empty")
+          );
+        }
+        renderMore();
+      }
+
+      filterSelect.addEventListener("change", () => {
+        view.filter = filterSelect.value;
+        renderList();
+      });
+      search.addEventListener("input", () => {
+        view.query = String(search.value || "");
+        renderList();
+      });
+      moreButton.addEventListener("click", renderMore);
+      renderList();
+    }
   }
 
   // The button carries an explicit accessible name, so it has to be recomposed
@@ -16234,25 +16588,25 @@
   // Every Toolkit colour is a custom property carried by the Toolkit roots, so a
   // theme is selected purely by which token block wins on `.wfr-root`.
   const LIGHT_THEME_TOKENS =
-    "color-scheme: light; --wfr-overlay-bg: rgba(25,27,30,.42); --wfr-panel-bg: #faf9f6; --wfr-panel-text: #292b2e; --wfr-panel-shadow: 0 24px 80px rgba(24,27,30,.2), 0 2px 8px rgba(24,27,30,.08); --wfr-border: #deddd7; --wfr-control-border: #cfcec7; --wfr-button-bg: #fffefd; --wfr-button-text: #30343a; --wfr-button-hover: #eeede8; --wfr-primary-bg: #30343a; --wfr-primary-text: #fffefd; --wfr-primary-hover: #454a52; --wfr-accent: #53776c; --wfr-danger-bg: #a53f37; --wfr-danger-text: #fff; --wfr-danger-border: #96382f; --wfr-danger-hover-bg: #89332c; --wfr-success: #34634e; --wfr-error: #a13832; --wfr-muted: #676a65; --wfr-field-bg: #fffefd; --wfr-field-text: #292b2e; --wfr-card-bg: #f3f2ee; --wfr-launcher-bg: rgba(250,249,246,.96); --wfr-launcher-text: #30343a; --wfr-launcher-border: #cfcec7; --wfr-launcher-hover-bg: #fffefd; --wfr-launcher-hover-border: #9a9e97; --wfr-badge-bg: #a53f37; --wfr-badge-text: #fff; --wfr-bar-shadow: 0 -6px 16px rgba(24,27,30,.08);";
+    "color-scheme: light; --wfr-overlay-bg: rgba(24,27,30,.44); --wfr-panel-bg: #faf9f6; --wfr-panel-text: #1f2328; --wfr-panel-shadow: 0 12px 36px rgba(15,20,26,.14); --wfr-border: #e1dfd8; --wfr-control-border: #cfcdc5; --wfr-button-bg: #fffefd; --wfr-button-text: #262a30; --wfr-button-hover: #f0eee8; --wfr-primary-bg: #23272e; --wfr-primary-text: #faf9f6; --wfr-primary-hover: #363c46; --wfr-accent: #3d6b5e; --wfr-danger-bg: #a53f37; --wfr-danger-text: #fff; --wfr-danger-border: #96382f; --wfr-danger-hover-bg: #89332c; --wfr-success: #2b6349; --wfr-error: #a13832; --wfr-muted: #656963; --wfr-field-bg: #fffefd; --wfr-field-text: #1f2328; --wfr-card-bg: #f3f1ec; --wfr-launcher-bg: #faf9f6; --wfr-launcher-text: #262a30; --wfr-launcher-border: #cfcdc5; --wfr-launcher-hover-bg: #f0eee8; --wfr-launcher-hover-border: #8c948e; --wfr-badge-bg: #a53f37; --wfr-badge-text: #fff; --wfr-bar-shadow: none;";
 
   const DARK_THEME_TOKENS =
-    "color-scheme: dark; --wfr-overlay-bg: rgba(8,10,12,.66); --wfr-panel-bg: #1b1d20; --wfr-panel-text: #ece8df; --wfr-panel-shadow: 0 24px 80px rgba(0,0,0,.45), 0 2px 8px rgba(0,0,0,.3); --wfr-border: #363a40; --wfr-control-border: #454a52; --wfr-button-bg: #25282d; --wfr-button-text: #ece8df; --wfr-button-hover: #30343a; --wfr-primary-bg: #ece8df; --wfr-primary-text: #202226; --wfr-primary-hover: #fffdf8; --wfr-accent: #b8d1c3; --wfr-danger-bg: #923b35; --wfr-danger-text: #fff; --wfr-danger-border: #b85449; --wfr-danger-hover-bg: #aa453c; --wfr-success: #a3c7b3; --wfr-error: #f1a69d; --wfr-muted: #a3a7af; --wfr-field-bg: #17191c; --wfr-field-text: #ece8df; --wfr-card-bg: #22252a; --wfr-launcher-bg: rgba(27,29,32,.96); --wfr-launcher-text: #ece8df; --wfr-launcher-border: #454a52; --wfr-launcher-hover-bg: #30343a; --wfr-launcher-hover-border: #787e87; --wfr-badge-bg: #d97b70; --wfr-badge-text: #211715; --wfr-bar-shadow: 0 -6px 16px rgba(0,0,0,.35);";
+    "color-scheme: dark; --wfr-overlay-bg: rgba(8,10,12,.68); --wfr-panel-bg: #191b1f; --wfr-panel-text: #ece9e1; --wfr-panel-shadow: 0 12px 36px rgba(0,0,0,.42); --wfr-border: #2f333a; --wfr-control-border: #414750; --wfr-button-bg: #23262b; --wfr-button-text: #ece9e1; --wfr-button-hover: #2d3138; --wfr-primary-bg: #ece9e1; --wfr-primary-text: #191b1f; --wfr-primary-hover: #ffffff; --wfr-accent: #8ec5b2; --wfr-danger-bg: #923b35; --wfr-danger-text: #fff; --wfr-danger-border: #b85449; --wfr-danger-hover-bg: #aa453c; --wfr-success: #8cc9a8; --wfr-error: #f1a69d; --wfr-muted: #9ea3ae; --wfr-field-bg: #141619; --wfr-field-text: #ece9e1; --wfr-card-bg: #202328; --wfr-launcher-bg: #191b1f; --wfr-launcher-text: #ece9e1; --wfr-launcher-border: #414750; --wfr-launcher-hover-bg: #262a30; --wfr-launcher-hover-border: #78808c; --wfr-badge-bg: #d97b70; --wfr-badge-text: #211715; --wfr-bar-shadow: none;";
 
   function installStyles() {
     const style = createElement("style");
     style.textContent = `
-      .wfr-root { ${LIGHT_THEME_TOKENS} --wfr-mono: "SFMono-Regular", Consolas, "Liberation Mono", system-ui, monospace; --wfr-radius-s: 6px; --wfr-radius-m: 8px; --wfr-radius-l: 12px; }
+      .wfr-root { ${LIGHT_THEME_TOKENS} --wfr-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif; --wfr-mono: "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", ui-monospace, monospace; --wfr-radius-s: 6px; --wfr-radius-m: 8px; --wfr-radius-l: 12px; }
       .wfr-root.wfr-theme-dark { ${DARK_THEME_TOKENS} }
       @media (prefers-color-scheme: dark) {
         .wfr-root.wfr-theme-system { ${DARK_THEME_TOKENS} }
       }
-      .wfr-overlay { position: fixed; inset: 0; z-index: 2147483647; display: grid; place-items: center; background: var(--wfr-overlay-bg); backdrop-filter: blur(3px); padding: 32px; overflow: auto; box-sizing: border-box; }
-      .wfr-panel { display: flex; flex-direction: column; width: 100%; max-width: 840px; max-height: calc(100vh - 64px); min-width: 0; margin: 0 auto; overflow: hidden; border: 1px solid var(--wfr-border); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); border-radius: var(--wfr-radius-l); box-shadow: var(--wfr-panel-shadow); font: 14px/1.6 system-ui, sans-serif; }
+      .wfr-overlay { position: fixed; inset: 0; z-index: 2147483647; display: grid; place-items: center; background: var(--wfr-overlay-bg); padding: 32px; overflow: auto; box-sizing: border-box; }
+      .wfr-panel { display: flex; flex-direction: column; width: 100%; max-width: 840px; max-height: calc(100vh - 64px); min-width: 0; margin: 0 auto; overflow: hidden; border: 1px solid var(--wfr-border); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); border-radius: var(--wfr-radius-l); box-shadow: var(--wfr-panel-shadow); font: 14px/1.6 var(--wfr-sans); }
       .wfr-panel:focus { outline: none; }
       .wfr-panel-fixed { align-self: start; min-height: min(640px, calc(100vh - 64px)); }
-      .wfr-header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 24px; border-bottom: 1px solid var(--wfr-border); }
-      .wfr-header h2 { min-width: 0; margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.025em; overflow-wrap: anywhere; }
+      .wfr-header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 24px; border-bottom: 1px solid var(--wfr-border); background: var(--wfr-panel-bg); }
+      .wfr-header h2 { min-width: 0; margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.02em; overflow-wrap: anywhere; }
       .wfr-header > .wfr-button { flex: 0 0 auto; }
       .wfr-body { flex: 1 1 auto; min-height: 0; padding: 24px; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--wfr-control-border) transparent; }
       .wfr-row { margin: 8px 0; overflow-wrap: anywhere; }
@@ -16263,11 +16617,11 @@
       .wfr-kv > strong { flex: 0 0 auto; color: var(--wfr-muted); font-weight: 400; }
       .wfr-kv > .wfr-value { min-width: 0; text-align: right; }
       .wfr-event .wfr-kv-group, .wfr-home-module .wfr-kv-group { margin: 0; padding: 0; border: 0; background: transparent; }
-      .wfr-event .wfr-kv { display: grid; grid-template-columns: 3em minmax(0, 1fr); gap: 10px; margin: 3px 0; padding: 0; border-top: 0; }
+      .wfr-event .wfr-kv { display: grid; grid-template-columns: 3.4em minmax(0, 1fr); gap: 10px; margin: 3px 0; padding: 0; border-top: 0; }
       .wfr-event .wfr-kv > .wfr-value { text-align: left; }
-      .wfr-body > .wfr-kv-group { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(190px, 100%), 1fr)); gap: 8px; padding: 0; border: 0; background: transparent; }
-      .wfr-body > .wfr-kv-group > .wfr-kv { flex-direction: column; align-items: flex-start; justify-content: flex-start; gap: 4px; padding: 11px 14px 12px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-card-bg); }
-      .wfr-body > .wfr-kv-group > .wfr-kv > strong { flex: 0 1 auto; font-size: 12px; line-height: 1.5; }
+      .wfr-body > .wfr-kv-group { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(185px, 100%), 1fr)); gap: 8px; padding: 0; border: 0; background: transparent; }
+      .wfr-body > .wfr-kv-group > .wfr-kv { flex-direction: column; align-items: flex-start; justify-content: space-between; gap: 4px; padding: 11px 14px 12px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-card-bg); }
+      .wfr-body > .wfr-kv-group > .wfr-kv > strong { flex: 0 1 auto; font-size: 12px; line-height: 1.45; }
       .wfr-body > .wfr-kv-group > .wfr-kv > .wfr-value { font-size: 16px; font-weight: 600; line-height: 1.4; text-align: left; overflow-wrap: anywhere; }
       .wfr-failure-code { margin: -4px 0 12px; font: 12px/1.6 var(--wfr-mono); overflow-wrap: anywhere; }
       .wfr-progress { position: relative; height: 16px; margin: 12px 0; overflow: hidden; background: radial-gradient(circle, var(--wfr-muted) 1.5px, transparent 2px) 0 50% / 14px 100% repeat-x; }
@@ -16276,11 +16630,12 @@
       @keyframes wfr-pac-run { 0% { left: 0; transform: scaleX(1); } 50% { left: calc(100% - 16px); transform: scaleX(1); } 50.01% { left: calc(100% - 16px); transform: scaleX(-1); } 100% { left: 0; transform: scaleX(-1); } }
       @keyframes wfr-pac-chomp { from { clip-path: polygon(0 0, 100% 0, 100% 18%, 50% 50%, 100% 82%, 100% 100%, 0 100%); } to { clip-path: polygon(0 0, 100% 0, 100% 50%, 50% 50%, 100% 50%, 100% 100%, 0 100%); } }
       @keyframes wfr-pac-eaten { 0% { left: 0; right: calc(100% - 8px); } 50% { left: 0; right: 8px; } 50.01% { left: calc(100% - 8px); right: 0; } 100% { left: 8px; right: 0; } }
-      .wfr-empty { margin: 14px 0; padding: 40px 16px; border: 1px dashed var(--wfr-control-border); border-radius: var(--wfr-radius-m); text-align: center; }
+      .wfr-empty { margin: 14px 0; padding: 38px 16px; border: 1px dashed var(--wfr-control-border); border-radius: var(--wfr-radius-m); text-align: center; }
       .wfr-value { font-variant-numeric: tabular-nums; }
       .wfr-button { appearance: none; box-sizing: border-box; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-button-bg); color: var(--wfr-button-text); padding: 7px 12px; font: inherit; font-size: 13px; font-weight: 500; line-height: 1.45; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease; }
       .wfr-button:hover:enabled { background: var(--wfr-button-hover); border-color: var(--wfr-muted); }
-      .wfr-root :is(button, input, select, textarea, a, summary):focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 3px; }
+      .wfr-root :is(button, input, select, textarea, a, summary):focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 2px; }
+      .wfr-root :is(.wfr-search, .wfr-select, .wfr-hygiene-input, .wfr-note-textarea, .wfr-note-tag-input):focus-visible { outline: none; border-color: var(--wfr-accent); box-shadow: 0 0 0 1px var(--wfr-accent); }
       .wfr-button:disabled { opacity: .55; cursor: default; }
       .wfr-primary { margin: 10px 0 14px; background: var(--wfr-primary-bg); border-color: var(--wfr-primary-bg); color: var(--wfr-primary-text); }
       .wfr-primary:hover:enabled { background: var(--wfr-primary-hover); border-color: var(--wfr-primary-hover); }
@@ -16289,16 +16644,16 @@
       .wfr-success { color: var(--wfr-success); font-weight: 500; }
       .wfr-success:empty { display: none; }
       .wfr-error { color: var(--wfr-error); font-weight: 500; }
-      .wfr-body > .wfr-success, .wfr-body > .wfr-error { margin: 0 0 12px; padding: 9px 12px; border-left: 2px solid currentColor; border-radius: var(--wfr-radius-s); background: color-mix(in srgb, currentColor 8%, transparent); }
+      .wfr-body > .wfr-success, .wfr-body > .wfr-error { margin: 0 0 12px; padding: 9px 12px; border-left: 3px solid currentColor; border-radius: var(--wfr-radius-s); background: color-mix(in srgb, currentColor 8%, transparent); }
       .wfr-muted { color: var(--wfr-muted); }
-      .wfr-search { width: 100%; box-sizing: border-box; margin-top: 12px; padding: 9px 12px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-search { width: 100%; box-sizing: border-box; margin-top: 12px; padding: 9px 12px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; transition: border-color 120ms ease; }
       .wfr-search::placeholder { color: var(--wfr-muted); opacity: 1; }
-      .wfr-select { max-width: 100%; padding: 7px 10px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-select { max-width: 100%; padding: 7px 10px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; transition: border-color 120ms ease; }
       .wfr-toggle { display: flex; align-items: center; gap: 8px; }
       .wfr-browse-tabs { display: flex; flex-wrap: wrap; box-sizing: border-box; gap: 4px; width: fit-content; max-width: 100%; margin: 0 0 20px; padding: 4px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-card-bg); }
       .wfr-browse-tab { appearance: none; border: 1px solid transparent; border-radius: var(--wfr-radius-s); background: transparent; color: var(--wfr-muted); padding: 6px 15px; font: inherit; font-weight: 500; cursor: pointer; }
       .wfr-browse-tab:hover { color: var(--wfr-button-text); background: var(--wfr-card-bg); }
-      .wfr-browse-tab[aria-selected="true"] { color: var(--wfr-button-text); border-color: var(--wfr-border); background: var(--wfr-panel-bg); box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+      .wfr-browse-tab[aria-selected="true"] { color: var(--wfr-button-text); font-weight: 600; border-color: var(--wfr-border); background: var(--wfr-panel-bg); }
       .wfr-browse-tab:focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 2px; }
       .wfr-browse-panel { padding-top: 2px; }
       .wfr-browse-panel[hidden] { display: none; }
@@ -16309,8 +16664,10 @@
       .wfr-browse-status { margin: 9px 0 0; }
       .wfr-browse-status:empty { display: none; }
       .wfr-event-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; margin-top: 14px; }
-      .wfr-event { min-width: 0; overflow-wrap: anywhere; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); padding: 14px 16px; background: var(--wfr-card-bg); }
-      .wfr-event h3 { margin: 0 0 6px; font-size: 14px; }
+      .wfr-event { min-width: 0; overflow-wrap: anywhere; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); padding: 14px 16px; background: var(--wfr-card-bg); transition: border-color 120ms ease; }
+      .wfr-event:hover { border-color: var(--wfr-control-border); }
+      .wfr-event h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
+      .wfr-event-unread { border-left: 3px solid var(--wfr-accent); }
       .wfr-event-unread > h3::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 999px; background: var(--wfr-accent); vertical-align: middle; }
       .wfr-root input[type="checkbox"], .wfr-root input[type="radio"] { flex: 0 0 auto; accent-color: var(--wfr-accent); width: 15px; height: 15px; margin: 0; }
       .wfr-hygiene-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr)); gap: 12px 16px; margin-top: 12px; padding: 16px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-card-bg); }
@@ -16331,9 +16688,9 @@
       .wfr-hygiene-summary { margin: 8px 0 2px; }
       .wfr-hygiene-control { display: flex; flex-direction: column; align-items: stretch; gap: 5px; }
       .wfr-hygiene-check { display: flex; align-items: center; gap: 8px; }
-      .wfr-hygiene-input { width: 100%; max-width: none; box-sizing: border-box; padding: 7px 10px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-hygiene-input { width: 100%; max-width: none; box-sizing: border-box; padding: 7px 10px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; transition: border-color 120ms ease; }
       .wfr-hygiene-reasons { margin: 6px 0 10px; padding-left: 22px; }
-      .wfr-event-list .wfr-event { padding: 9px 11px; }
+      .wfr-event-list .wfr-event { padding: 10px 13px; }
       .wfr-hygiene-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
       .wfr-hygiene-head .wfr-hygiene-check { flex: 0 0 auto; }
       .wfr-hygiene-head .wfr-hygiene-check span { font-size: 13px; color: var(--wfr-muted); }
@@ -16343,9 +16700,9 @@
       .wfr-hygiene-protected { color: var(--wfr-accent); font-size: 12px; }
       .wfr-hygiene-facts { font-size: 13px; }
       .wfr-event .wfr-actions { margin-top: 9px; }
-      .wfr-removal-confirm { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); }
+      .wfr-removal-confirm { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-panel-bg); }
       .wfr-batch-panel { margin-top: 10px; }
-      .wfr-selection-bar { position: sticky; bottom: 0; z-index: 1; display: flex; flex-direction: column; gap: 6px; margin-top: 14px; padding: 9px 11px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: var(--wfr-bar-shadow); }
+      .wfr-selection-bar { position: sticky; bottom: 0; z-index: 1; display: flex; flex-direction: column; gap: 6px; margin-top: 14px; padding: 9px 11px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); }
       .wfr-body.wfr-body-flush { padding-bottom: 0; }
       .wfr-body-flush > .wfr-event-list { margin-bottom: 24px; }
       .wfr-body-flush > .wfr-selection-bar { margin: 0 -24px; padding: 12px 24px; border-width: 1px 0 0; border-radius: 0; }
@@ -16360,13 +16717,14 @@
       .wfr-actions .wfr-primary { margin: 0; }
       .wfr-compact-actions { margin-top: 6px; }
       .wfr-module { margin-top: 22px; }
-      .wfr-body h3 { margin: 18px 0 6px; font-size: 16px; }
+      .wfr-body h3 { margin: 18px 0 6px; font-size: 15px; font-weight: 600; }
       .wfr-body h3:first-child { margin-top: 0; }
       .wfr-body > h3:not(:first-child) { margin-top: 26px; padding-top: 22px; border-top: 1px solid var(--wfr-border); }
       .wfr-home { padding-top: 20px; padding-bottom: 18px; }
       .wfr-home-description { margin: 0; font-size: 13px; line-height: 1.7; }
       .wfr-home-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-      .wfr-home-module { display: flex; flex-direction: column; min-width: 0; padding: 16px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-l); background: var(--wfr-card-bg); }
+      .wfr-home-module { display: flex; flex-direction: column; min-width: 0; padding: 16px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-l); background: var(--wfr-card-bg); transition: border-color 120ms ease; }
+      .wfr-home-module:hover { border-color: var(--wfr-control-border); }
       .wfr-home .wfr-home-module-title { margin: 0 0 10px; font-size: 14px; font-weight: 600; letter-spacing: -.015em; }
       .wfr-home-module .wfr-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 3px 0; padding: 0; border-top: 0; }
       .wfr-home-module .wfr-row strong { flex: 0 0 auto; color: var(--wfr-muted); font-size: 13px; font-weight: 400; }
@@ -16384,7 +16742,7 @@
       .wfr-home .wfr-changelog-footer { display: flex; justify-content: flex-end; margin: 12px 0 0; }
       .wfr-browse-panel h3 { margin: 10px 0 4px; }
       .wfr-browse-panel h3:first-child { margin-top: 2px; }
-      .wfr-profile-extras { box-sizing: border-box; position: relative; margin: 0 0 7px; padding: 2px 16px 7px; background: transparent; color: var(--wfr-muted); font: 13px/1.35 system-ui, sans-serif; font-weight: 400; }
+      .wfr-profile-extras { box-sizing: border-box; position: relative; margin: 0 0 7px; padding: 2px 16px 7px; background: transparent; color: var(--wfr-muted); font: 13px/1.35 var(--wfr-sans); font-weight: 400; }
       .wfr-profile-row { margin: 2px 0; overflow-wrap: anywhere; font-weight: 400; }
       .wfr-profile-label { color: var(--wfr-muted); }
       .wfr-profile-name-row { position: relative; width: max-content; max-width: 100%; margin: 3px 0; }
@@ -16400,13 +16758,13 @@
       .wfr-note-time, .wfr-note-counter { margin: 4px 0; font: 12px/1.6 var(--wfr-mono); }
       .wfr-note-tags { display: flex; flex-wrap: wrap; gap: 5px; margin: 5px 0; padding: 0; list-style: none; }
       .wfr-note-tags[hidden] { display: none; }
-      .wfr-note-tag { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; box-sizing: border-box; padding: 2px 8px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-s); background: var(--wfr-card-bg); color: var(--wfr-panel-text); font-size: 12px; overflow-wrap: anywhere; }
+      .wfr-note-tag { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; box-sizing: border-box; padding: 2px 8px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-s); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); font-size: 12px; overflow-wrap: anywhere; }
       .wfr-note-tag-remove { appearance: none; border: 0; padding: 0 2px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
       .wfr-note-tag-remove:focus-visible, .wfr-note-textarea:focus-visible, .wfr-note-tag-input:focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 2px; }
       .wfr-note-field-label { display: block; margin: 7px 0 3px; font-weight: 600; }
-      .wfr-note-textarea { display: block; width: 100%; min-height: 96px; box-sizing: border-box; resize: vertical; padding: 9px 12px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-note-textarea { display: block; width: 100%; min-height: 96px; box-sizing: border-box; resize: vertical; padding: 9px 12px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; transition: border-color 120ms ease; }
       .wfr-note-tag-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-      .wfr-note-tag-input { flex: 1 1 140px; min-width: 0; box-sizing: border-box; padding: 7px 10px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; }
+      .wfr-note-tag-input { flex: 1 1 140px; min-width: 0; box-sizing: border-box; padding: 7px 10px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; transition: border-color 120ms ease; }
       .wfr-note-status { margin: 6px 0 0; }
       .wfr-note-status:empty { display: none; }
       .wfr-note-conflict { margin: 4px 0 8px; padding: 8px 10px; border: 1px solid var(--wfr-error); border-radius: var(--wfr-radius-m); }
@@ -16414,7 +16772,7 @@
       .wfr-note-link { display: inline-block; text-decoration: none; }
       .wfr-note-link:hover { background: var(--wfr-button-hover); border-color: var(--wfr-muted); }
       .wfr-actions[hidden] { display: none; }
-      .wfr-profile-notes { box-sizing: border-box; margin: 0 0 8px; padding: 12px 16px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); font: 14px/1.55 system-ui, sans-serif; font-weight: 400; overflow-wrap: anywhere; }
+      .wfr-profile-notes { box-sizing: border-box; margin: 0 0 8px; padding: 12px 16px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); font: 14px/1.55 var(--wfr-sans); font-weight: 400; overflow-wrap: anywhere; }
       .wfr-profile-notes p { margin: 3px 0; }
       .wfr-profile-notes-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
       .wfr-profile-notes-head .wfr-muted { font-size: 13px; }
@@ -16422,8 +16780,8 @@
       .wfr-profile-notes .wfr-removal-confirm { margin-top: 6px; }
       .wfr-profile-notes-observed { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--wfr-border); color: var(--wfr-muted); font-size: 13px; }
       .wfr-profile-notes-subhead { font-weight: 600; }
-      .wfr-feed-note { display: inline-flex; flex-wrap: nowrap; align-items: center; gap: 0; min-width: 0; max-width: 100%; margin-left: 5px; vertical-align: middle; color: inherit; font: 13px/1.5 system-ui, sans-serif; }
-      .wfr-feed-note-entry { appearance: none; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: var(--wfr-radius-s); padding: 0; background: transparent; color: inherit; font-size: 0; opacity: .4; cursor: pointer; vertical-align: middle; }
+      .wfr-feed-note { display: inline-flex; flex-wrap: nowrap; align-items: center; gap: 0; min-width: 0; max-width: 100%; margin-left: 5px; vertical-align: middle; color: inherit; font: 13px/1.5 var(--wfr-sans); }
+      .wfr-feed-note-entry { appearance: none; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: var(--wfr-radius-s); padding: 0; background: transparent; color: inherit; font-size: 0; opacity: .45; cursor: pointer; vertical-align: middle; }
       .wfr-feed-note-entry::before { content: ""; width: 14px; height: 14px; background: currentColor; -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 4h12v17l-6-4-6 4z' fill='none' stroke='white' stroke-width='1.7' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 4h12v17l-6-4-6 4z' fill='none' stroke='white' stroke-width='1.7' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; }
       .wfr-feed-note-entry:hover, .wfr-feed-note-entry:focus-visible, .wfr-feed-note-entry[aria-expanded="true"] { opacity: 1; }
       .wfr-feed-note-entry:focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 2px; }
@@ -16431,12 +16789,12 @@
       .wfr-feed-note-entry.wfr-feed-note-has { color: var(--wfr-accent); opacity: 1; }
       .wfr-feed-note-hint { display: none; }
       .wfr-feed-note-hint[hidden] { display: none; }
-      .wfr-feed-note-card { position: absolute; top: 0; left: 0; z-index: 2147482500; box-sizing: border-box; display: flex; flex-direction: column; width: min(360px, calc(100vw - 24px)); max-height: min(560px, calc(100vh - 24px)); overflow: hidden; padding: 14px 16px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-l); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: var(--wfr-panel-shadow); font: 14px/1.55 system-ui, sans-serif; font-weight: 400; overflow-wrap: anywhere; }
+      .wfr-feed-note-card { position: absolute; top: 0; left: 0; z-index: 2147482500; box-sizing: border-box; display: flex; flex-direction: column; width: min(360px, calc(100vw - 24px)); max-height: min(560px, calc(100vh - 24px)); overflow: hidden; padding: 14px 16px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-l); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: var(--wfr-panel-shadow); font: 14px/1.55 var(--wfr-sans); font-weight: 400; overflow-wrap: anywhere; }
       .wfr-feed-note-card:focus { outline: none; }
       .wfr-feed-note-card:focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 1px; }
       .wfr-feed-note-card p { margin: 3px 0; }
       .wfr-feed-note-card .wfr-button { padding: 3px 9px; font: inherit; font-size: 13px; }
-      .wfr-feed-note-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+      .wfr-feed-note-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid var(--wfr-border); }
       .wfr-feed-note-card-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 0; }
       .wfr-feed-note-card-title .wfr-muted { font-size: 13px; }
       .wfr-feed-note-card-notice:empty { display: none; }
@@ -16448,14 +16806,15 @@
       .wfr-changelog-link { padding: 3px 7px; border-color: transparent; background: transparent; color: var(--wfr-muted); font: 12px/1.5 var(--wfr-mono); }
       .wfr-release-history { padding: 8px 0; border-bottom: 1px solid var(--wfr-border); }
       .wfr-release-history:first-child { padding-top: 0; }
-      .wfr-release-history summary { cursor: pointer; font-weight: 600; }
+      .wfr-release-history summary, .wfr-usage-history summary { cursor: pointer; font-weight: 600; }
       .wfr-release-history-content { padding: 2px 0 2px 12px; }
+      .wfr-usage-history { margin-top: 10px; padding: 9px 12px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-card-bg); }
       .wfr-release-history-content h3 { margin: 8px 0 3px; font-size: 14px; }
       .wfr-release-history-content .wfr-changelog-list { margin: 3px 0 5px; }
-      .wfr-usage-corner { position: fixed; right: 18px; bottom: 62px; z-index: 2147482999; padding: 5px 9px; border: 1px solid var(--wfr-launcher-border); border-radius: var(--wfr-radius-m); background: var(--wfr-launcher-bg); color: var(--wfr-launcher-text); box-shadow: none; font: 12px/1.35 var(--wfr-mono); opacity: .8; cursor: pointer; }
-      .wfr-usage-corner:hover, .wfr-usage-corner:focus-visible { opacity: 1; border-color: var(--wfr-launcher-hover-border); }
-      .wfr-toolkit-launcher { position: fixed; right: 18px; bottom: 18px; z-index: 2147483000; display: inline-flex; align-items: center; gap: 8px; padding: 9px 13px; border: 1px solid var(--wfr-launcher-border); border-radius: var(--wfr-radius-m); background: var(--wfr-launcher-bg); color: var(--wfr-launcher-text); box-shadow: 0 4px 16px rgba(0,0,0,.08); font: 13px/1.35 var(--wfr-mono); opacity: .95; transition: background-color 120ms ease, border-color 120ms ease; }
-      .wfr-toolkit-launcher:hover:enabled, .wfr-toolkit-launcher:focus-visible { border-color: var(--wfr-launcher-hover-border); background: var(--wfr-launcher-hover-bg); opacity: 1; }
+      .wfr-usage-corner { position: fixed; right: 18px; bottom: 62px; z-index: 2147482999; padding: 5px 10px; border: 1px solid var(--wfr-launcher-border); border-radius: var(--wfr-radius-m); background: var(--wfr-launcher-bg); color: var(--wfr-launcher-text); font: 12px/1.35 var(--wfr-mono); cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease; }
+      .wfr-usage-corner:hover, .wfr-usage-corner:focus-visible { border-color: var(--wfr-launcher-hover-border); background: var(--wfr-launcher-hover-bg); }
+      .wfr-toolkit-launcher { position: fixed; right: 18px; bottom: 18px; z-index: 2147483000; display: inline-flex; align-items: center; gap: 8px; padding: 9px 13px; border: 1px solid var(--wfr-launcher-border); border-radius: var(--wfr-radius-m); background: var(--wfr-launcher-bg); color: var(--wfr-launcher-text); font: 500 13px/1.35 var(--wfr-mono); transition: background-color 120ms ease, border-color 120ms ease; }
+      .wfr-toolkit-launcher:hover:enabled, .wfr-toolkit-launcher:focus-visible { border-color: var(--wfr-launcher-hover-border); background: var(--wfr-launcher-hover-bg); }
       .wfr-launcher-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 19px; height: 19px; padding: 0 6px; box-sizing: border-box; border-radius: 999px; background: var(--wfr-badge-bg); color: var(--wfr-badge-text); font-size: 12px; font-weight: 700; line-height: 1; }
       .wfr-launcher-badge[hidden] { display: none; }
       @media (max-width: 680px) {
@@ -16479,7 +16838,7 @@
         .wfr-header h2 { order: 3; flex: 1 0 100%; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
       }
       @media (prefers-reduced-motion: reduce) {
-        .wfr-button, .wfr-toolkit-launcher { transition: none; }
+        .wfr-button, .wfr-toolkit-launcher, .wfr-usage-corner, .wfr-event, .wfr-home-module { transition: none; }
         .wfr-progress::before, .wfr-progress::after { animation: none; }
       }
     `;

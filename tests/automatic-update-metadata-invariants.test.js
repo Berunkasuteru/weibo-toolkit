@@ -44,6 +44,42 @@ assert(
     "已跳过（已有更新的快照）",
   "paired skip must render its own reason"
 );
+assert(
+  product.describeAutomaticOutcomeForAttempt(T2, {
+    attemptedAt: T2,
+    outcome: "FAILURE",
+    failureKind: "PAGINATION_FAILURE",
+    reason: "HARD_REQUEST_CEILING_REACHED",
+  }) === "失败（达到请求安全上限）",
+  "following ceiling reason must not be masked by generic pagination failureKind"
+);
+assert(
+  product.describeAutomaticOutcomeForAttempt(T2, {
+    attemptedAt: T2,
+    outcome: "FAILURE",
+    failureKind: "PAGINATION_FAILURE",
+    reason: "FOLLOWER_SAFETY_CEILING_REACHED",
+  }) === "失败（达到请求安全上限）",
+  "follower ceiling reason must not be masked by generic pagination failureKind"
+);
+assert(
+  product.describeAutomaticOutcomeForAttempt(T2, {
+    attemptedAt: T2,
+    outcome: "FAILURE",
+    failureKind: "NETWORK_ERROR",
+    reason: "REQUEST_TIMEOUT",
+  }) === "失败（请求超时）",
+  "timeout reason must not be masked by generic network failureKind"
+);
+assert(
+  product.describeAutomaticOutcomeForAttempt(T2, {
+    attemptedAt: T2,
+    outcome: "FAILURE",
+    failureKind: "PAGINATION_FAILURE",
+    reason: "REPEATED_NEXT_CURSOR",
+  }) === "失败（分页完整性校验失败）",
+  "unmapped internal pagination reason must fall back to failureKind label"
+);
 
 // Nothing recorded at all stays the ordinary empty state.
 assert(

@@ -31,6 +31,7 @@
     panelReturnFocus = null;
     if (panelRoot && panelRoot.parentNode) panelRoot.parentNode.removeChild(panelRoot);
     panelRoot = null;
+    friendNoteDetailView = null;
     panelSizeFixed = false;
     panelHeaderButtons = [];
     panelExitLocked = false;
@@ -84,10 +85,11 @@
       if (typeof alert === "function") alert("正在保存，请等待完成后再离开。");
       return false;
     }
-    return (
+    const confirmed =
       typeof confirm !== "function" ||
-      confirm("这份友人档案还有未保存的修改。确定放弃这些修改吗？")
-    );
+      confirm("这份友人档案还有未保存的修改。确定放弃这些修改吗？");
+    if (confirmed) friendNoteDetailView = null;
+    return confirmed;
   }
 
   // Escape is left alone wherever it could cost the user something: while an
@@ -138,9 +140,13 @@
   // panel does not jump between them. A panel opened on its own (a notice, a
   // failure with nothing behind it) keeps the size of its content.
   function showPanel(title, withBack = false, fixedSize = Boolean(withBack)) {
-    // A locked panel is not replaced. The caller still gets a body to fill, but
-    // one that is never attached, so no entry point needs its own check.
-    if (panelExitLocked) return createElement("div", null, "wfr-body");
+    // A locked panel, or one holding an unsaved note the user chose to keep, is
+    // not replaced. The caller still gets a body to fill, but one that is never
+    // attached, so no entry point needs its own check.
+    if (panelExitLocked || !confirmLeavingUnsavedNote()) {
+      return createElement("div", null, "wfr-body");
+    }
+    closeProfileNicknamePopover(false);
     const keepSize = fixedSize || panelSizeFixed;
     // Focus goes back to whatever opened the first panel of this visit, not to
     // a node of a panel that this one replaces.
@@ -369,6 +375,47 @@
         usageSessionOwnerUid === owner.uid ? usageSessionPostIds.size : 0
       } 条不同微博`
     );
+    const summary = deriveUsageHistorySummary(loaded.state);
+    body.append(createElement("h3", "阶段汇总（含今日）"));
+    addLine(
+      body,
+      "近 7 天活跃",
+      `约 ${formatUsageMinutes(summary.last7Days.activeSeconds)} 分钟`
+    );
+    addLine(
+      body,
+      "近 7 天浏览",
+      `${summary.last7Days.uniquePosts} 条（按日累计）`
+    );
+    addLine(
+      body,
+      "近 30 天活跃",
+      `约 ${formatUsageMinutes(summary.last30Days.activeSeconds)} 分钟`
+    );
+    addLine(
+      body,
+      "近 30 天浏览",
+      `${summary.last30Days.uniquePosts} 条（按日累计）`
+    );
+    if (summary.historyDays.length > 0) {
+      const details = createElement("details", null, "wfr-usage-history");
+      details.append(
+        createElement(
+          "summary",
+          `历史每日明细（共 ${summary.historyDays.length} 天，最多保留 ${USAGE_RETENTION_DAYS} 天）`
+        )
+      );
+      for (const day of summary.historyDays) {
+        addLine(
+          details,
+          day.date,
+          `约 ${formatUsageMinutes(day.activeSeconds)} 分钟 · ${
+            day.uniquePosts
+          } 条不同微博`
+        );
+      }
+      body.append(details);
+    }
     body.append(
       createElement(
         "p",
@@ -1083,7 +1130,15 @@
     );
   }
 
-  function renderFollowerEvents(ownerUid, state) {
+  function matchesFollowerEventQuery(event, query) {
+    const needle = String(query || "").trim().toLowerCase();
+    if (needle === "") return true;
+    return [event.displayName, event.uid].some(
+      (value) => typeof value === "string" && value.toLowerCase().includes(needle)
+    );
+  }
+
+  function renderFollowerEvents(ownerUid, state, initialQuery = "") {
     const body = showPanel("粉丝变化", true);
     const snapshot = state.latestSnapshot;
     addLine(body, "已有快照", snapshot ? "是" : "否");
@@ -1095,6 +1150,8 @@
     appendFollowerVisibilityNote(body, snapshot);
 
     let events = state.events;
+    const notesLoaded = loadFriendNotesState(ownerUid);
+    const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
     const clearAllActions = createElement("div", null, "wfr-actions");
     const clearAllButton = createElement(
       "button",
@@ -1104,10 +1161,15 @@
     clearAllButton.type = "button";
     clearAllActions.append(clearAllButton);
     const clearAllPanel = createElement("div", null, "wfr-batch-panel");
+    const search = createElement("input", null, "wfr-search");
+    search.type = "search";
+    search.placeholder = "搜索昵称或 UID";
+    search.setAttribute("aria-label", "搜索昵称或 UID");
+    search.value = initialQuery;
     const status = createElement("p", "", "wfr-muted");
     const emptyNote = createElement("p", "暂无粉丝变化事件。", "wfr-muted wfr-empty");
     const list = createElement("div", null, "wfr-event-list");
-    body.append(clearAllActions, clearAllPanel, status, emptyNote, list);
+    body.append(clearAllActions, clearAllPanel, search, status, emptyNote, list);
 
     function clearNode(node) {
       while (node.childNodes.length > 0) node.removeChild(node.childNodes[0]);
@@ -1118,8 +1180,11 @@
     // Reconciles the rendered cards with the freshly persisted event list. Cards
     // that survived keep their nodes; events another tab added since this view
     // opened appear instead of being silently dropped from the count.
-    function syncList() {
-      const desired = sortFollowerEventsNewestFirst(events);
+    function syncList(preserveExistingOrder = false) {
+      const allSorted = sortFollowerEventsNewestFirst(events);
+      const desired = allSorted.filter((event) =>
+        matchesFollowerEventQuery(event, search.value || "")
+      );
       const desiredIds = new Set(desired.map((event) => event.id));
       for (const [id, node] of [...renderedCards]) {
         if (desiredIds.has(id)) continue;
@@ -1127,21 +1192,26 @@
         renderedCards.delete(id);
       }
       for (const event of desired) {
-        if (renderedCards.has(event.id)) continue;
-        const card = buildEventCard(event);
+        if (preserveExistingOrder && renderedCards.has(event.id)) continue;
+        const card = renderedCards.get(event.id) || buildEventCard(event);
         renderedCards.set(event.id, card);
         list.append(card);
       }
-      renderCounts();
+      renderCounts(desired.length);
     }
 
-    function renderCounts() {
+    function renderCounts(matchingCount) {
       countValue.textContent = String(events.length);
-      const empty = events.length === 0;
-      emptyNote.hidden = !empty;
-      list.hidden = empty;
-      clearAllActions.hidden = empty;
-      if (empty) clearNode(clearAllPanel);
+      const noEvents = events.length === 0;
+      const noMatches = matchingCount === 0;
+      search.hidden = noEvents;
+      emptyNote.textContent = noEvents
+        ? "暂无粉丝变化事件。"
+        : "没有匹配的粉丝变化事件。";
+      emptyNote.hidden = !noMatches;
+      list.hidden = noMatches;
+      clearAllActions.hidden = noEvents;
+      if (noEvents) clearNode(clearAllPanel);
     }
 
     // Local records only: clearing a notification never touches the Weibo
@@ -1191,12 +1261,33 @@
         }
         // Targeted reconciliation: surviving cards keep their nodes and the
         // reading position stays where it is.
-        syncList();
+        syncList(true);
       });
-      actions.append(clearButton);
+      actions.append(clearButton, createFriendNoteProfileLink(event.uid));
+      if (notedUids !== null) {
+        const noteButton = createElement(
+          "button",
+          hasOwn(notedUids, event.uid) ? "友人档案" : "写档案",
+          "wfr-button"
+        );
+        noteButton.type = "button";
+        noteButton.addEventListener("click", () =>
+          showFriendNoteDetail(ownerUid, event.uid, null, () => {
+            const fresh = loadFollowerState(ownerUid);
+            renderFollowerEvents(
+              ownerUid,
+              fresh.ok ? fresh.state : { ...state, events },
+              String(search.value || "")
+            );
+          })
+        );
+        actions.append(noteButton);
+      }
       item.append(actions);
       return item;
     }
+
+    search.addEventListener("input", () => syncList(false));
 
     clearAllButton.addEventListener("click", () => {
       clearNode(clearAllPanel);

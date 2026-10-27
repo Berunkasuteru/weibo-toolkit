@@ -258,6 +258,7 @@
   const AUTOMATIC_OUTCOME_REASON_LABELS = Object.freeze({
     STALE_SCAN: "已有更新的快照",
     NETWORK_ERROR: "网络请求失败",
+    REQUEST_TIMEOUT: "请求超时",
     HTTP_ERROR: "接口请求失败",
     LOGIN_REQUIRED: "登录状态失效",
     CHALLENGE_OR_UNEXPECTED_RESPONSE: "遇到验证页面或异常响应",
@@ -265,12 +266,15 @@
     UNEXPECTED_CONTENT_TYPE: "接口响应类型异常",
     UNEXPECTED_SCHEMA: "接口数据校验失败",
     PAGINATION_FAILURE: "分页完整性校验失败",
+    HARD_REQUEST_CEILING_REACHED: "达到请求安全上限",
+    FOLLOWER_SAFETY_CEILING_REACHED: "达到请求安全上限",
     MAX_REQUESTS_REACHED: "达到请求安全上限",
     FOLLOWER_REQUEST_CEILING_REACHED: "达到请求安全上限",
     ACCOUNT_CHANGED_DURING_SCAN: "扫描期间账号发生变化",
     STORAGE_ERROR: "本地数据读取失败",
     PERSISTENCE_ERROR: "本地保存失败",
     CONCURRENT_MODIFICATION: "检测到并发修改",
+    STATE_LOCK_UNAVAILABLE: "浏览器锁不可用",
     LOCK_UNAVAILABLE: "浏览器锁不可用",
     LOCK_REQUEST_FAILED: "浏览器锁请求失败",
     UNKNOWN_FAILURE: "未能确认原因",
@@ -353,9 +357,10 @@
   function describeAutomaticOutcome(value) {
     if (value === null) return "—";
     if (value.outcome === "SUCCESS") return "成功";
-    const code = value.failureKind || value.reason || null;
     const detail =
-      AUTOMATIC_OUTCOME_REASON_LABELS[code] || "原因未能确认";
+      AUTOMATIC_OUTCOME_REASON_LABELS[value.reason] ||
+      AUTOMATIC_OUTCOME_REASON_LABELS[value.failureKind] ||
+      "原因未能确认";
     return value.outcome === "SKIPPED"
       ? "已跳过（" + detail + "）"
       : "失败（" + detail + "）";

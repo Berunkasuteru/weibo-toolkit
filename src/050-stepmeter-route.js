@@ -108,6 +108,52 @@
     };
   }
 
+  function usageDateKeyDaysAgo(baseDateKey, daysAgo) {
+    if (!isValidUsageDateKey(baseDateKey)) return null;
+    const [year, month, day] = baseDateKey.split("-").map(Number);
+    const date = new Date(year, month - 1, day);
+    date.setDate(date.getDate() - daysAgo);
+    return usageLocalDateKey(date.getTime());
+  }
+
+  function deriveUsageHistorySummary(state) {
+    const todayKey = state.currentDay.date;
+    const todayEntry = {
+      date: todayKey,
+      activeSeconds: state.currentDay.activeSeconds,
+      uniquePosts: state.currentDay.uniquePostIds.length,
+    };
+    const historyDays = Object.entries(state.days)
+      .map(([date, day]) => ({
+        date,
+        activeSeconds: day.activeSeconds,
+        uniquePosts: day.uniquePosts,
+      }))
+      .filter((day) => day.activeSeconds > 0 || day.uniquePosts > 0)
+      .sort((left, right) => right.date.localeCompare(left.date));
+    const allDays = [todayEntry, ...historyDays];
+    function sumWindow(windowDays) {
+      const cutoff = usageDateKeyDaysAgo(todayKey, windowDays - 1);
+      let activeSeconds = 0;
+      let uniquePosts = 0;
+      let activeDays = 0;
+      for (const day of allDays) {
+        if (cutoff !== null && (day.date < cutoff || day.date > todayKey)) {
+          continue;
+        }
+        activeSeconds += day.activeSeconds;
+        uniquePosts += day.uniquePosts;
+        if (day.activeSeconds > 0 || day.uniquePosts > 0) activeDays += 1;
+      }
+      return { activeSeconds, uniquePosts, activeDays };
+    }
+    return {
+      last7Days: sumWindow(7),
+      last30Days: sumWindow(30),
+      historyDays,
+    };
+  }
+
   function usageStorageKey(ownerUid) {
     return USAGE_STORAGE_PREFIX + ownerUid;
   }

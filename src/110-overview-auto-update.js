@@ -1,11 +1,33 @@
 
-  function showRelationshipOverview() {
+  function filterOverviewFollowingRecords(records, filter, query) {
+    const mode =
+      filter === "MUTUAL" || filter === "ONE_WAY" ? filter : "ALL";
+    const needle = String(query || "").trim().toLowerCase();
+    return records.filter((record) => {
+      if (mode === "MUTUAL" && !record.followsMe) return false;
+      if (mode === "ONE_WAY" && record.followsMe) return false;
+      if (needle === "") return true;
+      return [record.screenName, record.remark, record.uid].some(
+        (value) =>
+          typeof value === "string" && value.toLowerCase().includes(needle)
+      );
+    });
+  }
+
+  function showRelationshipOverview(viewState) {
+    const view =
+      isPlainObject(viewState) &&
+      typeof viewState.filter === "string" &&
+      typeof viewState.query === "string"
+        ? { filter: viewState.filter, query: viewState.query }
+        : { filter: "ALL", query: "" };
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
       showFailure("关系概览", uidResult);
       return;
     }
-    const loaded = loadState(uidResult.uid);
+    const ownerUid = uidResult.uid;
+    const loaded = loadState(ownerUid);
     if (!loaded.ok) {
       showFailure("关系概览", loaded);
       return;
@@ -51,6 +73,144 @@
         "wfr-muted"
       )
     );
+
+    if (overview.current !== null && loaded.state.latestSnapshot !== null) {
+      const records = loaded.state.latestSnapshot.records;
+      const notesLoaded = loadFriendNotesState(ownerUid);
+      const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
+
+      body.append(createElement("h3", "当前关注名单"));
+      const filterRow = createElement("label", "关系筛选：", "wfr-row");
+      const filterSelect = createElement("select", null, "wfr-select");
+      filterSelect.setAttribute("aria-label", "按关系状态筛选");
+      for (const [value, label] of [
+        ["ALL", `全部可见关注（${overview.current.visibleFollowing}）`],
+        ["MUTUAL", `互相关注（${overview.current.mutual}）`],
+        ["ONE_WAY", `单向关注（${overview.current.oneWay}）`],
+      ]) {
+        const option = createElement("option", label);
+        option.value = value;
+        option.selected = value === view.filter;
+        filterSelect.append(option);
+      }
+      filterSelect.value =
+        view.filter === "MUTUAL" || view.filter === "ONE_WAY"
+          ? view.filter
+          : "ALL";
+      filterRow.append(filterSelect);
+      body.append(filterRow);
+
+      const search = createElement("input", null, "wfr-search");
+      search.type = "search";
+      search.placeholder = "搜索昵称、微博备注或 UID";
+      search.setAttribute("aria-label", "搜索当前关注名单");
+      search.value = view.query;
+      body.append(search);
+
+      const summary = createElement("p", "", "wfr-muted");
+      const list = createElement("div", null, "wfr-event-list");
+      const moreActions = createElement("div", null, "wfr-actions");
+      const moreButton = createElement("button", "加载更多", "wfr-button");
+      moreButton.type = "button";
+      moreActions.append(moreButton);
+      body.append(summary, list, moreActions);
+
+      let matching = [];
+      let shown = 0;
+      const returnToOverview = () =>
+        showRelationshipOverview({
+          filter: filterSelect.value,
+          query: String(search.value || ""),
+        });
+
+      function buildRecordCard(record) {
+        const item = createElement("article", null, "wfr-event");
+        item.append(
+          createElement(
+            "h3",
+            `${record.screenName} · ${
+              record.followsMe ? "互相关注" : "单向关注"
+            }`
+          )
+        );
+        addLine(item, "UID", record.uid);
+        if (typeof record.remark === "string" && record.remark.trim() !== "") {
+          addLine(item, "微博备注", record.remark);
+        }
+        const actions = createElement("div", null, "wfr-actions");
+        actions.append(createFriendNoteProfileLink(record.uid));
+        const eventCount = eventsForSubject(
+          loaded.state.events,
+          record.uid
+        ).length;
+        if (eventCount > 0) {
+          const timelineButton = createElement(
+            "button",
+            `关系时间线（${eventCount}）`,
+            "wfr-button"
+          );
+          timelineButton.type = "button";
+          timelineButton.addEventListener("click", () =>
+            showTimeline(ownerUid, loaded.state, record.uid, returnToOverview)
+          );
+          actions.append(timelineButton);
+        }
+        if (notedUids !== null) {
+          const noteButton = createElement(
+            "button",
+            hasOwn(notedUids, record.uid) ? "友人档案" : "写档案",
+            "wfr-button"
+          );
+          noteButton.type = "button";
+          noteButton.addEventListener("click", () =>
+            showFriendNoteDetail(ownerUid, record.uid, null, returnToOverview)
+          );
+          actions.append(noteButton);
+        }
+        item.append(actions);
+        return item;
+      }
+
+      function renderMore() {
+        const next = matching.slice(shown, shown + FRIEND_NOTES_PAGE_SIZE);
+        for (const record of next) list.append(buildRecordCard(record));
+        shown += next.length;
+        const remaining = matching.length - shown;
+        moreActions.hidden = remaining <= 0;
+        moreButton.textContent = `加载更多（还有 ${remaining} 个）`;
+      }
+
+      function renderList() {
+        while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
+        matching = filterOverviewFollowingRecords(
+          records,
+          view.filter,
+          view.query
+        );
+        shown = 0;
+        summary.textContent =
+          matching.length === records.length
+            ? `共 ${records.length} 个关注账号`
+            : `共 ${records.length} 个关注账号，匹配 ${matching.length} 个`;
+        if (matching.length === 0) {
+          list.append(
+            createElement("p", "没有匹配的关注账号", "wfr-muted wfr-empty")
+          );
+        }
+        renderMore();
+      }
+
+      filterSelect.addEventListener("change", () => {
+        view.filter = filterSelect.value;
+        renderList();
+      });
+      search.addEventListener("input", () => {
+        view.query = String(search.value || "");
+        renderList();
+      });
+      moreButton.addEventListener("click", renderMore);
+      renderList();
+    }
   }
 
   // The button carries an explicit accessible name, so it has to be recomposed

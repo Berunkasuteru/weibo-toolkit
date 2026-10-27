@@ -494,14 +494,14 @@
     const style = document.createElement("style");
     style.id = "wfr-pm-export-style";
     style.textContent = `
-      .wfr-pm-export-root { color-scheme: light; --wfr-pm-bg: #faf9f6; --wfr-pm-text: #292b2e; --wfr-pm-border: #deddd7; --wfr-pm-hover-bg: #f3f2ee; --wfr-pm-accent: #53776c; --wfr-pm-muted: #71746f; position: absolute; top: 10px; right: 58px; z-index: 20; display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; max-width: 520px; font: 12px/1.4 system-ui, sans-serif; }
-      .wfr-pm-export-button, .wfr-pm-export-choice { appearance: none; border: 1px solid var(--wfr-pm-border); border-radius: 8px; background: var(--wfr-pm-bg); color: var(--wfr-pm-text); font: inherit; cursor: pointer; }
+      .wfr-pm-export-root { color-scheme: light; --wfr-pm-bg: #faf9f6; --wfr-pm-text: #1f2328; --wfr-pm-border: #dcdad2; --wfr-pm-hover-bg: #f0eee8; --wfr-pm-accent: #3d6b5e; --wfr-pm-muted: #656963; position: absolute; top: 10px; right: 58px; z-index: 20; display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; max-width: min(520px, calc(100% - 68px)); font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", system-ui, sans-serif; }
+      .wfr-pm-export-button, .wfr-pm-export-choice { appearance: none; border: 1px solid var(--wfr-pm-border); border-radius: 8px; background: var(--wfr-pm-bg); color: var(--wfr-pm-text); font: inherit; font-weight: 500; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease; }
       .wfr-pm-export-button { padding: 5px 10px; }
       .wfr-pm-export-button:hover:not(:disabled), .wfr-pm-export-choice:hover:not(:disabled) { border-color: var(--wfr-pm-accent); background: var(--wfr-pm-hover-bg); color: var(--wfr-pm-accent); }
       .wfr-pm-export-button:focus-visible, .wfr-pm-export-choice:focus-visible { outline: 2px solid var(--wfr-pm-accent); outline-offset: 2px; }
       .wfr-pm-export-button:disabled, .wfr-pm-export-choice:disabled { opacity: .55; cursor: default; }
       .wfr-pm-export-button[hidden] { display: none; }
-      .wfr-pm-export-status { max-width: 260px; box-sizing: border-box; padding: 4px 7px; border: 1px solid var(--wfr-pm-border); border-radius: 8px; background: var(--wfr-pm-bg); color: var(--wfr-pm-muted); font: 11px/1.4 "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .wfr-pm-export-status { max-width: min(260px, 100%); box-sizing: border-box; padding: 4px 8px; border: 1px solid var(--wfr-pm-border); border-radius: 8px; background: var(--wfr-pm-bg); color: var(--wfr-pm-muted); font: 11px/1.4 "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .wfr-pm-export-status:empty { display: none; }
       .wfr-pm-export-checkpoint { display: inline-flex; align-items: center; gap: 5px; }
       .wfr-pm-export-checkpoint[hidden] { display: none; }

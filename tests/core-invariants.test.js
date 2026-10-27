@@ -11,6 +11,9 @@ const product = loadProductFunctions([
   "diffSnapshots",
   "diffFollowerSnapshots",
   "filterFollowerSnapshot",
+  "deriveUsageHistorySummary",
+  "filterOverviewFollowingRecords",
+  "matchesFollowerEventQuery",
 ]);
 
 assert(product.normalizeStableUid(123) === "123", "safe numeric UID rejected");
@@ -92,6 +95,54 @@ const hygiene = product.filterFollowerSnapshot(hygieneSnapshot, {
 assert(
   hygiene.matches.length === 1 && hygiene.matches[0].record.uid === "2",
   "unknown public-post count must not match 公开微博数 ≤ 0"
+);
+
+const usageSummary = product.deriveUsageHistorySummary({
+  version: 1,
+  currentDay: {
+    date: "2026-10-26",
+    activeSeconds: 600,
+    uniquePostIds: ["PostA1", "PostA2"],
+  },
+  days: {
+    "2026-10-25": { activeSeconds: 1200, uniquePosts: 10 },
+    "2026-10-24": { activeSeconds: 0, uniquePosts: 0 },
+    "2026-10-10": { activeSeconds: 1800, uniquePosts: 25 },
+    "2026-09-01": { activeSeconds: 300, uniquePosts: 4 },
+  },
+});
+assert(
+  usageSummary.last7Days.activeSeconds === 1800 &&
+    usageSummary.last7Days.uniquePosts === 12 &&
+    usageSummary.last7Days.activeDays === 2,
+  "7-day usage summary must sum today and active days within the 7-day window"
+);
+assert(
+  usageSummary.last30Days.activeSeconds === 3600 &&
+    usageSummary.last30Days.uniquePosts === 37 &&
+    usageSummary.last30Days.activeDays === 3,
+  "30-day usage summary must include days within 30 days and exclude older history"
+);
+assert(
+  JSON.stringify(usageSummary.historyDays.map((day) => day.date)) ===
+    JSON.stringify(["2026-10-25", "2026-10-10", "2026-09-01"]),
+  "historyDays must be sorted newest first and omit empty zero-activity days"
+);
+
+const overviewRecords = [
+  { uid: "1001", screenName: "阿岚Lan", following: true, followsMe: true, remark: "摄影师" },
+  { uid: "1002", screenName: "老薄", following: true, followsMe: false, remark: "" },
+];
+assert(
+  product.filterOverviewFollowingRecords(overviewRecords, "MUTUAL", "").length === 1 &&
+    product.filterOverviewFollowingRecords(overviewRecords, "ONE_WAY", "")[0].uid === "1002" &&
+    product.filterOverviewFollowingRecords(overviewRecords, "ALL", "摄影").length === 1,
+  "overview following filter must filter by relationship status and remark/name/UID query"
+);
+assert(
+  product.matchesFollowerEventQuery({ uid: "2001", displayName: "海边的岚" }, "海边") === true &&
+    product.matchesFollowerEventQuery({ uid: "2001", displayName: "海边的岚" }, "9999") === false,
+  "follower event search must match displayName or UID"
 );
 
 console.log("core product invariants passed");

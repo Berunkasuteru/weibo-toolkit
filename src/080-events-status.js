@@ -103,7 +103,7 @@
     return events.filter((event) => matchesEventQuery(event, query));
   }
 
-  function renderEvents(ownerUid, state, notice) {
+  function renderEvents(ownerUid, state, notice, initialQuery = "") {
     const body = showPanel("关系事件", true);
     if (notice) body.append(createElement("p", notice, "wfr-success"));
     // Opening the list only reflects read state; it never changes it.
@@ -136,7 +136,12 @@
           showFailure("标记失败", saved);
           return;
         }
-        renderEvents(ownerUid, saved.state, "全部事件已标为已读。");
+        renderEvents(
+          ownerUid,
+          saved.state,
+          "全部事件已标为已读。",
+          String(search ? search.value || "" : initialQuery)
+        );
       });
       body.append(markButton);
     }
@@ -169,6 +174,7 @@
     search.type = "search";
     search.placeholder = "搜索昵称或 UID";
     search.setAttribute("aria-label", "搜索昵称或 UID");
+    search.value = initialQuery;
     body.append(search);
 
     const list = createElement("div", null, "wfr-event-list");
@@ -179,6 +185,8 @@
     // note exists. Unreadable notes simply mean no shortcut is offered.
     const notesLoaded = loadFriendNotesState(ownerUid);
     const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
+    const returnToEvents = () =>
+      renderEvents(ownerUid, state, null, String(search.value || ""));
     function renderList(query) {
       while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
       const matching = filterEvents(newestFirst, query);
@@ -197,15 +205,21 @@
         else groups.set(event.subjectUid, [event]);
       }
       for (const group of groups.values()) {
-        list.append(buildEventCard(ownerUid, state, group, notedUids));
+        list.append(
+          buildEventCard(ownerUid, state, group, notedUids, returnToEvents)
+        );
       }
     }
     search.addEventListener("input", () => renderList(search.value || ""));
-    renderList("");
+    renderList(initialQuery);
   }
 
   // group: the matching events of one account, newest first.
-  function buildEventCard(ownerUid, state, group, notedUids) {
+  function buildEventCard(ownerUid, state, group, notedUids, onReturn) {
+    const returnToEvents =
+      typeof onReturn === "function"
+        ? onReturn
+        : () => renderEvents(ownerUid, state, null);
     const event = group[0];
     const read = group.every((entry) => entry.read);
     const item = createElement(
@@ -228,7 +242,7 @@
     const detailButton = createElement("button", "详情", "wfr-button");
     detailButton.type = "button";
     detailButton.addEventListener("click", () =>
-      showEventDetail(ownerUid, state, event)
+      showEventDetail(ownerUid, state, event, returnToEvents)
     );
     actions.append(detailButton);
     // The whole stored history of the account, not just what the search
@@ -242,7 +256,7 @@
       );
       moreButton.type = "button";
       moreButton.addEventListener("click", () =>
-        showTimeline(ownerUid, state, event.subjectUid)
+        showTimeline(ownerUid, state, event.subjectUid, returnToEvents)
       );
       actions.append(moreButton);
     }
@@ -254,7 +268,7 @@
       );
       noteButton.type = "button";
       noteButton.addEventListener("click", () =>
-        showFriendNoteDetail(ownerUid, event.subjectUid, null)
+        showFriendNoteDetail(ownerUid, event.subjectUid, null, returnToEvents)
       );
       actions.append(noteButton);
     }
@@ -262,8 +276,12 @@
     return item;
   }
 
-  function showEventDetail(ownerUid, state, event) {
-    const body = showPanel("事件详情", () => renderEvents(ownerUid, state, null));
+  function showEventDetail(ownerUid, state, event, onBack) {
+    const backToEvents =
+      typeof onBack === "function"
+        ? onBack
+        : () => renderEvents(ownerUid, state, null);
+    const body = showPanel("事件详情", backToEvents);
     body.append(
       createElement("h3", EVENT_LABELS[event.type] || event.type)
     );
@@ -300,7 +318,9 @@
     );
     timelineButton.type = "button";
     timelineButton.addEventListener("click", () =>
-      showTimeline(ownerUid, state, event.subjectUid)
+      showTimeline(ownerUid, state, event.subjectUid, () =>
+        showEventDetail(ownerUid, state, event, backToEvents)
+      )
     );
     body.append(timelineButton);
   }
