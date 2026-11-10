@@ -162,6 +162,48 @@ async function uncertainSingleInvalidatesBatch() {
     "the new plan includes only the remaining eligible selection");
 }
 
+async function uncertainRemovalSurvivesChildViews() {
+  for (const mode of ["single", "batch"]) {
+    const view = openHygiene();
+    view.filter.checked = true;
+    await view.filter.dispatch("change");
+    let running;
+    if (mode === "single") {
+      await findButton(view.cards()[0], "移除粉丝").click();
+      running = findButton(view.cards()[0], "确认移除").click();
+    } else {
+      const input = view.checkbox(view.cards()[0]);
+      input.checked = true;
+      await input.dispatch("change");
+      await findButton(view.document.body, "移除所选粉丝").click();
+      running = findButton(view.document.body, "确认移除 1 个").click();
+    }
+    await tick();
+    view.calls[0].resolve(response("malformed JSON"));
+    await running;
+    const card = () => view.cards().find((node) => node.textContent.includes("粉丝2001"));
+    assert(!view.checkbox(card()) && card().textContent.includes("结果待确认"), "an unknown outcome quarantines the card");
+    const originalMessage = view.state().messages.get("2001");
+    const kept = view.checkbox(view.cards().find((node) => node.textContent.includes("粉丝2002")));
+    kept.checked = true;
+    await kept.dispatch("change");
+
+    for (const destination of ["note", "log"]) {
+      if (destination === "note") await findButton(card(), "写档案").click();
+      else await findButton(view.document.body, "移除记录").click();
+      await findButton(view.document.body, "← 返回").click();
+      assert(!view.checkbox(card()) && card().textContent.includes("结果待确认"),
+        `${mode}: returning from ${destination} must keep the unknown result quarantined`);
+      assert(view.state().messages.get("2001") === originalMessage,
+        "the original outcome explanation survives navigation");
+      assert(view.state().selectedUids.has("2002"), "the other reviewed selection survives navigation");
+    }
+    await findButton(view.document.body, "按顺序选满").click();
+    assert(!view.state().selectedUids.has("2001"), "bulk selection still skips the quarantined account");
+    assert(view.calls.length === 1, "child-view navigation never retries the removal");
+  }
+}
+
 async function finalConfirmationRechecksState() {
   for (const changed of ["selection", "eligibility"]) {
     const view = openHygiene();
@@ -389,6 +431,7 @@ function sortPutsUnknownValuesLast() {
   await presetsAreSavedAndNormalised();
   await heldBatchCanBeStopped();
   await uncertainSingleInvalidatesBatch();
+  await uncertainRemovalSurvivesChildViews();
   await finalConfirmationRechecksState();
   console.log("follower removal UI safety invariants passed");
 })().catch((error) => {

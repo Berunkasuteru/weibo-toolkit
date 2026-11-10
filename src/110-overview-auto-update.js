@@ -19,8 +19,24 @@
       isPlainObject(viewState) &&
       typeof viewState.filter === "string" &&
       typeof viewState.query === "string"
-        ? { filter: viewState.filter, query: viewState.query }
-        : { filter: "ALL", query: "" };
+        ? {
+            filter: viewState.filter,
+            query: viewState.query,
+            shown:
+              typeof viewState.shown === "number" && viewState.shown > 0
+                ? viewState.shown
+                : FRIEND_NOTES_PAGE_SIZE,
+            scrollTop:
+              typeof viewState.scrollTop === "number" && viewState.scrollTop >= 0
+                ? viewState.scrollTop
+                : 0,
+          }
+        : {
+            filter: "ALL",
+            query: "",
+            shown: FRIEND_NOTES_PAGE_SIZE,
+            scrollTop: 0,
+          };
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
       showFailure("关系概览", uidResult);
@@ -48,7 +64,7 @@
       );
     } else {
       addLine(body, "快照时间", formatTime(overview.current.capturedAt));
-      addLine(body, "API可见关注", overview.current.visibleFollowing);
+      addLine(body, "API 可见关注", overview.current.visibleFollowing);
       addLine(body, "互相关注", overview.current.mutual);
       addLine(body, "单向关注", overview.current.oneWay);
       body.append(
@@ -108,6 +124,8 @@
       body.append(search);
 
       const summary = createElement("p", "", "wfr-muted");
+      summary.setAttribute("role", "status");
+      summary.setAttribute("aria-live", "polite");
       const list = createElement("div", null, "wfr-event-list");
       const moreActions = createElement("div", null, "wfr-actions");
       const moreButton = createElement("button", "加载更多", "wfr-button");
@@ -117,11 +135,15 @@
 
       let matching = [];
       let shown = 0;
-      const returnToOverview = () =>
-        showRelationshipOverview({
+      const captureReturnToOverview = () => {
+        const savedView = {
           filter: filterSelect.value,
           query: String(search.value || ""),
-        });
+          shown: Math.max(FRIEND_NOTES_PAGE_SIZE, shown),
+          scrollTop: Number(body.scrollTop) || 0,
+        };
+        return () => showRelationshipOverview(savedView);
+      };
 
       function buildRecordCard(record) {
         const item = createElement("article", null, "wfr-event");
@@ -146,12 +168,12 @@
         if (eventCount > 0) {
           const timelineButton = createElement(
             "button",
-            `关系时间线（${eventCount}）`,
+            `关系时间线（${eventCount} 条事件）`,
             "wfr-button"
           );
           timelineButton.type = "button";
           timelineButton.addEventListener("click", () =>
-            showTimeline(ownerUid, loaded.state, record.uid, returnToOverview)
+            showTimeline(ownerUid, loaded.state, record.uid, captureReturnToOverview())
           );
           actions.append(timelineButton);
         }
@@ -163,7 +185,7 @@
           );
           noteButton.type = "button";
           noteButton.addEventListener("click", () =>
-            showFriendNoteDetail(ownerUid, record.uid, null, returnToOverview)
+            showFriendNoteDetail(ownerUid, record.uid, null, captureReturnToOverview())
           );
           actions.append(noteButton);
         }
@@ -171,17 +193,20 @@
         return item;
       }
 
-      function renderMore() {
-        const next = matching.slice(shown, shown + FRIEND_NOTES_PAGE_SIZE);
+      function renderMore(batchSize = FRIEND_NOTES_PAGE_SIZE) {
+        const next = matching.slice(shown, shown + batchSize);
         for (const record of next) list.append(buildRecordCard(record));
         shown += next.length;
         const remaining = matching.length - shown;
         moreActions.hidden = remaining <= 0;
-        moreButton.textContent = `加载更多（还有 ${remaining} 个）`;
+        moreButton.textContent = `加载更多（还有 ${remaining} 条）`;
       }
 
-      function renderList() {
-        while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
+      function renderList(
+        initialShown = FRIEND_NOTES_PAGE_SIZE,
+        initialScrollTop = 0
+      ) {
+        clearNode(list);
         matching = filterOverviewFollowingRecords(
           records,
           view.filter,
@@ -194,22 +219,27 @@
             : `共 ${records.length} 个关注账号，匹配 ${matching.length} 个`;
         if (matching.length === 0) {
           list.append(
-            createElement("p", "没有匹配的关注账号", "wfr-muted wfr-empty")
+            createElement("p", "没有匹配的关注账号。", "wfr-muted wfr-empty")
           );
         }
-        renderMore();
+        renderMore(Math.max(FRIEND_NOTES_PAGE_SIZE, initialShown));
+        if (initialScrollTop > 0) body.scrollTop = initialScrollTop;
       }
 
       filterSelect.addEventListener("change", () => {
         view.filter = filterSelect.value;
+        view.shown = FRIEND_NOTES_PAGE_SIZE;
+        view.scrollTop = 0;
         renderList();
       });
       search.addEventListener("input", () => {
         view.query = String(search.value || "");
+        view.shown = FRIEND_NOTES_PAGE_SIZE;
+        view.scrollTop = 0;
         renderList();
       });
-      moreButton.addEventListener("click", renderMore);
-      renderList();
+      moreButton.addEventListener("click", () => renderMore());
+      renderList(view.shown, view.scrollTop);
     }
   }
 
@@ -334,6 +364,7 @@
 
           updateRunning = true;
           setLauncherStatus("关系雷达正在自动更新…");
+          refreshOpenToolkitHome();
           let result;
           // An outcome is only ever written for an attempt the storage layer
           // actually accepted, so a rejected attempt cannot leave an orphan
@@ -382,6 +413,7 @@
             AUTO_STATUS_DURATION_MS
           );
           refreshUnreadBadge();
+          refreshOpenToolkitHome();
           return result;
         }
       );
@@ -452,6 +484,7 @@
 
           followerUpdateRunning = true;
           setLauncherStatus("粉丝快照正在自动更新…");
+          refreshOpenToolkitHome();
           let result;
           try {
             result = await performFollowerUpdate(
@@ -488,6 +521,7 @@
                 : "粉丝快照自动更新失败，且结果记录未保存",
             AUTO_STATUS_DURATION_MS
           );
+          refreshOpenToolkitHome();
           return result;
         }
       );
@@ -507,6 +541,15 @@
     markFeedFriendNotesStale();
     return { friendRadar, followerSnapshot };
   }
+
+  const AUTO_INTERVAL_CHOICES = [
+    [0, "关闭"],
+    [24, "每 24 小时"],
+    [48, "每 48 小时"],
+    [72, "每 72 小时"],
+    [168, "每 7 天"],
+    [360, "每 15 天"],
+  ];
 
   function showAutoUpdateSettings(notice) {
     const uidResult = determineCurrentUid();
@@ -560,203 +603,118 @@
 
     const body = showPanel("自动更新与外观", true);
     if (notice) body.append(createElement("p", notice, "wfr-success"));
-    body.append(createElement("h3", "关系雷达自动更新"));
-    body.append(
-      createElement(
-        "p",
-        "仅在打开微博网页时检查。",
-        "wfr-muted"
-      )
-    );
-    if (!loaded.ok) {
+
+    function appendAutoIntervalSection(config) {
+      body.append(createElement("h3", config.title));
       body.append(
-        createElement("p", "关系雷达本地数据无法读取。", "wfr-error")
+        createElement("p", "仅在打开微博网页时检查。", "wfr-muted")
       );
-    } else if (loaded.state.latestSnapshot === null) {
-      body.append(
-        createElement(
-          "p",
-          "请先手动完成一次关系雷达更新，自动更新不会保存首次快照。",
-          "wfr-muted"
+      if (!config.stateLoaded.ok) {
+        body.append(createElement("p", config.unreadableText, "wfr-error"));
+      } else if (config.stateLoaded.state.latestSnapshot === null) {
+        body.append(createElement("p", config.emptySnapshotHint, "wfr-muted"));
+      }
+      let currentHours = config.initialHours;
+      const label = createElement("label", "自动更新间隔：", "wfr-row");
+      const select = createElement("select", null, "wfr-select");
+      select.setAttribute("aria-label", config.selectLabel);
+      for (const [hours, text] of AUTO_INTERVAL_CHOICES) {
+        const option = createElement("option", text);
+        option.value = String(hours);
+        option.selected = hours === currentHours;
+        select.append(option);
+      }
+      select.value = String(currentHours);
+      label.append(select);
+      body.append(label);
+      addLine(
+        body,
+        "上次成功更新",
+        !config.stateLoaded.ok
+          ? "无法读取"
+          : config.stateLoaded.state.latestSnapshot === null
+            ? "—"
+            : formatTime(config.stateLoaded.state.latestSnapshot.capturedAt)
+      );
+      addLine(
+        body,
+        "上次自动尝试",
+        config.lastAttempt === null ? "—" : formatTime(config.lastAttempt)
+      );
+      addLine(
+        body,
+        "上次自动结果",
+        describeAutomaticOutcomeForAttempt(
+          config.lastAttempt,
+          config.lastOutcome
         )
       );
+      if (config.extraHint) {
+        body.append(createElement("p", config.extraHint, "wfr-muted"));
+      }
+      const statusNode = createElement("p", "", "wfr-success wfr-browse-status");
+      statusNode.setAttribute("role", "status");
+      statusNode.setAttribute("aria-live", "polite");
+      select.addEventListener("change", () => {
+        const currentUid = determineCurrentUid();
+        if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
+          select.value = String(currentHours);
+          showFailure("自动更新设置", {
+            failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+          });
+          return;
+        }
+        const selectedHours = Number(select.value);
+        if (!AUTO_INTERVAL_HOURS.includes(selectedHours)) {
+          select.value = String(currentHours);
+          showFailure("自动更新设置", {
+            failureKind: "STORAGE_ERROR",
+            reason: config.invalidReason,
+          });
+          return;
+        }
+        const saved = config.save(uidResult.uid, selectedHours);
+        if (!saved.ok) {
+          select.value = String(currentHours);
+          showFailure("自动更新设置", saved);
+          return;
+        }
+        currentHours = selectedHours;
+        statusNode.textContent = config.savedNotice;
+      });
+      body.append(statusNode);
     }
-    const label = createElement("label", "自动更新间隔：", "wfr-row");
-    const select = createElement("select", null, "wfr-select");
-    const choices = [
-      [0, "关闭"],
-      [24, "每 24 小时"],
-      [48, "每 48 小时"],
-      [72, "每 72 小时"],
-      [168, "每 7 天"],
-      [360, "每 15 天"],
-    ];
-    for (const [hours, text] of choices) {
-      const option = createElement("option", text);
-      option.value = String(hours);
-      option.selected = hours === interval.value;
-      select.append(option);
-    }
-    select.value = String(interval.value);
-    label.append(select);
-    body.append(label);
-    addLine(
-      body,
-      "上次成功更新",
-      !loaded.ok
-        ? "无法读取"
-        : loaded.state.latestSnapshot === null
-          ? "—"
-          : formatTime(loaded.state.latestSnapshot.capturedAt)
-    );
-    addLine(
-      body,
-      "上次自动尝试",
-      lastAttempt.value === null ? "—" : formatTime(lastAttempt.value)
-    );
-    addLine(
-      body,
-      "上次自动结果",
-      describeAutomaticOutcomeForAttempt(lastAttempt.value, lastOutcome.value)
-    );
 
-    const saveButton = createElement("button", "保存设置", "wfr-button wfr-primary");
-    saveButton.type = "button";
-    saveButton.addEventListener("click", () => {
-      const currentUid = determineCurrentUid();
-      if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
-        showFailure("自动更新设置", {
-          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
-        });
-        return;
-      }
-      const value = Number(select.value);
-      if (!AUTO_INTERVAL_HOURS.includes(value)) {
-        showFailure("自动更新设置", {
-          failureKind: "STORAGE_ERROR",
-          reason: "AUTO_INTERVAL_INVALID",
-        });
-        return;
-      }
-      const saved = saveAutoInterval(uidResult.uid, value);
-      if (!saved.ok) {
-        showFailure("自动更新设置", saved);
-        return;
-      }
-      showAutoUpdateSettings("关系雷达自动更新设置已保存。");
+    appendAutoIntervalSection({
+      title: "关系雷达自动更新",
+      selectLabel: "关系雷达自动更新间隔",
+      stateLoaded: loaded,
+      unreadableText: "关系雷达本地数据无法读取。",
+      emptySnapshotHint:
+        "请先手动完成一次关系雷达更新，自动更新不会保存首次快照。",
+      initialHours: interval.value,
+      lastAttempt: lastAttempt.value,
+      lastOutcome: lastOutcome.value,
+      invalidReason: "AUTO_INTERVAL_INVALID",
+      save: saveAutoInterval,
+      savedNotice: "关系雷达自动更新间隔已保存。",
     });
-    body.append(saveButton);
 
-    body.append(createElement("h3", "粉丝快照自动更新"));
-    body.append(
-      createElement(
-        "p",
-        "仅在打开微博网页时检查。",
-        "wfr-muted"
-      )
-    );
-    if (!followerState.ok) {
-      body.append(
-        createElement("p", "粉丝快照本地状态无法读取。", "wfr-error")
-      );
-    } else if (followerState.state.latestSnapshot === null) {
-      body.append(
-        createElement(
-          "p",
-          "首次到期的自动更新会保存首次粉丝快照，不会生成历史变化事件。",
-          "wfr-muted"
-        )
-      );
-    }
-    const followerIntervalLabel = createElement(
-      "label",
-      "自动更新间隔：",
-      "wfr-row"
-    );
-    const followerIntervalSelect = createElement(
-      "select",
-      null,
-      "wfr-select"
-    );
-    for (const [hours, text] of [
-      [0, "关闭"],
-      [24, "每 24 小时"],
-      [48, "每 48 小时"],
-      [72, "每 72 小时"],
-      [168, "每 7 天"],
-      [360, "每 15 天"],
-    ]) {
-      const option = createElement("option", text);
-      option.value = String(hours);
-      followerIntervalSelect.append(option);
-    }
-    followerIntervalSelect.value = String(followerInterval.value);
-    followerIntervalLabel.append(followerIntervalSelect);
-    body.append(followerIntervalLabel);
-    addLine(
-      body,
-      "上次成功更新",
-      !followerState.ok
-        ? "无法读取"
-        : followerState.state.latestSnapshot === null
-          ? "—"
-          : formatTime(followerState.state.latestSnapshot.capturedAt)
-    );
-    addLine(
-      body,
-      "上次自动尝试",
-      followerLastAttempt.value === null
-        ? "—"
-        : formatTime(followerLastAttempt.value)
-    );
-    addLine(
-      body,
-      "上次自动结果",
-      describeAutomaticOutcomeForAttempt(
-        followerLastAttempt.value,
-        followerLastOutcome.value
-      )
-    );
-    body.append(
-      createElement(
-        "p",
-        "首次启用建议选择每 72 小时。",
-        "wfr-muted"
-      )
-    );
-    const followerSaveButton = createElement(
-      "button",
-      "保存设置",
-      "wfr-button wfr-primary"
-    );
-    followerSaveButton.type = "button";
-    followerSaveButton.addEventListener("click", () => {
-      const currentUid = determineCurrentUid();
-      if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
-        showFailure("自动更新设置", {
-          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
-        });
-        return;
-      }
-      const selectedHours = Number(followerIntervalSelect.value);
-      if (!AUTO_INTERVAL_HOURS.includes(selectedHours)) {
-        showFailure("自动更新设置", {
-          failureKind: "STORAGE_ERROR",
-          reason: "FOLLOWER_AUTO_INTERVAL_INVALID",
-        });
-        return;
-      }
-      const saved = saveFollowerAutoInterval(
-        uidResult.uid,
-        selectedHours
-      );
-      if (!saved.ok) {
-        showFailure("自动更新设置", saved);
-        return;
-      }
-      showAutoUpdateSettings("粉丝快照自动更新设置已保存。");
+    appendAutoIntervalSection({
+      title: "粉丝快照自动更新",
+      selectLabel: "粉丝快照自动更新间隔",
+      stateLoaded: followerState,
+      unreadableText: "粉丝快照本地状态无法读取。",
+      emptySnapshotHint:
+        "首次到期的自动更新会保存首次粉丝快照，不会生成历史变化事件。",
+      initialHours: followerInterval.value,
+      lastAttempt: followerLastAttempt.value,
+      lastOutcome: followerLastOutcome.value,
+      extraHint: "首次启用建议选择每 72 小时。",
+      invalidReason: "FOLLOWER_AUTO_INTERVAL_INVALID",
+      save: saveFollowerAutoInterval,
+      savedNotice: "粉丝快照自动更新间隔已保存。",
     });
-    body.append(followerSaveButton);
 
     body.append(createElement("h3", "外观"));
     body.append(buildAppearanceControl());

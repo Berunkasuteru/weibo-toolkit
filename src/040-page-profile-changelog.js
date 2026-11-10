@@ -541,6 +541,17 @@
 
   function reconcileStrongTipsAdModules(root) {
     if (!root) return;
+    if (
+      !effectiveStrongFeedPromotionFilter() &&
+      typeof root.querySelectorAll === "function"
+    ) {
+      for (const node of root.querySelectorAll(
+        `.${STRONG_FEED_PROMOTION_HIDDEN_CLASS}`
+      )) {
+        setToolkitClass(node, STRONG_FEED_PROMOTION_HIDDEN_CLASS, false);
+      }
+      return;
+    }
     walkElementSubtree(root, applyStrongTipsAdVisibility);
   }
 
@@ -1522,6 +1533,28 @@
     }
   }
 
+  const MAX_PROFILE_VISIT_ENTRIES = 2000;
+  const PROFILE_VISIT_LOCK_PREFIX = "weibo-toolkit-profile-visits-";
+
+  function trimProfileVisitEntries(visits, protectedUid) {
+    const uids = Object.keys(visits);
+    if (uids.length <= MAX_PROFILE_VISIT_ENTRIES) return visits;
+    const removable = uids
+      .filter((uid) => uid !== protectedUid)
+      .sort(
+        (left, right) =>
+          Date.parse(visits[left].lastVisitedAt) -
+            Date.parse(visits[right].lastVisitedAt) ||
+          left.localeCompare(right)
+      );
+    const excess = uids.length - MAX_PROFILE_VISIT_ENTRIES;
+    const trimmed = { ...visits };
+    for (let index = 0; index < excess && index < removable.length; index += 1) {
+      delete trimmed[removable[index]];
+    }
+    return trimmed;
+  }
+
   function recordProfileVisit(ownerUid, targetUid, visitedAt) {
     const loaded = loadProfileVisits(ownerUid);
     if (!loaded.ok) return loaded;
@@ -1535,12 +1568,16 @@
       count: previous === null ? 1 : previous.count + 1,
       lastVisitedAt: visitedAt,
     };
-    const nextVisits = { ...loaded.visits, [targetUid]: nextRecord };
+    const nextVisits = trimProfileVisitEntries(
+      { ...loaded.visits, [targetUid]: nextRecord },
+      targetUid
+    );
     try {
       GM_setValue(profileVisitStorageKey(ownerUid), nextVisits);
       const saved = GM_getValue(profileVisitStorageKey(ownerUid), null);
       if (
         !isValidProfileVisitMap(saved) ||
+        !hasOwn(saved, targetUid) ||
         saved[targetUid].count !== nextRecord.count ||
         saved[targetUid].lastVisitedAt !== visitedAt
       ) {
@@ -1572,95 +1609,95 @@
     observations.push({ name, observedAt, order });
   }
 
-  function deriveProfileLocalFacts(targetUid, friendState, followerState) {
-    const names = [];
-    const relationshipEvents = [];
-    const evidenceTimes = [];
-    let order = 0;
-    let currentName = null;
-    let currentNameObservedAt = Number.NEGATIVE_INFINITY;
+  function createProfileLocalFactsAccumulator() {
+    return {
+      names: [],
+      relationshipEvents: [],
+      evidenceTimes: [],
+      order: 0,
+      currentName: null,
+      currentNameObservedAt: Number.NEGATIVE_INFINITY,
+      seenFriendSnapshot: false,
+      seenFollowerSnapshot: false,
+      finalized: null,
+    };
+  }
 
-    function observeName(name, observedAt) {
-      addProfileNameObservation(names, name, observedAt, order);
-      order += 1;
-      if (
-        typeof observedAt === "string" &&
-        Number.isFinite(Date.parse(observedAt))
-      ) {
-        evidenceTimes.push(observedAt);
-      }
+  function observeAccumulatorName(acc, name, observedAt) {
+    addProfileNameObservation(acc.names, name, observedAt, acc.order);
+    acc.order += 1;
+    if (
+      typeof observedAt === "string" &&
+      Number.isFinite(Date.parse(observedAt))
+    ) {
+      acc.evidenceTimes.push(observedAt);
     }
+  }
 
-    function observeCurrentName(name, observedAt) {
-      const observedTime = Date.parse(observedAt);
-      if (
-        typeof name === "string" &&
-        name.trim() !== "" &&
-        Number.isFinite(observedTime) &&
-        observedTime > currentNameObservedAt
-      ) {
-        currentName = name;
-        currentNameObservedAt = observedTime;
-      }
+  function observeAccumulatorCurrentName(acc, name, observedAt) {
+    const observedTime = Date.parse(observedAt);
+    if (
+      typeof name === "string" &&
+      name.trim() !== "" &&
+      Number.isFinite(observedTime) &&
+      observedTime > acc.currentNameObservedAt
+    ) {
+      acc.currentName = name;
+      acc.currentNameObservedAt = observedTime;
     }
+  }
 
-    if (friendState && friendState.latestSnapshot) {
-      const snapshot = friendState.latestSnapshot;
-      const record = snapshot.records.find((entry) => entry.uid === targetUid);
-      if (record) {
-        observeCurrentName(record.screenName, snapshot.capturedAt);
-        observeName(record.screenName, snapshot.capturedAt);
-      }
+  function observeFriendEventOnAccumulator(acc, event) {
+    acc.evidenceTimes.push(event.detectedAt);
+    acc.relationshipEvents.push({
+      observedAt: event.detectedAt,
+      label: EVENT_LABELS[event.type],
+    });
+    if (event.type === EVENT.SCREEN_NAME_CHANGED) {
+      observeAccumulatorName(acc, event.previous.screenName, event.detectedAt);
+      observeAccumulatorName(acc, event.current.screenName, event.detectedAt);
+    } else {
+      observeAccumulatorName(acc, event.displayName, event.detectedAt);
     }
-    if (friendState) {
-      for (const event of friendState.events) {
-        if (event.subjectUid !== targetUid) continue;
-        evidenceTimes.push(event.detectedAt);
-        relationshipEvents.push({
-          observedAt: event.detectedAt,
-          label: EVENT_LABELS[event.type],
-        });
-        if (event.type === EVENT.SCREEN_NAME_CHANGED) {
-          observeName(event.previous.screenName, event.detectedAt);
-          observeName(event.current.screenName, event.detectedAt);
-        } else {
-          observeName(event.displayName, event.detectedAt);
-        }
-      }
-    }
+  }
 
-    if (followerState && followerState.latestSnapshot) {
-      const snapshot = followerState.latestSnapshot;
-      const record = snapshot.records.find((entry) => entry.uid === targetUid);
-      if (record) {
-        observeCurrentName(record.screenName, snapshot.capturedAt);
-        observeName(record.screenName, snapshot.capturedAt);
-      }
-    }
-    if (followerState) {
-      for (const event of followerState.events) {
-        if (event.uid !== targetUid) continue;
-        evidenceTimes.push(event.observedAt);
-        relationshipEvents.push({
-          observedAt: event.observedAt,
-          label: FOLLOWER_EVENT_LABELS[event.type],
-        });
-        observeName(event.displayName, event.observedAt);
-      }
-    }
+  function observeFollowerEventOnAccumulator(acc, event) {
+    acc.evidenceTimes.push(event.observedAt);
+    acc.relationshipEvents.push({
+      observedAt: event.observedAt,
+      label: FOLLOWER_EVENT_LABELS[event.type],
+    });
+    observeAccumulatorName(acc, event.displayName, event.observedAt);
+  }
 
-    names.sort((left, right) => {
+  function emptyProfileLocalFacts() {
+    return {
+      currentName: null,
+      currentNameObservedAt: null,
+      historicalNames: [],
+      earliestLocalRecord: null,
+      recentRelationshipEvent: null,
+    };
+  }
+
+  function finalizeProfileLocalFactsAccumulator(acc) {
+    if (acc.finalized !== null) return acc.finalized;
+    acc.names.sort((left, right) => {
       const timeDifference =
         Date.parse(left.observedAt) - Date.parse(right.observedAt);
       return timeDifference || left.order - right.order;
     });
-    if (currentName === null && names.length > 0) {
-      currentName = names[names.length - 1].name;
-      currentNameObservedAt = Date.parse(names[names.length - 1].observedAt);
+    let currentName = acc.currentName;
+    let currentNameObservedAt = acc.currentNameObservedAt;
+    if (currentName === null && acc.names.length > 0) {
+      currentName = acc.names[acc.names.length - 1].name;
+      currentNameObservedAt = Date.parse(
+        acc.names[acc.names.length - 1].observedAt
+      );
     }
     const seenNames = new Set();
     const historicalNames = [];
-    for (const observation of names) {
+    for (const observation of acc.names) {
       if (
         observation.name === currentName ||
         seenNames.has(observation.name)
@@ -1670,16 +1707,23 @@
       seenNames.add(observation.name);
       historicalNames.push(observation.name);
     }
-    relationshipEvents.sort(
+    acc.relationshipEvents.sort(
       (left, right) =>
         Date.parse(right.observedAt) - Date.parse(left.observedAt)
     );
-    const earliestLocalRecord = evidenceTimes.length
-      ? new Date(
-          Math.min(...evidenceTimes.map((value) => Date.parse(value)))
-        ).toISOString()
+    let minEvidenceMs = Number.POSITIVE_INFINITY;
+    for (const value of acc.evidenceTimes) {
+      const ms = Date.parse(value);
+      if (Number.isNaN(ms)) {
+        minEvidenceMs = Number.NaN;
+        break;
+      }
+      if (ms < minEvidenceMs) minEvidenceMs = ms;
+    }
+    const earliestLocalRecord = acc.evidenceTimes.length
+      ? new Date(minEvidenceMs).toISOString()
       : null;
-    return {
+    acc.finalized = {
       currentName,
       // When the name above was recorded, so it is never presented as live.
       currentNameObservedAt: Number.isFinite(currentNameObservedAt)
@@ -1687,8 +1731,92 @@
         : null,
       historicalNames,
       earliestLocalRecord,
-      recentRelationshipEvent: relationshipEvents[0] || null,
+      recentRelationshipEvent: acc.relationshipEvents[0] || null,
     };
+    return acc.finalized;
+  }
+
+  function buildProfileLocalFactsIndex(friendState, followerState) {
+    const buckets = new Map();
+    const bucketFor = (uid) => {
+      let bucket = buckets.get(uid);
+      if (!bucket) {
+        bucket = createProfileLocalFactsAccumulator();
+        buckets.set(uid, bucket);
+      }
+      return bucket;
+    };
+    if (friendState && friendState.latestSnapshot) {
+      const snapshot = friendState.latestSnapshot;
+      for (const record of snapshot.records) {
+        const acc = bucketFor(record.uid);
+        if (acc.seenFriendSnapshot) continue;
+        acc.seenFriendSnapshot = true;
+        observeAccumulatorCurrentName(acc, record.screenName, snapshot.capturedAt);
+        observeAccumulatorName(acc, record.screenName, snapshot.capturedAt);
+      }
+    }
+    if (friendState) {
+      for (const event of friendState.events) {
+        observeFriendEventOnAccumulator(bucketFor(event.subjectUid), event);
+      }
+    }
+    if (followerState && followerState.latestSnapshot) {
+      const snapshot = followerState.latestSnapshot;
+      for (const record of snapshot.records) {
+        const acc = bucketFor(record.uid);
+        if (acc.seenFollowerSnapshot) continue;
+        acc.seenFollowerSnapshot = true;
+        observeAccumulatorCurrentName(acc, record.screenName, snapshot.capturedAt);
+        observeAccumulatorName(acc, record.screenName, snapshot.capturedAt);
+      }
+    }
+    if (followerState) {
+      for (const event of followerState.events) {
+        observeFollowerEventOnAccumulator(bucketFor(event.uid), event);
+      }
+    }
+    return {
+      get(targetUid) {
+        const acc = buckets.get(targetUid);
+        return acc
+          ? finalizeProfileLocalFactsAccumulator(acc)
+          : emptyProfileLocalFacts();
+      },
+    };
+  }
+
+  function deriveProfileLocalFacts(targetUid, friendState, followerState) {
+    const acc = createProfileLocalFactsAccumulator();
+    if (friendState && friendState.latestSnapshot) {
+      const snapshot = friendState.latestSnapshot;
+      const record = snapshot.records.find((entry) => entry.uid === targetUid);
+      if (record) {
+        observeAccumulatorCurrentName(acc, record.screenName, snapshot.capturedAt);
+        observeAccumulatorName(acc, record.screenName, snapshot.capturedAt);
+      }
+    }
+    if (friendState) {
+      for (const event of friendState.events) {
+        if (event.subjectUid !== targetUid) continue;
+        observeFriendEventOnAccumulator(acc, event);
+      }
+    }
+    if (followerState && followerState.latestSnapshot) {
+      const snapshot = followerState.latestSnapshot;
+      const record = snapshot.records.find((entry) => entry.uid === targetUid);
+      if (record) {
+        observeAccumulatorCurrentName(acc, record.screenName, snapshot.capturedAt);
+        observeAccumulatorName(acc, record.screenName, snapshot.capturedAt);
+      }
+    }
+    if (followerState) {
+      for (const event of followerState.events) {
+        if (event.uid !== targetUid) continue;
+        observeFollowerEventOnAccumulator(acc, event);
+      }
+    }
+    return finalizeProfileLocalFactsAccumulator(acc);
   }
 
   function loadProfileLocalFacts(ownerUid, targetUid) {
@@ -1752,7 +1880,7 @@
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value);
     const pad = (part) => String(part).padStart(2, "0");
-    return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
       date.getDate()
     )}`;
   }
@@ -1819,6 +1947,73 @@
     }
   }
 
+  function collectFocusableControls(root) {
+    const focusables = [];
+    if (!root) return focusables;
+    const visit = (parent) => {
+      const closedDetails = parent.tagName === "DETAILS" && !parent.open;
+      for (const child of elementChildren(parent)) {
+        if (child.hidden) continue;
+        if (closedDetails && child.tagName !== "SUMMARY") continue;
+        const tabIndexAttr =
+          typeof child.getAttribute === "function"
+            ? child.getAttribute("tabindex")
+            : null;
+        const tag = child.tagName;
+        const inherentlyFocusable =
+          tag === "BUTTON" ||
+          tag === "INPUT" ||
+          tag === "SELECT" ||
+          tag === "TEXTAREA" ||
+          tag === "SUMMARY" ||
+          (tag === "A" &&
+            Boolean(
+              child.href ||
+                (typeof child.getAttribute === "function" &&
+                  child.getAttribute("href"))
+            ));
+        if (
+          !child.disabled &&
+          tabIndexAttr !== "-1" &&
+          (inherentlyFocusable || tabIndexAttr === "0") &&
+          (typeof child.getClientRects !== "function" ||
+            child.getClientRects().length > 0)
+        ) {
+          focusables.push(child);
+        }
+        visit(child);
+      }
+    };
+    visit(root);
+    return focusables;
+  }
+
+  function trapDialogTabKey(event, root) {
+    if (!event || event.key !== "Tab" || !root) return;
+    const focusable = collectFocusableControls(root);
+    if (focusable.length === 0) {
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !focusable.includes(active))) {
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      if (typeof last.focus === "function") last.focus();
+    } else if (
+      !event.shiftKey &&
+      (active === last ||
+        !active ||
+        !root.contains(active) ||
+        (typeof active.getAttribute === "function" &&
+          active.getAttribute("tabindex") === "-1"))
+    ) {
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      if (typeof first.focus === "function") first.focus();
+    }
+  }
+
   function openProfileNicknamePopover(trigger, names) {
     if (!trigger || !trigger.parentNode || !Array.isArray(names)) return false;
     closeProfileNicknamePopover();
@@ -1830,6 +2025,7 @@
     popover.id = "wfr-profile-name-popover";
     popover.setAttribute("role", "dialog");
     popover.setAttribute("aria-label", "本地记录过的昵称");
+    popover.setAttribute("tabindex", "-1");
     const header = createElement("div", null, "wfr-profile-name-popover-header");
     header.append(createElement("strong", "本地记录过的昵称"));
     const closeButton = createElement(
@@ -1857,13 +2053,14 @@
       closeProfileNicknamePopover();
     };
     const onKeydown = (event) => {
-      if (
-        panelRoot === null &&
-        event &&
-        !event.defaultPrevented &&
-        event.key === "Escape"
-      ) {
+      if (panelRoot !== null || !event || event.defaultPrevented) return;
+      if (event.key === "Escape") {
+        if (typeof event.preventDefault === "function") event.preventDefault();
         closeProfileNicknamePopover(true);
+        return;
+      }
+      if (event.key === "Tab") {
+        trapDialogTabKey(event, popover);
       }
     };
     activeProfileNicknamePopover = {
@@ -1879,6 +2076,7 @@
       document.addEventListener("click", onDocumentClick, true);
       document.addEventListener("keydown", onKeydown);
     }
+    if (typeof closeButton.focus === "function") closeButton.focus();
     return true;
   }
 
@@ -2059,12 +2257,41 @@
     ) {
       teardownProfileExtras();
       const visitedAt = new Date().toISOString();
-      activeProfileContext = {
-        ownerUid: owner.uid,
-        targetUid,
-        facts: loadProfileLocalFacts(owner.uid, targetUid),
-        visit: recordProfileVisit(owner.uid, targetUid, visitedAt),
-      };
+      const ownerUid = owner.uid;
+      if (pageLockManager() === null) {
+        activeProfileContext = {
+          ownerUid,
+          targetUid,
+          facts: loadProfileLocalFacts(ownerUid, targetUid),
+          visit: recordProfileVisit(ownerUid, targetUid, visitedAt),
+        };
+      } else {
+        const context = {
+          ownerUid,
+          targetUid,
+          facts: loadProfileLocalFacts(ownerUid, targetUid),
+          visit: { ok: false, pending: true },
+        };
+        activeProfileContext = context;
+        void withExclusiveStateLock(
+          PROFILE_VISIT_LOCK_PREFIX + ownerUid,
+          async () => recordProfileVisit(ownerUid, targetUid, visitedAt)
+        )
+          .then((visitResult) => {
+            if (activeProfileContext !== context) return;
+            // An untakable lock must not cost the visit: recording without it
+            // is what this path did before the lock existed.
+            context.visit =
+              visitResult && visitResult.failureKind === "STATE_LOCK_UNAVAILABLE"
+                ? recordProfileVisit(ownerUid, targetUid, visitedAt)
+                : visitResult;
+            removeProfileExtrasNode();
+            ensureProfileExtras();
+          })
+          // Best effort only: the context keeps the visit, so the next route
+          // change or host mutation re-ensures and renders it.
+          .catch(() => {});
+      }
     }
 
     if (!profileContextHasContent(activeProfileContext)) {

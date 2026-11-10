@@ -1,7 +1,16 @@
 
   function formatTime(value) {
     const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+    if (Number.isNaN(date.getTime())) return String(value);
+    const pad = (part) => String(part).padStart(2, "0");
+    return (
+      `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+        date.getDate()
+      )} ` +
+      `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(
+        date.getSeconds()
+      )}`
+    );
   }
 
   // Minute precision for compact headers; the stored timestamp is untouched.
@@ -10,7 +19,9 @@
     if (Number.isNaN(date.getTime())) return String(value);
     const pad = (part) => String(part).padStart(2, "0");
     return (
-      `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()} ` +
+      `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+        date.getDate()
+      )} ` +
       `${pad(date.getHours())}:${pad(date.getMinutes())}`
     );
   }
@@ -95,7 +106,10 @@
     if (needle === "") return true;
     return (
       event.subjectUid.includes(needle) ||
-      event.displayName.toLowerCase().includes(needle)
+      event.displayName.toLowerCase().includes(needle) ||
+      (event.type === EVENT.SCREEN_NAME_CHANGED &&
+        typeof event.previous?.screenName === "string" &&
+        event.previous.screenName.toLowerCase().includes(needle))
     );
   }
 
@@ -103,7 +117,33 @@
     return events.filter((event) => matchesEventQuery(event, query));
   }
 
-  function renderEvents(ownerUid, state, notice, initialQuery = "") {
+  function renderEvents(ownerUid, state, notice, initialQueryOrView = "") {
+    const view =
+      typeof initialQueryOrView === "string"
+        ? {
+            query: initialQueryOrView,
+            shown: FRIEND_NOTES_PAGE_SIZE,
+            scrollTop: 0,
+          }
+        : {
+            query:
+              initialQueryOrView && typeof initialQueryOrView.query === "string"
+                ? initialQueryOrView.query
+                : "",
+            shown:
+              initialQueryOrView &&
+              typeof initialQueryOrView.shown === "number" &&
+              Number.isFinite(initialQueryOrView.shown) &&
+              initialQueryOrView.shown >= FRIEND_NOTES_PAGE_SIZE
+                ? initialQueryOrView.shown
+                : FRIEND_NOTES_PAGE_SIZE,
+            scrollTop:
+              initialQueryOrView &&
+              typeof initialQueryOrView.scrollTop === "number" &&
+              Number.isFinite(initialQueryOrView.scrollTop)
+                ? initialQueryOrView.scrollTop
+                : 0,
+          };
     const body = showPanel("关系事件", true);
     if (notice) body.append(createElement("p", notice, "wfr-success"));
     // Opening the list only reflects read state; it never changes it.
@@ -111,6 +151,9 @@
     showUnreadBadge(unread);
     addLine(body, "事件总数", state.events.length);
     addLine(body, "未读", unread);
+
+    let search = null;
+    let shown = 0;
 
     if (unread > 0) {
       const markButton = createElement("button", "全部标为已读", "wfr-button wfr-primary");
@@ -136,18 +179,17 @@
           showFailure("标记失败", saved);
           return;
         }
-        renderEvents(
-          ownerUid,
-          saved.state,
-          "全部事件已标为已读。",
-          String(search ? search.value || "" : initialQuery)
-        );
+        renderEvents(ownerUid, saved.state, "全部事件已标为已读。", {
+          query: String(search ? search.value || "" : view.query),
+          shown: Math.max(FRIEND_NOTES_PAGE_SIZE, shown || view.shown),
+          scrollTop: Number(body.scrollTop) || 0,
+        });
       });
       body.append(markButton);
     }
 
     if (state.events.length === 0) {
-      body.append(createElement("p", "暂无事件", "wfr-muted wfr-empty"));
+      body.append(createElement("p", "暂无事件。", "wfr-muted wfr-empty"));
       return;
     }
 
@@ -170,30 +212,60 @@
       )
     );
 
-    const search = createElement("input", null, "wfr-search");
+    search = createElement("input", null, "wfr-search");
     search.type = "search";
-    search.placeholder = "搜索昵称或 UID";
-    search.setAttribute("aria-label", "搜索昵称或 UID");
-    search.value = initialQuery;
+    search.placeholder = "搜索昵称、旧昵称或 UID";
+    search.setAttribute("aria-label", "搜索昵称、旧昵称或 UID");
+    search.value = view.query;
     body.append(search);
 
+    const summary = createElement("p", "", "wfr-muted");
+    summary.setAttribute("role", "status");
+    summary.setAttribute("aria-live", "polite");
     const list = createElement("div", null, "wfr-event-list");
-    body.append(list);
+    const moreActions = createElement("div", null, "wfr-actions");
+    const moreButton = createElement("button", "加载更多", "wfr-button");
+    moreButton.type = "button";
+    moreActions.append(moreButton);
+    body.append(summary, list, moreActions);
 
     const newestFirst = sortEventsNewestFirst(state.events);
+    const totalAccounts = new Set(newestFirst.map((event) => event.subjectUid)).size;
     // Read once per render of the page; the cards only need to know whether a
     // note exists. Unreadable notes simply mean no shortcut is offered.
     const notesLoaded = loadFriendNotesState(ownerUid);
     const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
-    const returnToEvents = () =>
-      renderEvents(ownerUid, state, null, String(search.value || ""));
-    function renderList(query) {
-      while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
-      const matching = filterEvents(newestFirst, query);
-      if (matching.length === 0) {
-        list.append(createElement("p", "没有匹配的事件", "wfr-muted wfr-empty"));
-        return;
+    const captureReturnToEvents = () => {
+      const savedView = {
+        query: String(search.value || ""),
+        shown: Math.max(FRIEND_NOTES_PAGE_SIZE, shown),
+        scrollTop: Number(body.scrollTop) || 0,
+      };
+      return () => {
+        const fresh = loadState(ownerUid);
+        renderEvents(ownerUid, fresh.ok ? fresh.state : state, null, savedView);
+      };
+    };
+
+    let groupList = [];
+
+    function renderMore(batchSize = FRIEND_NOTES_PAGE_SIZE) {
+      const next = groupList.slice(shown, shown + batchSize);
+      for (const group of next) {
+        list.append(
+          buildEventCard(ownerUid, state, group, notedUids, captureReturnToEvents)
+        );
       }
+      shown += next.length;
+      const remaining = groupList.length - shown;
+      moreActions.hidden = remaining <= 0;
+      moreButton.textContent = `加载更多（还有 ${remaining} 条）`;
+    }
+
+    function renderList(query, initialLimit = FRIEND_NOTES_PAGE_SIZE) {
+      clearNode(list);
+      shown = 0;
+      const matching = filterEvents(newestFirst, query);
       // One card per account, placed where its newest matching event falls.
       // The card shows that newest event; the rest are one click away in the
       // account's timeline, so an account that changed often no longer fills
@@ -204,22 +276,29 @@
         if (group) group.push(event);
         else groups.set(event.subjectUid, [event]);
       }
-      for (const group of groups.values()) {
-        list.append(
-          buildEventCard(ownerUid, state, group, notedUids, returnToEvents)
-        );
+      groupList = [...groups.values()];
+      summary.textContent =
+        matching.length === newestFirst.length
+          ? `共 ${totalAccounts} 个账号（${newestFirst.length} 条事件）`
+          : `共 ${totalAccounts} 个账号（${newestFirst.length} 条事件），匹配 ${groupList.length} 个账号（${matching.length} 条事件）`;
+      if (groupList.length === 0) {
+        list.append(createElement("p", "没有匹配的事件。", "wfr-muted wfr-empty"));
       }
+      renderMore(initialLimit);
     }
+
     search.addEventListener("input", () => renderList(search.value || ""));
-    renderList(initialQuery);
+    moreButton.addEventListener("click", () => renderMore());
+    renderList(view.query, view.shown);
+    if (view.scrollTop > 0) body.scrollTop = view.scrollTop;
   }
 
   // group: the matching events of one account, newest first.
-  function buildEventCard(ownerUid, state, group, notedUids, onReturn) {
-    const returnToEvents =
-      typeof onReturn === "function"
-        ? onReturn
-        : () => renderEvents(ownerUid, state, null);
+  function buildEventCard(ownerUid, state, group, notedUids, captureReturn) {
+    const captureReturnToEvents =
+      typeof captureReturn === "function"
+        ? captureReturn
+        : () => () => renderEvents(ownerUid, state, null);
     const event = group[0];
     const read = group.every((entry) => entry.read);
     const item = createElement(
@@ -235,6 +314,7 @@
     );
     addLine(item, "时间", formatTime(event.detectedAt));
     addLine(item, "名称", event.displayName);
+    addLine(item, "UID", event.subjectUid);
     if (event.type === EVENT.SCREEN_NAME_CHANGED) {
       addLine(item, "变化", describeEvent(event));
     }
@@ -242,7 +322,7 @@
     const detailButton = createElement("button", "详情", "wfr-button");
     detailButton.type = "button";
     detailButton.addEventListener("click", () =>
-      showEventDetail(ownerUid, state, event, returnToEvents)
+      showEventDetail(ownerUid, state, event, captureReturnToEvents())
     );
     actions.append(detailButton);
     // The whole stored history of the account, not just what the search
@@ -251,15 +331,16 @@
     if (historyCount > 1) {
       const moreButton = createElement(
         "button",
-        `该账号共 ${historyCount} 条事件`,
+        `关系时间线（${historyCount} 条事件）`,
         "wfr-button"
       );
       moreButton.type = "button";
       moreButton.addEventListener("click", () =>
-        showTimeline(ownerUid, state, event.subjectUid, returnToEvents)
+        showTimeline(ownerUid, state, event.subjectUid, captureReturnToEvents())
       );
       actions.append(moreButton);
     }
+    actions.append(createFriendNoteProfileLink(event.subjectUid));
     if (notedUids !== null) {
       const noteButton = createElement(
         "button",
@@ -268,7 +349,7 @@
       );
       noteButton.type = "button";
       noteButton.addEventListener("click", () =>
-        showFriendNoteDetail(ownerUid, event.subjectUid, null, returnToEvents)
+        showFriendNoteDetail(ownerUid, event.subjectUid, null, captureReturnToEvents())
       );
       actions.append(noteButton);
     }
@@ -295,11 +376,8 @@
       addLine(body, "变化前", transition.previous);
       addLine(body, "变化后", transition.current);
     }
-    addLine(
-      body,
-      "该 UID 的已存事件",
-      eventsForSubject(state.events, event.subjectUid).length
-    );
+    const historyCount = eventsForSubject(state.events, event.subjectUid).length;
+    addLine(body, "该 UID 的已存事件", historyCount);
 
     if (event.type === EVENT.VISIBLE_FOLLOWING_DISAPPEARED) {
       body.append(
@@ -311,33 +389,68 @@
       );
     }
 
+    const actions = createElement("div", null, "wfr-actions");
     const timelineButton = createElement(
       "button",
-      "查看关系时间线",
+      `关系时间线（${historyCount} 条事件）`,
       "wfr-button wfr-primary"
     );
     timelineButton.type = "button";
+    const reopenDetail = () =>
+      showEventDetail(ownerUid, state, event, backToEvents);
     timelineButton.addEventListener("click", () =>
-      showTimeline(ownerUid, state, event.subjectUid, () =>
-        showEventDetail(ownerUid, state, event, backToEvents)
-      )
+      showTimeline(ownerUid, state, event.subjectUid, reopenDetail)
     );
-    body.append(timelineButton);
+    actions.append(timelineButton, createFriendNoteProfileLink(event.subjectUid));
+    const notesLoaded = loadFriendNotesState(ownerUid);
+    if (notesLoaded.ok) {
+      const noteButton = createElement(
+        "button",
+        hasOwn(notesLoaded.state.notes, event.subjectUid) ? "友人档案" : "写档案",
+        "wfr-button"
+      );
+      noteButton.type = "button";
+      noteButton.addEventListener("click", () =>
+        showFriendNoteDetail(ownerUid, event.subjectUid, null, reopenDetail)
+      );
+      actions.append(noteButton);
+    }
+    body.append(actions);
   }
 
   function showTimeline(ownerUid, state, subjectUid, onBack) {
     const history = eventsForSubject(state.events, subjectUid);
-    const body = showPanel(
-      `${bestDisplayName(state, subjectUid)} · 关系时间线`,
+    const backAction =
       typeof onBack === "function"
         ? onBack
-        : () => renderEvents(ownerUid, state, null)
+        : () => renderEvents(ownerUid, state, null);
+    const body = showPanel(
+      `${bestDisplayName(state, subjectUid)} · 关系时间线`,
+      backAction
     );
     addLine(body, "UID", subjectUid);
     addLine(body, "历史事件", history.length);
+    const actions = createElement("div", null, "wfr-actions wfr-compact-actions");
+    actions.append(createFriendNoteProfileLink(subjectUid));
+    const notesLoaded = loadFriendNotesState(ownerUid);
+    if (notesLoaded.ok) {
+      const noteButton = createElement(
+        "button",
+        hasOwn(notesLoaded.state.notes, subjectUid) ? "友人档案" : "写档案",
+        "wfr-button"
+      );
+      noteButton.type = "button";
+      noteButton.addEventListener("click", () =>
+        showFriendNoteDetail(ownerUid, subjectUid, null, () =>
+          showTimeline(ownerUid, state, subjectUid, backAction)
+        )
+      );
+      actions.append(noteButton);
+    }
+    body.append(actions);
 
     if (history.length === 0) {
-      body.append(createElement("p", "暂无事件", "wfr-muted wfr-empty"));
+      body.append(createElement("p", "暂无事件。", "wfr-muted wfr-empty"));
       return;
     }
 
@@ -389,7 +502,7 @@
     addLine(body, "已有快照", snapshot ? "是" : "否");
     if (snapshot) {
       addLine(body, "上次成功更新", formatTime(snapshot.capturedAt));
-      addLine(body, "API可见关注", snapshot.visibleCount);
+      addLine(body, "API 可见关注", snapshot.visibleCount);
       addLine(body, "接口总数", snapshot.reportedTotal);
       addLine(
         body,

@@ -1,20 +1,43 @@
 "use strict";
 
+const fs = require("node:fs");
+const path = require("node:path");
 const { loadProductFunctions } = require("./product-loader");
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-const product = loadProductFunctions([
-  "normalizeStableUid",
-  "diffSnapshots",
-  "diffFollowerSnapshots",
-  "filterFollowerSnapshot",
-  "deriveUsageHistorySummary",
-  "filterOverviewFollowingRecords",
-  "matchesFollowerEventQuery",
-]);
+const gmStore = new Map();
+const product = loadProductFunctions(
+  [
+    "APP_VERSION",
+    "CHANGELOG_BY_VERSION",
+    "bundledReleaseVersionsThrough",
+    "normalizeStableUid",
+    "diffSnapshots",
+    "diffFollowerSnapshots",
+    "filterFollowerSnapshot",
+    "deriveUsageHistorySummary",
+    "filterOverviewFollowingRecords",
+    "matchesFollowerEventQuery",
+    "matchesEventQuery",
+    "deriveProfileLocalFacts",
+    "buildProfileLocalFactsIndex",
+    "profileVisitStorageKey",
+    "loadProfileVisits",
+    "recordProfileVisit",
+    "MAX_PROFILE_VISIT_ENTRIES",
+  ],
+  {
+    GM_getValue(key, fallback) {
+      return gmStore.has(key) ? gmStore.get(key) : fallback;
+    },
+    GM_setValue(key, value) {
+      gmStore.set(key, JSON.parse(JSON.stringify(value)));
+    },
+  }
+);
 
 assert(product.normalizeStableUid(123) === "123", "safe numeric UID rejected");
 assert(product.normalizeStableUid(" 123 ") === "123", "canonical string UID rejected");
@@ -143,6 +166,86 @@ assert(
   product.matchesFollowerEventQuery({ uid: "2001", displayName: "海边的岚" }, "海边") === true &&
     product.matchesFollowerEventQuery({ uid: "2001", displayName: "海边的岚" }, "9999") === false,
   "follower event search must match displayName or UID"
+);
+
+const userscriptSource = fs.readFileSync(
+  path.resolve(__dirname, "..", "weibo-toolkit.user.js"),
+  "utf8"
+);
+const metadataVersionMatch = userscriptSource.match(/^\/\/\s*@version\s+(\S+)\s*$/m);
+const bundledVersions = product.bundledReleaseVersionsThrough(product.APP_VERSION);
+assert(
+  metadataVersionMatch !== null &&
+    metadataVersionMatch[1] === product.APP_VERSION &&
+    Object.prototype.hasOwnProperty.call(product.CHANGELOG_BY_VERSION, product.APP_VERSION) &&
+    bundledVersions[0] === product.APP_VERSION,
+  "userscript @version, APP_VERSION, and newest CHANGELOG_BY_VERSION entry must match"
+);
+
+const renameEvent = {
+  type: "SCREEN_NAME_CHANGED",
+  subjectUid: "100",
+  displayName: "新昵称",
+  previous: { screenName: "旧海边的岚" },
+  current: { screenName: "新昵称" },
+};
+assert(
+  product.matchesEventQuery(renameEvent, "旧海边") === true &&
+    product.matchesEventQuery(renameEvent, "新昵称") === true &&
+    product.matchesEventQuery(renameEvent, "不存在") === false,
+  "Friend Radar event search must match previous.screenName on SCREEN_NAME_CHANGED"
+);
+
+const sampleFriendState = {
+  latestSnapshot: current,
+  events: radarEvents,
+};
+const sampleFollowerState = {
+  latestSnapshot: followerSnapshot("2026-01-03T00:00:00.000Z", [
+    { uid: "100", screenName: "粉丝侧昵称", createdAt: "2020-05-01T00:00:00.000Z" },
+  ]),
+  events: [],
+};
+const factsIndex = product.buildProfileLocalFactsIndex(
+  sampleFriendState,
+  sampleFollowerState
+);
+for (const uid of ["100", "200", "300", "999"]) {
+  assert(
+    JSON.stringify(factsIndex.get(uid)) ===
+      JSON.stringify(
+        product.deriveProfileLocalFacts(uid, sampleFriendState, sampleFollowerState)
+      ),
+    `buildProfileLocalFactsIndex must match deriveProfileLocalFacts for UID ${uid}`
+  );
+}
+
+const seedVisits = {};
+for (let index = 1; index <= product.MAX_PROFILE_VISIT_ENTRIES + 4; index += 1) {
+  seedVisits[String(10000 + index)] = {
+    count: 1,
+    lastVisitedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+  };
+}
+gmStore.set(product.profileVisitStorageKey("1"), seedVisits);
+const visitRecorded = product.recordProfileVisit(
+  "1",
+  String(10000 + product.MAX_PROFILE_VISIT_ENTRIES + 5),
+  new Date(Date.UTC(2026, 0, 2, 0, 0, 0)).toISOString()
+);
+const loadedVisits = product.loadProfileVisits("1");
+assert(
+  visitRecorded.ok &&
+    loadedVisits.ok &&
+    Object.keys(loadedVisits.visits).length === product.MAX_PROFILE_VISIT_ENTRIES &&
+    !Object.prototype.hasOwnProperty.call(loadedVisits.visits, "10001") &&
+    !Object.prototype.hasOwnProperty.call(loadedVisits.visits, "10005") &&
+    Object.prototype.hasOwnProperty.call(loadedVisits.visits, "10006") &&
+    Object.prototype.hasOwnProperty.call(
+      loadedVisits.visits,
+      String(10000 + product.MAX_PROFILE_VISIT_ENTRIES + 5)
+    ),
+  "recordProfileVisit must cap stored profile visit entries by evicting oldest visits"
 );
 
 console.log("core product invariants passed");

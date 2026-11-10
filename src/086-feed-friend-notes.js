@@ -15,6 +15,17 @@
   // { ownerUid, subjectUid, editor, root, notice, entry, onKeydown, ... }
   let feedFriendNoteCard = null;
 
+  function anyFriendNoteEditorHasUnsavedChanges() {
+    return Boolean(
+      panelHoldsUnsavedNote() ||
+        (profileFriendNotesContext !== null &&
+          profileFriendNotesContext.editor &&
+          profileFriendNotesContext.editor.hasUnsavedChanges()) ||
+        (feedFriendNoteCard !== null &&
+          feedFriendNoteCard.editor.hasUnsavedChanges())
+    );
+  }
+
   function feedFriendNotesActiveForRoute() {
     return Boolean(
       pageCleanupPreferences.showFeedFriendNotes && isPageEnhancementFeedRoute()
@@ -139,7 +150,7 @@
   }
 
   // One read of each state per activation, shared by every card. The verified
-  // notes map and the per-UID derived facts are reused until the data is
+  // notes map and the pre-indexed local facts are reused until the data is
   // reloaded as a whole.
   function loadFeedFriendNotesData(ownerUid) {
     const notes = loadFriendNotesState(ownerUid);
@@ -148,21 +159,15 @@
     const follower = loadFollowerState(ownerUid);
     return {
       notes: notes.state.notes,
-      friendState: friend.ok ? friend.state : null,
-      followerState: follower.ok ? follower.state : null,
-      factsByUid: new Map(),
+      factsIndex: buildProfileLocalFactsIndex(
+        friend.ok ? friend.state : null,
+        follower.ok ? follower.state : null
+      ),
     };
   }
 
   function feedFriendNoteFacts(uid) {
-    const data = feedFriendNotes.data;
-    if (!data.factsByUid.has(uid)) {
-      data.factsByUid.set(
-        uid,
-        deriveProfileLocalFacts(uid, data.friendState, data.followerState)
-      );
-    }
-    return data.factsByUid.get(uid);
+    return feedFriendNotes.data.factsIndex.get(uid);
   }
 
   function reloadFeedFriendNotesData() {
@@ -244,10 +249,12 @@
         ? `友人档案：已为${who}写过备注，打开查看${hint === "" ? "" : `；${hint}`}`
         : `友人档案：为${who}写备注${hint === "" ? "" : `；${hint}`}`
     );
+    const baseTitle = hasNote ? "查看友人档案" : "为这位作者写备注";
     entry.button.setAttribute(
       "title",
-      hasNote ? "查看友人档案" : "为这位作者写备注"
+      hint === "" ? baseTitle : `${baseTitle}（${hint}）`
     );
+    setToolkitClass(entry.button, "wfr-feed-note-has-hint", hint !== "");
     entry.hintText = hint;
     entry.hint.textContent = hint;
     entry.hint.hidden = hint === "";
@@ -661,6 +668,7 @@
     const card = feedFriendNoteCard;
     if (card === null) return;
     feedFriendNoteCard = null;
+    syncBeforeUnloadGuard();
     if (typeof document.removeEventListener === "function") {
       document.removeEventListener("keydown", card.onKeydown);
       document.removeEventListener("click", card.onDocumentClick, true);
@@ -821,13 +829,19 @@
       resizeObserver: null,
       onKeydown: (event) => {
         if (
-          panelRoot === null &&
-          event &&
-          !event.defaultPrevented &&
-          event.key === "Escape" &&
-          !isFriendNoteImeKeyEvent(event)
+          panelRoot !== null ||
+          !event ||
+          event.defaultPrevented ||
+          isFriendNoteImeKeyEvent(event)
         ) {
+          return;
+        }
+        if (event.key === "Escape") {
           requestCloseFeedFriendNoteCard(true);
+          return;
+        }
+        if (event.key === "Tab") {
+          trapDialogTabKey(event, root);
         }
       },
       onDocumentClick: (event) => {

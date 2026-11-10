@@ -2,6 +2,8 @@
   function showPageSettings() {
     const body = showPanel("浏览体验", true);
     const status = createElement("p", "", "wfr-muted wfr-browse-status");
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
     const tabList = createElement("div", null, "wfr-browse-tabs");
     tabList.setAttribute("role", "tablist");
     tabList.setAttribute("aria-label", "浏览体验分类");
@@ -57,475 +59,309 @@
     const feedPanel = createBrowseTab("feed", "信息流", true);
     const enhancementPanel = createBrowseTab("enhancement", "增强", false);
     const cleanupPanel = createBrowseTab("cleanup", "净化", false);
-    body.append(tabList, feedPanel, enhancementPanel, cleanupPanel);
+    body.append(tabList, status, feedPanel, enhancementPanel, cleanupPanel);
 
-    function appendToggle(container, labelText, key, property, description) {
+    function appendPreferenceToggle(container, options) {
       const label = createElement(
         "label",
         null,
-        "wfr-toggle wfr-row wfr-setting-label"
+        options.suboption
+          ? "wfr-toggle wfr-row wfr-setting-label wfr-suboption"
+          : "wfr-toggle wfr-row wfr-setting-label"
       );
       const input = createElement("input");
       input.type = "checkbox";
-      input.checked = pageCleanupPreferences[property];
-      input.setAttribute("aria-label", labelText);
-      label.append(input, createElement("span", labelText));
+      input.checked = options.read() === true;
+      input.setAttribute("aria-label", options.label);
+      label.append(input, createElement("span", options.label));
       input.addEventListener("change", () => {
-        const previous = pageCleanupPreferences[property];
+        const previous = options.read();
         const next = input.checked === true;
-        const saved = savePageCleanupPreference(key, next);
+        const saved = savePageCleanupPreference(options.key, next);
         if (!saved.ok) {
           input.checked = previous;
-          status.textContent = "页面净化偏好未能保存，微博页面未改变。";
+          status.textContent = options.saveErrorText;
           return;
         }
-        pageCleanupPreferences[property] = next;
-        try {
-          applyPageCleanupStyles();
-        } catch (_) {
-          pageCleanupPreferences[property] = previous;
-          savePageCleanupPreference(key, previous);
-          input.checked = previous;
+        options.write(next);
+        if (typeof options.apply === "function") {
           try {
-            applyPageCleanupStyles();
+            const applied = options.apply(next);
+            if (applied === false) {
+              options.write(previous);
+              savePageCleanupPreference(options.key, previous);
+              input.checked = previous;
+              if (typeof options.recover === "function") options.recover(previous);
+              status.textContent = options.applyErrorText;
+              return;
+            }
           } catch (_) {
-            // Preferences remain fail-closed if presentation recovery also fails.
+            options.write(previous);
+            savePageCleanupPreference(options.key, previous);
+            input.checked = previous;
+            if (typeof options.recover === "function") {
+              try {
+                options.recover(previous);
+              } catch (_) {
+                // Preferences remain fail-closed if presentation recovery also fails.
+              }
+            }
+            status.textContent = options.applyErrorText;
+            return;
           }
-          status.textContent = "页面净化偏好未能应用，微博页面未改变。";
-          return;
         }
-        status.textContent = next ? "已隐藏所选页面组件。" : "已恢复所选页面组件。";
+        status.textContent = options.successText(next);
       });
       container.append(label);
-      if (description) {
+      if (options.description) {
         container.append(
           createElement(
             "p",
-            description,
-            "wfr-muted wfr-setting-description"
+            options.description,
+            options.suboption
+              ? "wfr-muted wfr-setting-description wfr-suboption-description"
+              : "wfr-muted wfr-setting-description"
           )
         );
       }
     }
 
-    const latestLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const latestInput = createElement("input");
-    latestInput.type = "checkbox";
-    latestInput.checked = preferLatestFeed;
-    latestInput.setAttribute("aria-label", "首页优先进入最新微博");
-    latestLabel.append(latestInput, createElement("span", "首页优先进入最新微博"));
-    latestInput.addEventListener("change", () => {
-      const previous = preferLatestFeed;
-      const next = latestInput.checked === true;
-      const saved = savePageCleanupPreference(PREFER_LATEST_FEED_KEY, next);
-      if (!saved.ok) {
-        latestInput.checked = previous;
-        status.textContent = "浏览体验偏好未能保存。";
-        return;
-      }
-      preferLatestFeed = next;
-      if (!next) latestFeedNavigationPending = false;
-      status.textContent = next
-        ? "每个标签页首次进入微博首页时将打开最新微博。"
-        : "已停止自动进入最新微博。";
-    });
-    feedPanel.append(
-      latestLabel,
-      createElement(
-        "p",
+    function appendToggle(container, labelText, key, property, description) {
+      appendPreferenceToggle(container, {
+        label: labelText,
+        key,
+        read: () => pageCleanupPreferences[property],
+        write: (next) => {
+          pageCleanupPreferences[property] = next;
+        },
+        apply: () => {
+          applyPageCleanupStyles();
+        },
+        recover: () => {
+          applyPageCleanupStyles();
+        },
+        saveErrorText: "页面净化偏好未能保存，微博页面未改变。",
+        applyErrorText: "页面净化偏好未能应用，微博页面未改变。",
+        successText: (next) =>
+          next ? "已隐藏所选页面组件。" : "已恢复所选页面组件。",
+        description,
+      });
+    }
+
+    const applyFeedFilterPreferences = () => {
+      applyPageCleanupStyles();
+      installLatestFeedRecommendationFilter();
+    };
+
+    appendPreferenceToggle(feedPanel, {
+      label: "首页优先进入最新微博",
+      key: PREFER_LATEST_FEED_KEY,
+      read: () => preferLatestFeed,
+      write: (next) => {
+        preferLatestFeed = next;
+        if (!next) latestFeedNavigationPending = false;
+      },
+      saveErrorText: "浏览体验偏好未能保存。",
+      successText: (next) =>
+        next
+          ? "每个标签页首次进入微博首页时将打开最新微博。"
+          : "已停止自动进入最新微博。",
+      description:
         "每个标签页首次打开微博首页时自动进入按时间排序的“最新微博”。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
+    });
 
-    const latestRecommendedLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const latestRecommendedInput = createElement("input");
-    latestRecommendedInput.type = "checkbox";
-    latestRecommendedInput.checked =
-      pageCleanupPreferences.hideLatestRecommended;
-    latestRecommendedInput.setAttribute(
-      "aria-label",
-      "隐藏信息流中的推广内容"
-    );
-    latestRecommendedLabel.append(
-      latestRecommendedInput,
-      createElement("span", "隐藏信息流中的推广内容")
-    );
-    latestRecommendedInput.addEventListener("change", () => {
-      const previous = pageCleanupPreferences.hideLatestRecommended;
-      const next = latestRecommendedInput.checked === true;
-      const saved = savePageCleanupPreference(
-        HIDE_LATEST_RECOMMENDED_KEY,
+    appendPreferenceToggle(feedPanel, {
+      label: "隐藏信息流中的推广内容",
+      key: HIDE_LATEST_RECOMMENDED_KEY,
+      read: () => pageCleanupPreferences.hideLatestRecommended,
+      write: (next) => {
+        pageCleanupPreferences.hideLatestRecommended = next;
+      },
+      apply: applyFeedFilterPreferences,
+      recover: applyFeedFilterPreferences,
+      saveErrorText: "浏览体验偏好未能保存。",
+      applyErrorText: "“荐读”隐藏设置未能应用，微博内容未改变。",
+      successText: (next) =>
         next
-      );
-      if (!saved.ok) {
-        latestRecommendedInput.checked = previous;
-        status.textContent = "浏览体验偏好未能保存。";
-        return;
-      }
-      pageCleanupPreferences.hideLatestRecommended = next;
-      try {
-        applyPageCleanupStyles();
-        installLatestFeedRecommendationFilter();
-      } catch (_) {
-        pageCleanupPreferences.hideLatestRecommended = previous;
-        savePageCleanupPreference(HIDE_LATEST_RECOMMENDED_KEY, previous);
-        latestRecommendedInput.checked = previous;
-        try {
-          applyPageCleanupStyles();
-          installLatestFeedRecommendationFilter();
-        } catch (_) {
-          // The previous fail-closed state remains the recovery boundary.
-        }
-        status.textContent = "“荐读”隐藏设置未能应用，微博内容未改变。";
-        return;
-      }
-      status.textContent = next
-        ? "已隐藏首页和“最新微博”中明确标记为“荐读”的内容。"
-        : "已停止隐藏信息流推广内容；强力规则偏好会保留但不生效。";
+          ? "已隐藏首页和“最新微博”中明确标记为“荐读”的内容。"
+          : "已停止隐藏信息流推广内容；强力规则偏好会保留但不生效。",
+      description: "默认仅隐藏明确标记为“荐读”的内容。",
     });
-    feedPanel.append(
-      latestRecommendedLabel,
-      createElement(
-        "p",
-        "默认仅隐藏明确标记为“荐读”的内容。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
 
-    const strongPromotionLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label wfr-suboption"
-    );
-    const strongPromotionInput = createElement("input");
-    strongPromotionInput.type = "checkbox";
-    strongPromotionInput.checked =
-      pageCleanupPreferences.strongFeedPromotionFilter;
-    strongPromotionInput.setAttribute(
-      "aria-label",
-      "使用强力规则（可能误伤）"
-    );
-    strongPromotionLabel.append(
-      strongPromotionInput,
-      createElement("span", "使用强力规则（可能误伤）")
-    );
-    strongPromotionInput.addEventListener("change", () => {
-      const previous = pageCleanupPreferences.strongFeedPromotionFilter;
-      const next = strongPromotionInput.checked === true;
-      const saved = savePageCleanupPreference(
-        STRONG_FEED_PROMOTION_FILTER_KEY,
+    appendPreferenceToggle(feedPanel, {
+      label: "使用强力规则（可能误伤）",
+      key: STRONG_FEED_PROMOTION_FILTER_KEY,
+      suboption: true,
+      read: () => pageCleanupPreferences.strongFeedPromotionFilter,
+      write: (next) => {
+        pageCleanupPreferences.strongFeedPromotionFilter = next;
+      },
+      apply: applyFeedFilterPreferences,
+      recover: applyFeedFilterPreferences,
+      saveErrorText: "强力过滤偏好未能保存。",
+      applyErrorText: "强力过滤规则未能应用，微博内容未改变。",
+      successText: (next) =>
         next
-      );
-      if (!saved.ok) {
-        strongPromotionInput.checked = previous;
-        status.textContent = "强力过滤偏好未能保存。";
-        return;
-      }
-      pageCleanupPreferences.strongFeedPromotionFilter = next;
-      try {
-        applyPageCleanupStyles();
-        installLatestFeedRecommendationFilter();
-      } catch (_) {
-        pageCleanupPreferences.strongFeedPromotionFilter = previous;
-        savePageCleanupPreference(STRONG_FEED_PROMOTION_FILTER_KEY, previous);
-        strongPromotionInput.checked = previous;
-        try {
-          applyPageCleanupStyles();
-          installLatestFeedRecommendationFilter();
-        } catch (_) {
-          // The previous fail-closed state remains the recovery boundary.
-        }
-        status.textContent = "强力过滤规则未能应用，微博内容未改变。";
-        return;
-      }
-      status.textContent = next
-        ? pageCleanupPreferences.hideLatestRecommended
-          ? "已启用强力推广过滤。"
-          : "已保存强力规则偏好；启用上方推广过滤后才会生效。"
-        : "已停用强力规则，精确“荐读”规则保持不变。";
+          ? pageCleanupPreferences.hideLatestRecommended
+            ? "已启用强力推广过滤。"
+            : "已保存强力规则偏好；启用上方推广过滤后才会生效。"
+          : "已停用强力规则，精确“荐读”规则保持不变。",
+      description: "额外识别推荐、广告等推广标签和明确广告模块。",
     });
-    feedPanel.append(
-      strongPromotionLabel,
-      createElement(
-        "p",
-        "额外识别推荐、广告等推广标签和明确广告模块。",
-        "wfr-muted wfr-setting-description wfr-suboption-description"
-      )
-    );
 
-    const autoExpandLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const autoExpandInput = createElement("input");
-    autoExpandInput.type = "checkbox";
-    autoExpandInput.checked = pageCleanupPreferences.autoExpandLongPosts;
-    autoExpandInput.setAttribute("aria-label", "自动展开原创长微博");
-    autoExpandLabel.append(
-      autoExpandInput,
-      createElement("span", "自动展开原创长微博")
-    );
-    autoExpandInput.addEventListener("change", () => {
-      const previous = pageCleanupPreferences.autoExpandLongPosts;
-      const next = autoExpandInput.checked === true;
-      const saved = savePageCleanupPreference(AUTO_EXPAND_LONG_POSTS_KEY, next);
-      if (!saved.ok) {
-        autoExpandInput.checked = previous;
-        status.textContent = "自动展开偏好未能保存。";
-        return;
-      }
-      pageCleanupPreferences.autoExpandLongPosts = next;
-      try {
+    appendPreferenceToggle(feedPanel, {
+      label: "自动展开原创长微博",
+      key: AUTO_EXPAND_LONG_POSTS_KEY,
+      read: () => pageCleanupPreferences.autoExpandLongPosts,
+      write: (next) => {
+        pageCleanupPreferences.autoExpandLongPosts = next;
+      },
+      apply: () => {
         installLatestFeedRecommendationFilter();
-      } catch (_) {
-        pageCleanupPreferences.autoExpandLongPosts = previous;
-        savePageCleanupPreference(AUTO_EXPAND_LONG_POSTS_KEY, previous);
-        autoExpandInput.checked = previous;
-        try {
-          installLatestFeedRecommendationFilter();
-        } catch (_) {
-          // The previous fail-closed state remains the recovery boundary.
-        }
-        status.textContent = "自动展开未能启动，微博正文未改变。";
-        return;
-      }
-      status.textContent = next
-        ? "已启用视口内长微博自动展开。"
-        : "已停止后续自动展开；已经展开的正文不会被强制收起。";
+      },
+      recover: () => {
+        installLatestFeedRecommendationFilter();
+      },
+      saveErrorText: "自动展开偏好未能保存。",
+      applyErrorText: "自动展开未能启动，微博正文未改变。",
+      successText: (next) =>
+        next
+          ? "已启用视口内长微博自动展开。"
+          : "已停止后续自动展开；已经展开的正文不会被强制收起。",
+      description: "停下来阅读原创长微博时自动展开；转发微博保持折叠。",
     });
-    feedPanel.append(
-      autoExpandLabel,
-      createElement(
-        "p",
-        "停下来阅读原创长微博时自动展开；转发微博保持折叠。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
 
-    const profileExtrasLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const profileExtrasInput = createElement("input");
-    profileExtrasInput.type = "checkbox";
-    profileExtrasInput.checked = pageCleanupPreferences.showProfileExtras;
-    profileExtrasInput.setAttribute("aria-label", "显示主页小档案");
-    profileExtrasLabel.append(
-      profileExtrasInput,
-      createElement("span", "显示主页小档案")
-    );
-    profileExtrasInput.addEventListener("change", () => {
-      const previous = pageCleanupPreferences.showProfileExtras;
-      const next = profileExtrasInput.checked === true;
-      const saved = savePageCleanupPreference(SHOW_PROFILE_EXTRAS_KEY, next);
-      if (!saved.ok) {
-        profileExtrasInput.checked = previous;
-        status.textContent = "主页小档案设置未能保存。";
-        return;
-      }
-      pageCleanupPreferences.showProfileExtras = next;
-      if (next) {
-        ensureProfileExtras();
-      } else {
-        teardownProfileExtras(false);
-      }
-      // The friend-notes panel shows observed facts only while Profile Extras is
-      // off, so it is rebuilt to keep the two from repeating each other.
-      rebuildProfileFriendNotes();
-      status.textContent = next
-        ? "已启用其他用户主页的 Toolkit 本地小档案与访问记录。"
-        : "已停止显示主页小档案和记录主页访问。";
-    });
-    enhancementPanel.append(
-      profileExtrasLabel,
-      createElement(
-        "p",
+    appendPreferenceToggle(enhancementPanel, {
+      label: "显示主页小档案",
+      key: SHOW_PROFILE_EXTRAS_KEY,
+      read: () => pageCleanupPreferences.showProfileExtras,
+      write: (next) => {
+        pageCleanupPreferences.showProfileExtras = next;
+      },
+      apply: (next) => {
+        if (next) {
+          ensureProfileExtras();
+        } else {
+          teardownProfileExtras(false);
+        }
+        // The friend-notes panel shows observed facts only while Profile Extras is
+        // off, so it is rebuilt to keep the two from repeating each other.
+        rebuildProfileFriendNotes();
+      },
+      recover: (previous) => {
+        if (previous) ensureProfileExtras();
+        else teardownProfileExtras(false);
+        rebuildProfileFriendNotes();
+      },
+      saveErrorText: "主页小档案设置未能保存。",
+      applyErrorText: "主页小档案设置未能应用。",
+      successText: (next) =>
+        next
+          ? "已启用其他用户主页的 Toolkit 本地小档案与访问记录。"
+          : "已停止显示主页小档案和记录主页访问。",
+      description:
         "显示历史昵称等本地资料，并在本浏览器记录访问次数和上次访问时间。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
+    });
 
-    const friendNotesLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const friendNotesInput = createElement("input");
-    friendNotesInput.type = "checkbox";
-    friendNotesInput.checked = pageCleanupPreferences.showProfileFriendNotes;
-    friendNotesInput.setAttribute("aria-label", "在主页显示友人档案");
-    friendNotesLabel.append(
-      friendNotesInput,
-      createElement("span", "在主页显示友人档案")
-    );
-    friendNotesInput.addEventListener("change", () => {
-      const previous = pageCleanupPreferences.showProfileFriendNotes;
-      const next = friendNotesInput.checked === true;
-      const saved = savePageCleanupPreference(
-        SHOW_PROFILE_FRIEND_NOTES_KEY,
+    appendPreferenceToggle(enhancementPanel, {
+      label: "在主页显示友人档案",
+      key: SHOW_PROFILE_FRIEND_NOTES_KEY,
+      read: () => pageCleanupPreferences.showProfileFriendNotes,
+      write: (next) => {
+        pageCleanupPreferences.showProfileFriendNotes = next;
+      },
+      apply: () => {
+        rebuildProfileFriendNotes();
+      },
+      recover: () => {
+        rebuildProfileFriendNotes();
+      },
+      saveErrorText: "友人档案显示设置未能保存。",
+      applyErrorText: "友人档案显示设置未能应用。",
+      successText: (next) =>
         next
-      );
-      if (!saved.ok) {
-        friendNotesInput.checked = previous;
-        status.textContent = "友人档案显示设置未能保存。";
-        return;
-      }
-      pageCleanupPreferences.showProfileFriendNotes = next;
-      rebuildProfileFriendNotes();
-      status.textContent = next
-        ? "已在其他用户主页显示友人档案。"
-        : "已停止在主页显示友人档案；已保存的备注和标签不受影响。";
+          ? "已在其他用户主页显示友人档案。"
+          : "已停止在主页显示友人档案；已保存的备注和标签不受影响。",
+      description: "在其他用户的主页显示你手写的备注和标签，可直接编辑。",
     });
-    enhancementPanel.append(
-      friendNotesLabel,
-      createElement(
-        "p",
-        "在其他用户的主页显示你手写的备注和标签，可直接编辑。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
 
-    const feedFriendNotesLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const feedFriendNotesInput = createElement("input");
-    feedFriendNotesInput.type = "checkbox";
-    feedFriendNotesInput.checked = pageCleanupPreferences.showFeedFriendNotes;
-    feedFriendNotesInput.setAttribute("aria-label", "在信息流显示友人档案");
-    feedFriendNotesLabel.append(
-      feedFriendNotesInput,
-      createElement("span", "在信息流显示友人档案")
-    );
-    feedFriendNotesInput.addEventListener("change", () => {
-      const previous = pageCleanupPreferences.showFeedFriendNotes;
-      const next = feedFriendNotesInput.checked === true;
-      const saved = savePageCleanupPreference(SHOW_FEED_FRIEND_NOTES_KEY, next);
-      if (!saved.ok) {
-        feedFriendNotesInput.checked = previous;
-        status.textContent = "信息流友人档案设置未能保存。";
-        return;
-      }
-      pageCleanupPreferences.showFeedFriendNotes = next;
-      try {
+    appendPreferenceToggle(enhancementPanel, {
+      label: "在信息流显示友人档案",
+      key: SHOW_FEED_FRIEND_NOTES_KEY,
+      read: () => pageCleanupPreferences.showFeedFriendNotes,
+      write: (next) => {
+        pageCleanupPreferences.showFeedFriendNotes = next;
+      },
+      apply: () => {
         installLatestFeedRecommendationFilter();
-      } catch (_) {
-        pageCleanupPreferences.showFeedFriendNotes = previous;
-        savePageCleanupPreference(SHOW_FEED_FRIEND_NOTES_KEY, previous);
-        feedFriendNotesInput.checked = previous;
-        try {
-          installLatestFeedRecommendationFilter();
-        } catch (_) {
-          // The previous fail-closed state remains the recovery boundary.
-        }
-        status.textContent = "信息流友人档案未能启动，微博页面未改变。";
-        return;
-      }
-      status.textContent = next
-        ? "已在首页和“最新微博”的作者旁显示友人档案入口。"
-        : "已停止在信息流显示友人档案；已保存的备注和标签不受影响。";
+      },
+      recover: () => {
+        installLatestFeedRecommendationFilter();
+      },
+      saveErrorText: "信息流友人档案设置未能保存。",
+      applyErrorText: "信息流友人档案未能启动，微博页面未改变。",
+      successText: (next) =>
+        next
+          ? "已在首页和“最新微博”的作者旁显示友人档案入口。"
+          : "已停止在信息流显示友人档案；已保存的备注和标签不受影响。",
+      description: "在作者旁显示小书签，已有档案时高亮，点击可查看和编辑。",
     });
-    enhancementPanel.append(
-      feedFriendNotesLabel,
-      createElement(
-        "p",
-        "在作者旁显示小书签，已有档案时高亮，点击可查看和编辑。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
 
-    const usageEnabledLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const usageEnabledInput = createElement("input");
-    usageEnabledInput.type = "checkbox";
-    usageEnabledInput.checked = usageEnabledPreference;
-    usageEnabledInput.setAttribute("aria-label", "记录网页版使用统计");
-    usageEnabledLabel.append(
-      usageEnabledInput,
-      createElement("span", "记录网页版使用统计")
-    );
-    usageEnabledInput.addEventListener("change", () => {
-      const previous = usageEnabledPreference;
-      const next = usageEnabledInput.checked === true;
-      const saved = savePageCleanupPreference(USAGE_ENABLED_KEY, next);
-      if (!saved.ok) {
-        usageEnabledInput.checked = previous;
-        status.textContent = "使用统计设置未能保存。";
-        return;
-      }
-      usageEnabledPreference = next;
-      if (next) {
-        const started = startUsageTracking(true);
-        if (!started.ok) {
-          usageEnabledPreference = previous;
-          savePageCleanupPreference(USAGE_ENABLED_KEY, previous);
-          usageEnabledInput.checked = previous;
-          stopUsageTracking(false);
-          status.textContent =
-            "当前无法安全启动使用统计；设置未改变，也没有开始记录。";
-          return;
+    appendPreferenceToggle(enhancementPanel, {
+      label: "记录网页版使用统计",
+      key: USAGE_ENABLED_KEY,
+      read: () => usageEnabledPreference,
+      write: (next) => {
+        usageEnabledPreference = next;
+      },
+      apply: (next) => {
+        if (next) {
+          const started = startUsageTracking(true);
+          if (!started.ok) return false;
+        } else {
+          stopUsageTracking(true);
         }
-        status.textContent = "已开始在本浏览器记录网页版使用统计。";
-      } else {
-        stopUsageTracking(true);
-        status.textContent = "已停止记录；已有统计会保留到手动清空。";
-      }
-      syncUsageCorner();
+        syncUsageCorner();
+        return true;
+      },
+      recover: () => {
+        stopUsageTracking(false);
+        syncUsageCorner();
+      },
+      saveErrorText: "使用统计设置未能保存。",
+      applyErrorText: "当前无法安全启动使用统计；设置未改变，也没有开始记录。",
+      successText: (next) =>
+        next
+          ? "已开始在本浏览器记录网页版使用统计。"
+          : "已停止记录；已有统计会保留到手动清空。",
+      description: "仅在当前浏览器记录估算活跃时间和浏览数量。",
     });
-    enhancementPanel.append(
-      usageEnabledLabel,
-      createElement(
-        "p",
-        "仅在当前浏览器记录估算活跃时间和浏览数量。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
 
-    const usageCornerLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label wfr-suboption"
-    );
-    const usageCornerInput = createElement("input");
-    usageCornerInput.type = "checkbox";
-    usageCornerInput.checked = usageCornerPreference;
-    usageCornerInput.setAttribute("aria-label", "在页面角落显示今日统计");
-    usageCornerLabel.append(
-      usageCornerInput,
-      createElement("span", "在页面角落显示今日统计")
-    );
-    usageCornerInput.addEventListener("change", () => {
-      const previous = usageCornerPreference;
-      const next = usageCornerInput.checked === true;
-      const saved = savePageCleanupPreference(USAGE_CORNER_KEY, next);
-      if (!saved.ok) {
-        usageCornerInput.checked = previous;
-        status.textContent = "角落统计设置未能保存。";
-        return;
-      }
-      usageCornerPreference = next;
-      syncUsageCorner();
-      status.textContent = next
-        ? usageEnabledPreference
-          ? "已显示今日统计。"
-          : "角落统计已准备；开启使用统计后显示。"
-        : "已隐藏角落统计。";
+    appendPreferenceToggle(enhancementPanel, {
+      label: "在页面角落显示今日统计",
+      key: USAGE_CORNER_KEY,
+      suboption: true,
+      read: () => usageCornerPreference,
+      write: (next) => {
+        usageCornerPreference = next;
+      },
+      apply: () => {
+        syncUsageCorner();
+      },
+      recover: () => {
+        syncUsageCorner();
+      },
+      saveErrorText: "角落统计设置未能保存。",
+      applyErrorText: "角落统计设置未能应用。",
+      successText: (next) =>
+        next
+          ? usageEnabledPreference
+            ? "已显示今日统计。"
+            : "角落统计已准备；开启使用统计后显示。"
+          : "已隐藏角落统计。",
+      description: "开启记录后，可在页面角落显示今日分钟数和浏览数量。",
     });
+
     const usageActions = createElement(
       "div",
       null,
@@ -539,15 +375,7 @@
     usagePanelButton.type = "button";
     usagePanelButton.addEventListener("click", () => showUsageStatistics());
     usageActions.append(usagePanelButton);
-    enhancementPanel.append(
-      usageCornerLabel,
-      createElement(
-        "p",
-        "开启记录后，可在页面角落显示今日分钟数和浏览数量。",
-        "wfr-muted wfr-setting-description wfr-suboption-description"
-      ),
-      usageActions
-    );
+    enhancementPanel.append(usageActions);
 
     cleanupPanel.append(createElement("h3", "侧栏"));
     appendToggle(
@@ -578,7 +406,6 @@
       HIDE_TOP_VIDEO_KEY,
       "hideTopVideo"
     );
-    body.append(status);
   }
 
   // A manual update that finished after its progress panel was left is
@@ -598,7 +425,36 @@
     actions.append(button);
   }
 
-  function showToolkitHome() {
+  let toolkitHomePanelRoot = null;
+
+  function refreshOpenToolkitHome() {
+    if (
+      panelRoot !== null &&
+      panelRoot === toolkitHomePanelRoot &&
+      !panelExitLocked &&
+      !followerRemovalInFlight &&
+      !panelHoldsUnsavedNote()
+    ) {
+      const openBody =
+        typeof panelRoot.querySelector === "function"
+          ? panelRoot.querySelector(".wfr-body")
+          : null;
+      showToolkitHome({
+        scrollTop: openBody ? Number(openBody.scrollTop) || 0 : 0,
+      });
+    }
+  }
+
+  function showToolkitHome(viewState) {
+    // Only a refresh of an already open home passes state; the launcher, the
+    // script menu and every back action open it from the top.
+    const initialScrollTop =
+      isPlainObject(viewState) &&
+      typeof viewState.scrollTop === "number" &&
+      Number.isFinite(viewState.scrollTop) &&
+      viewState.scrollTop > 0
+        ? viewState.scrollTop
+        : 0;
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
       showFailure("Weibo Toolkit", uidResult, false);
@@ -609,6 +465,9 @@
     const loaded = loadState(uidResult.uid);
 
     const body = showPanel("Weibo Toolkit", false, true);
+    if (panelRoot !== null && panelRoot.contains(body)) {
+      toolkitHomePanelRoot = panelRoot;
+    }
     body.classList.add("wfr-home");
     const grid = createElement("div", null, "wfr-home-grid");
     body.append(grid);
@@ -634,11 +493,15 @@
         "上次成功更新",
         snapshot ? formatTime(snapshot.capturedAt) : "尚未建立快照"
       );
-      addLine(radarSection, "API可见关注", snapshot ? snapshot.visibleCount : "—");
+      addLine(radarSection, "API 可见关注", snapshot ? snapshot.visibleCount : "—");
       addLine(radarSection, "未读事件", unread);
       if (!snapshot) {
         radarSection.append(
           createElement("p", "首次更新建立基线，下次开始记录变化。", "wfr-muted wfr-home-hint")
+        );
+      } else if (loaded.state.events.length >= 2000) {
+        radarSection.append(
+          createElement("p", "本地已累计较多事件记录，建议定期导出备份。", "wfr-muted wfr-home-hint")
         );
       }
     }
@@ -647,12 +510,24 @@
       manualRadarRun !== null && manualRadarRun.ownerUid === uidResult.uid;
     const followerRunning =
       manualFollowerRun !== null && manualFollowerRun.ownerUid === uidResult.uid;
+    const autoRadarRunning = updateRunning && !radarRunning;
+    const autoFollowerRunning = followerUpdateRunning && !followerRunning;
+    const anyTaskBusy =
+      updateRunning || followerUpdateRunning || followerRemovalInFlight;
+    if (autoRadarRunning) {
+      radarSection.append(
+        createElement("p", "后台自动更新正在进行…", "wfr-muted wfr-home-hint")
+      );
+    }
     const actions = createElement("div", null, "wfr-actions");
     const updateButton = createElement(
       "button",
-      radarRunning ? "查看进度" : "立即更新",
+      radarRunning ? "查看进度" : autoRadarRunning ? "自动更新中…" : "立即更新",
       "wfr-button wfr-primary"
     );
+    if (!radarRunning && anyTaskBusy) {
+      updateButton.disabled = true;
+    }
     const eventsButton = createElement("button", "查看事件", "wfr-button");
     const overviewButton = createElement("button", "关系概览", "wfr-button");
     const statusButton = createElement("button", "查看状态", "wfr-button");
@@ -735,18 +610,35 @@
       );
       addLine(
         followerSection,
-        "API可见粉丝",
+        "API 可见粉丝",
         followerSnapshot ? followerSnapshot.uniqueRecordCount : "—"
       );
       addLine(followerSection, "变化事件", followerLoaded.state.events.length);
       appendFollowerVisibilityNote(followerSection, followerSnapshot);
+      if (followerLoaded.state.events.length >= 2000) {
+        followerSection.append(
+          createElement("p", "本地已累计较多事件记录，建议定期导出备份。", "wfr-muted wfr-home-hint")
+        );
+      }
+    }
+    if (autoFollowerRunning) {
+      followerSection.append(
+        createElement("p", "后台自动更新正在进行…", "wfr-muted wfr-home-hint")
+      );
     }
     const followerActions = createElement("div", null, "wfr-actions");
     const followerUpdateButton = createElement(
       "button",
-      followerRunning ? "查看进度" : "更新粉丝快照",
+      followerRunning
+        ? "查看进度"
+        : autoFollowerRunning
+          ? "自动更新中…"
+          : "更新粉丝快照",
       "wfr-button wfr-primary"
     );
+    if (!followerRunning && anyTaskBusy) {
+      followerUpdateButton.disabled = true;
+    }
     const followerEventsButton = createElement(
       "button",
       "查看粉丝变化",
@@ -859,6 +751,7 @@
       changelogFooter.append(changelogButton);
       body.append(changelogFooter);
     }
+    if (initialScrollTop > 0) body.scrollTop = initialScrollTop;
   }
 
   // Toolkit-only appearance preference: it changes nothing but Toolkit styling.
@@ -877,6 +770,7 @@
       const chosen = normalizeTheme(select.value);
       const saved = saveTheme(chosen);
       if (!saved.ok) {
+        select.value = currentTheme;
         showFailure("外观设置", saved);
         return;
       }
@@ -910,10 +804,10 @@
   // Every Toolkit colour is a custom property carried by the Toolkit roots, so a
   // theme is selected purely by which token block wins on `.wfr-root`.
   const LIGHT_THEME_TOKENS =
-    "color-scheme: light; --wfr-overlay-bg: rgba(24,27,30,.44); --wfr-panel-bg: #faf9f6; --wfr-panel-text: #1f2328; --wfr-panel-shadow: 0 12px 36px rgba(15,20,26,.14); --wfr-border: #e1dfd8; --wfr-control-border: #cfcdc5; --wfr-button-bg: #fffefd; --wfr-button-text: #262a30; --wfr-button-hover: #f0eee8; --wfr-primary-bg: #23272e; --wfr-primary-text: #faf9f6; --wfr-primary-hover: #363c46; --wfr-accent: #3d6b5e; --wfr-danger-bg: #a53f37; --wfr-danger-text: #fff; --wfr-danger-border: #96382f; --wfr-danger-hover-bg: #89332c; --wfr-success: #2b6349; --wfr-error: #a13832; --wfr-muted: #656963; --wfr-field-bg: #fffefd; --wfr-field-text: #1f2328; --wfr-card-bg: #f3f1ec; --wfr-launcher-bg: #faf9f6; --wfr-launcher-text: #262a30; --wfr-launcher-border: #cfcdc5; --wfr-launcher-hover-bg: #f0eee8; --wfr-launcher-hover-border: #8c948e; --wfr-badge-bg: #a53f37; --wfr-badge-text: #fff; --wfr-bar-shadow: none;";
+    "color-scheme: light; --wfr-overlay-bg: rgba(24,27,30,.44); --wfr-panel-bg: #faf9f6; --wfr-panel-text: #1f2328; --wfr-panel-shadow: 0 12px 36px rgba(15,20,26,.14); --wfr-border: #e1dfd8; --wfr-control-border: #cfcdc5; --wfr-button-bg: #fffefd; --wfr-button-text: #262a30; --wfr-button-hover: #f0eee8; --wfr-primary-bg: #23272e; --wfr-primary-text: #faf9f6; --wfr-primary-hover: #363c46; --wfr-accent: #3d6b5e; --wfr-danger-bg: #a53f37; --wfr-danger-text: #fff; --wfr-danger-border: #96382f; --wfr-danger-hover-bg: #89332c; --wfr-success: #2b6349; --wfr-error: #a13832; --wfr-muted: #656963; --wfr-field-bg: #fffefd; --wfr-field-text: #1f2328; --wfr-card-bg: #f3f1ec; --wfr-launcher-bg: #faf9f6; --wfr-launcher-text: #262a30; --wfr-launcher-border: #cfcdc5; --wfr-launcher-hover-bg: #f0eee8; --wfr-launcher-hover-border: #8c948e; --wfr-badge-bg: #a53f37; --wfr-badge-text: #fff;";
 
   const DARK_THEME_TOKENS =
-    "color-scheme: dark; --wfr-overlay-bg: rgba(8,10,12,.68); --wfr-panel-bg: #191b1f; --wfr-panel-text: #ece9e1; --wfr-panel-shadow: 0 12px 36px rgba(0,0,0,.42); --wfr-border: #2f333a; --wfr-control-border: #414750; --wfr-button-bg: #23262b; --wfr-button-text: #ece9e1; --wfr-button-hover: #2d3138; --wfr-primary-bg: #ece9e1; --wfr-primary-text: #191b1f; --wfr-primary-hover: #ffffff; --wfr-accent: #8ec5b2; --wfr-danger-bg: #923b35; --wfr-danger-text: #fff; --wfr-danger-border: #b85449; --wfr-danger-hover-bg: #aa453c; --wfr-success: #8cc9a8; --wfr-error: #f1a69d; --wfr-muted: #9ea3ae; --wfr-field-bg: #141619; --wfr-field-text: #ece9e1; --wfr-card-bg: #202328; --wfr-launcher-bg: #191b1f; --wfr-launcher-text: #ece9e1; --wfr-launcher-border: #414750; --wfr-launcher-hover-bg: #262a30; --wfr-launcher-hover-border: #78808c; --wfr-badge-bg: #d97b70; --wfr-badge-text: #211715; --wfr-bar-shadow: none;";
+    "color-scheme: dark; --wfr-overlay-bg: rgba(8,10,12,.68); --wfr-panel-bg: #191b1f; --wfr-panel-text: #ece9e1; --wfr-panel-shadow: 0 12px 36px rgba(0,0,0,.42); --wfr-border: #2f333a; --wfr-control-border: #414750; --wfr-button-bg: #23262b; --wfr-button-text: #ece9e1; --wfr-button-hover: #2d3138; --wfr-primary-bg: #ece9e1; --wfr-primary-text: #191b1f; --wfr-primary-hover: #ffffff; --wfr-accent: #8ec5b2; --wfr-danger-bg: #923b35; --wfr-danger-text: #fff; --wfr-danger-border: #b85449; --wfr-danger-hover-bg: #aa453c; --wfr-success: #8cc9a8; --wfr-error: #f1a69d; --wfr-muted: #9ea3ae; --wfr-field-bg: #141619; --wfr-field-text: #ece9e1; --wfr-card-bg: #202328; --wfr-launcher-bg: #191b1f; --wfr-launcher-text: #ece9e1; --wfr-launcher-border: #414750; --wfr-launcher-hover-bg: #262a30; --wfr-launcher-hover-border: #78808c; --wfr-badge-bg: #d97b70; --wfr-badge-text: #211715;";
 
   function installStyles() {
     const style = createElement("style");
@@ -983,9 +877,10 @@
       .wfr-setting-description { margin: 0 0 16px; padding-left: 23px; font-size: 13px; line-height: 1.65; }
       .wfr-suboption { margin-left: 22px; }
       .wfr-suboption-description { margin-left: 22px; }
-      .wfr-browse-status { margin: 9px 0 0; }
+      .wfr-browse-status { margin: 8px 0 12px; }
       .wfr-browse-status:empty { display: none; }
       .wfr-event-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; margin-top: 14px; }
+      .wfr-event-list[hidden] { display: none; }
       .wfr-event { min-width: 0; overflow-wrap: anywhere; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); padding: 14px 16px; background: var(--wfr-card-bg); transition: border-color 120ms ease; }
       .wfr-event:hover { border-color: var(--wfr-control-border); }
       .wfr-event h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
@@ -1011,7 +906,6 @@
       .wfr-hygiene-control { display: flex; flex-direction: column; align-items: stretch; gap: 5px; }
       .wfr-hygiene-check { display: flex; align-items: center; gap: 8px; }
       .wfr-hygiene-input { width: 100%; max-width: none; box-sizing: border-box; padding: 7px 10px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; transition: border-color 120ms ease; }
-      .wfr-hygiene-reasons { margin: 6px 0 10px; padding-left: 22px; }
       .wfr-event-list .wfr-event { padding: 10px 13px; }
       .wfr-hygiene-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
       .wfr-hygiene-head .wfr-hygiene-check { flex: 0 0 auto; }
@@ -1038,7 +932,6 @@
       .wfr-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
       .wfr-actions .wfr-primary { margin: 0; }
       .wfr-compact-actions { margin-top: 6px; }
-      .wfr-module { margin-top: 22px; }
       .wfr-body h3 { margin: 18px 0 6px; font-size: 15px; font-weight: 600; }
       .wfr-body h3:first-child { margin-top: 0; }
       .wfr-body > h3:not(:first-child) { margin-top: 26px; padding-top: 22px; border-top: 1px solid var(--wfr-border); }
@@ -1072,7 +965,7 @@
       .wfr-profile-name-trigger:focus-visible, .wfr-profile-name-close:focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 2px; }
       .wfr-profile-name-popover { position: absolute; top: calc(100% + 5px); left: 0; z-index: 20; box-sizing: border-box; min-width: min(220px, calc(100vw - 48px)); max-width: min(320px, calc(100vw - 48px)); padding: 12px 14px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: var(--wfr-panel-shadow); }
       .wfr-profile-name-popover-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-      .wfr-profile-name-close { appearance: none; border: 0; padding: 1px 3px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
+      .wfr-profile-name-close { appearance: none; display: inline-flex; align-items: center; justify-content: center; min-width: 24px; min-height: 24px; border: 0; border-radius: var(--wfr-radius-s); padding: 0 4px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
       .wfr-profile-name-list { max-height: 180px; margin: 7px 0 0; padding-left: 20px; overflow-y: auto; }
       .wfr-note-editor { min-width: 0; }
       .wfr-note-text { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -1081,7 +974,7 @@
       .wfr-note-tags { display: flex; flex-wrap: wrap; gap: 5px; margin: 5px 0; padding: 0; list-style: none; }
       .wfr-note-tags[hidden] { display: none; }
       .wfr-note-tag { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; box-sizing: border-box; padding: 2px 8px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-s); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); font-size: 12px; overflow-wrap: anywhere; }
-      .wfr-note-tag-remove { appearance: none; border: 0; padding: 0 2px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
+      .wfr-note-tag-remove { appearance: none; display: inline-flex; align-items: center; justify-content: center; min-width: 22px; min-height: 22px; margin: -2px -4px -2px 0; border: 0; border-radius: var(--wfr-radius-s); padding: 0 4px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
       .wfr-note-tag-remove:focus-visible, .wfr-note-textarea:focus-visible, .wfr-note-tag-input:focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 2px; }
       .wfr-note-field-label { display: block; margin: 7px 0 3px; font-weight: 600; }
       .wfr-note-textarea { display: block; width: 100%; min-height: 96px; box-sizing: border-box; resize: vertical; padding: 9px 12px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; transition: border-color 120ms ease; }
@@ -1103,12 +996,16 @@
       .wfr-profile-notes-observed { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--wfr-border); color: var(--wfr-muted); font-size: 13px; }
       .wfr-profile-notes-subhead { font-weight: 600; }
       .wfr-feed-note { display: inline-flex; flex-wrap: nowrap; align-items: center; gap: 0; min-width: 0; max-width: 100%; margin-left: 5px; vertical-align: middle; color: inherit; font: 13px/1.5 var(--wfr-sans); }
-      .wfr-feed-note-entry { appearance: none; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: var(--wfr-radius-s); padding: 0; background: transparent; color: inherit; font-size: 0; opacity: .45; cursor: pointer; vertical-align: middle; }
+      .wfr-feed-note-entry { position: relative; appearance: none; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: var(--wfr-radius-s); padding: 0; background: transparent; color: inherit; font-size: 0; opacity: .62; cursor: pointer; vertical-align: middle; }
       .wfr-feed-note-entry::before { content: ""; width: 14px; height: 14px; background: currentColor; -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 4h12v17l-6-4-6 4z' fill='none' stroke='white' stroke-width='1.7' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 4h12v17l-6-4-6 4z' fill='none' stroke='white' stroke-width='1.7' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; }
       .wfr-feed-note-entry:hover, .wfr-feed-note-entry:focus-visible, .wfr-feed-note-entry[aria-expanded="true"] { opacity: 1; }
       .wfr-feed-note-entry:focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 2px; }
       .wfr-feed-note-entry.wfr-feed-note-has::before { -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 4h12v17l-6-4-6 4z' fill='white' stroke='white' stroke-width='1.7' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 4h12v17l-6-4-6 4z' fill='white' stroke='white' stroke-width='1.7' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; }
       .wfr-feed-note-entry.wfr-feed-note-has { color: var(--wfr-accent); opacity: 1; }
+      .wfr-feed-note-entry.wfr-feed-note-has-hint { opacity: .82; }
+      .wfr-feed-note-entry.wfr-feed-note-has.wfr-feed-note-has-hint { opacity: 1; }
+      .wfr-feed-note-entry.wfr-feed-note-has-hint:hover, .wfr-feed-note-entry.wfr-feed-note-has-hint:focus-visible, .wfr-feed-note-entry.wfr-feed-note-has-hint[aria-expanded="true"] { opacity: 1; }
+      .wfr-feed-note-entry.wfr-feed-note-has-hint::after { content: ""; position: absolute; top: 3px; right: 3px; width: 5px; height: 5px; border-radius: 999px; background: var(--wfr-accent); }
       .wfr-feed-note-hint { display: none; }
       .wfr-feed-note-hint[hidden] { display: none; }
       .wfr-feed-note-card { position: absolute; top: 0; left: 0; z-index: 2147482500; box-sizing: border-box; display: flex; flex-direction: column; width: min(360px, calc(100vw - 24px)); max-height: min(560px, calc(100vh - 24px)); overflow: hidden; padding: 14px 16px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-l); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: var(--wfr-panel-shadow); font: 14px/1.55 var(--wfr-sans); font-weight: 400; overflow-wrap: anywhere; }
@@ -1182,6 +1079,12 @@
   }
 
   currentTheme = loadTheme();
+  // Both surfaces use shared theme and unload state, initialized above before
+  // either entry point runs. Chat still skips all normal-page startup work.
+  if (isPrivateMessageSurface()) {
+    installPrivateMessageExportModule();
+    return;
+  }
   pageCleanupPreferences = loadPageCleanupPreferences();
   preferLatestFeed = loadPageCleanupPreference(PREFER_LATEST_FEED_KEY);
   usageEnabledPreference = loadPageCleanupPreference(USAGE_ENABLED_KEY);

@@ -1,6 +1,8 @@
 "use strict";
 
-const { assert, radarKey, createSharedBrowser, openTab } = require("./friend-notes-fixture");
+const {
+  assert, radarKey, createSharedBrowser, openTab, createFakeDocument, findButton,
+} = require("./friend-notes-fixture");
 
 const OWNER = "1001";
 const SUBJECT = "2001";
@@ -40,10 +42,27 @@ function openScanningTab(browser) {
     ownerUid: OWNER,
     context: {
       AbortController,
-      fetch: () => {
+      fetch: (_url, init) => {
         requested.started = true;
-        return new Promise((resolve) => {
+        return new Promise((resolve, reject) => {
           pending = resolve;
+          if (init && init.signal) {
+            if (init.signal.aborted) {
+              const err = new Error("Aborted");
+              err.name = "AbortError";
+              reject(err);
+              return;
+            }
+            init.signal.addEventListener(
+              "abort",
+              () => {
+                const err = new Error("Aborted");
+                err.name = "AbortError";
+                reject(err);
+              },
+              { once: true }
+            );
+          }
           answer();
         });
       },
@@ -58,7 +77,74 @@ function openScanningTab(browser) {
 
 const storedState = (browser) => JSON.parse(browser.storage.get(radarKey(OWNER)));
 
+async function manualScanCompletionRefreshesHome() {
+  for (const module of ["radar", "followers"]) {
+    for (const outcome of ["success", "failure", "cancel", "other-view"]) {
+      const browser = createSharedBrowser();
+      const { document, MutationObserver } = createFakeDocument();
+      let answer;
+      let rejectRequest;
+      let requests = 0;
+      const tab = openTab(browser, [
+        "updateNow", "updateFollowersNow", "closePanel", "showToolkitHome", "showFriendNotesManager",
+        "takeUnseenRadarResult", "takeUnseenFollowerResult",
+      ], { ownerUid: OWNER, context: {
+        document, MutationObserver, AbortController,
+        setTimeout: (callback, ms) => setTimeout(callback, ms === 500 ? 0 : ms),
+        fetch: (_href, options) => {
+          requests += 1;
+          if (requests > 1) return Promise.resolve({
+            ok: true, status: 200, headers: { get: () => "application/json" },
+            text: async () => JSON.stringify({ ok: 1, users: [], previous_cursor: 1, next_cursor: 0, next_page: 0 }),
+          });
+          return new Promise((resolve, reject) => {
+            answer = resolve;
+            rejectRequest = reject;
+            options.signal.addEventListener("abort", () => {
+              const error = new Error("Aborted");
+              error.name = "AbortError";
+              reject(error);
+            }, { once: true });
+          });
+        },
+      } });
+      const run = module === "radar" ? tab.product.updateNow() : tab.product.updateFollowersNow();
+      let cancellation;
+      if (outcome === "cancel") cancellation = findButton(document.body, "取消").click();
+      tab.product.closePanel();
+      if (outcome === "other-view") tab.product.showFriendNotesManager();
+      else tab.product.showToolkitHome();
+      const oldRoot = document.body.querySelector(".wfr-overlay");
+      const otherLabel = module === "radar" ? "更新粉丝快照" : "立即更新";
+      if (outcome !== "other-view") assert(findButton(oldRoot, otherLabel).disabled, "the other scan is blocked while the manual scan runs");
+      if (outcome === "success") {
+        if (module === "radar") answer(pageResponse("扫描昵称"));
+        else answer({
+          ok: true, status: 200, headers: { get: () => "application/json" },
+          text: async () => JSON.stringify({
+            ok: 1, users: [{ id: 2001, idstr: "2001", screen_name: "粉丝" }],
+            previous_cursor: 0, next_cursor: 1, next_page: 2,
+          }),
+        });
+      } else if (outcome !== "cancel") rejectRequest(new Error("simulated read failure"));
+      await cancellation;
+      await run;
+      if (outcome === "other-view") {
+        assert(document.body.contains(oldRoot) && oldRoot.textContent.includes("还没有友人档案"),
+          "manual completion must not replace a different panel");
+      } else {
+        assert(!findButton(document.body, "立即更新").disabled && !findButton(document.body, "更新粉丝快照").disabled,
+          `${module} ${outcome}: completion re-enables both Home update buttons`);
+      }
+      const result = module === "radar" ? tab.product.takeUnseenRadarResult(OWNER) : tab.product.takeUnseenFollowerResult(OWNER);
+      assert(outcome === "cancel" ? result === null : result !== null && result.ok === (outcome === "success"),
+        "refreshing Home preserves the manual outcome and keeps cancellations quiet");
+    }
+  }
+}
+
 (async () => {
+  await manualScanCompletionRefreshesHome();
   const browser = createSharedBrowser();
 
   // Baseline: the subject is known under its original name.
@@ -106,6 +192,30 @@ const storedState = (browser) => JSON.parse(browser.storage.get(radarKey(OWNER))
   assert(
     finalState.events.length === 2 && finalState.events[0].read === true && finalState.events[1].read === false,
     "the earlier event stays read and the new one is appended"
+  );
+
+  // Manual cancellation aborts the in-flight request and leaves stored state untouched.
+  const beforeCancel = browser.storage.get(radarKey(OWNER));
+  const cancellable = openScanningTab(browser);
+  const cancelController = new AbortController();
+  let cancelled = false;
+  const cancelRun = cancellable.tab.product.performUpdate(
+    null,
+    null,
+    () => cancelled,
+    { cancelSignal: cancelController.signal }
+  );
+  await cancellable.requested;
+  cancelled = true;
+  cancelController.abort();
+  const cancelResult = await cancelRun;
+  assert(
+    !cancelResult.ok && cancelResult.failureKind === "RADAR_SCAN_CANCELLED",
+    `manual cancellation must return RADAR_SCAN_CANCELLED: ${JSON.stringify(cancelResult)}`
+  );
+  assert(
+    browser.storage.get(radarKey(OWNER)) === beforeCancel,
+    "manual cancellation must not modify stored Friend Radar state"
   );
 
   // A state that cannot be read fails before any request is sent.

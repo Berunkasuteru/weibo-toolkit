@@ -1,250 +1,49 @@
 # Weibo Toolkit
 
-> 微博网页版没给你的那几样小工具，收进右下角的一个按钮里。
+A local-first userscript toolkit for desktop web Weibo (`https://weibo.com/` and `https://api.weibo.com/chat*`). It brings private UID-bound notes, following/follower change tracking, local follower filtering and bounded removal, 1-on-1 private message export, and optional page cleanup into a single bottom-right launcher.
 
-一个给**桌面微博网页**用的用户脚本工具箱。记住昵称背后的人，看见关注和粉丝的变化，把一段私信带走，顺手让首页清爽一点。数据留在你自己的浏览器里。
+The UI is in Chinese. All data stays in your browser's userscript storage—there is no project server, telemetry, or cloud sync.
 
-**[从 Greasy Fork 安装](https://greasyfork.org/zh-CN/scripts/591269-weibo-toolkit-friend-radar)** · [GitHub Release](https://github.com/Berunkasuteru/weibo-toolkit/releases/latest) · [更新说明](docs/releases/v0.12.0.md) · [反馈问题](https://github.com/Berunkasuteru/weibo-toolkit/issues)
+**[Install from Greasy Fork](https://greasyfork.org/scripts/591269-weibo-toolkit-friend-radar)** · [GitHub Releases](https://github.com/Berunkasuteru/weibo-toolkit/releases/latest) · [v0.12.1 Release Notes](docs/releases/v0.12.1.md) · [Report an Issue](https://github.com/Berunkasuteru/weibo-toolkit/issues)
 
-## 一眼看完
+## Overview
 
-| 你想…… | 用这个 | 它会碰什么 |
+| Feature | What it does | Data & network scope |
 |---|---|---|
-| 记住某个账号到底是谁 | **友人档案** | 只写本地 |
-| 知道关注列表里谁变了 | **关系雷达** | 读微博接口，结果存本地 |
-| 看粉丝来来去去，再筛一筛 | **粉丝快照与粉丝体检** | 读微博接口，结果存本地 |
-| 亲手移除一批粉丝 | **移除粉丝** | **修改真实微博关系，无法自动撤销** |
-| 把一段私信存成文件 | **私信导出** | 读微博接口，生成本地文件 |
-| 首页清爽一点 | **浏览体验** | 修改页面显示；可选功能保存本地访问记录与使用统计 |
+| **Friend Notes (`友人档案`)** | Private hand-written notes and tags bound to stable UIDs, with optional profile panels and feed bookmarks | Local storage only; zero network requests |
+| **Friend Radar (`关系雷达`)** | Snapshots API-visible followings, diffs changes (added/disappeared, follow-back changes, renames), and lists mutual/one-way relationships | Reads Weibo API; stores locally |
+| **Follower Snapshot & Hygiene (`粉丝快照与粉丝体检`)** | Snapshots API-visible followers, tracks changes, and filters locally by factual criteria (mutual status, counts, verification, registration date, source) | Snapshot reads Weibo API; filtering is 100% local |
+| **Follower Removal (`移除粉丝`)** | Removes selected followers singly or in confirmed batches (up to 200, ~3s pacing, skips mutuals & noted accounts on bulk select) | **Modifies real Weibo relationships; cannot be undone** |
+| **PM Export (`私信导出`)** | Exports the currently open 1-on-1 chat at `api.weibo.com/chat*` to a local Markdown file (`WEIBO_PM_AI_3`) | Reads Weibo API; writes local file |
+| **Browsing & Stepmeter (`浏览体验与计步器`)** | Optional (default-off) feed/sidebar cleanup, promotion filtering, original long-post auto-expand, profile visit counter, and local usage stats | Modifies page DOM; optional local stats |
 
-整个工具箱里，会改动你真实微博关系的只有“移除粉丝”这一项。其余功能要么只读，要么只改浏览器里的本地数据。
+Aside from **Follower Removal**, every feature is either read-only or modifies only local browser storage.
 
-没有项目服务器，没有遥测，没有云同步。扫描和私信导出会请求微博自己的接口；Toolkit 不向微博以外的任何地方发送数据。
+## Installation
 
-## 功能
+1. Install [Tampermonkey](https://www.tampermonkey.net/) (or a compatible userscript manager) in a desktop browser.
+2. Install **Weibo Toolkit - Friend Radar** from [Greasy Fork](https://greasyfork.org/scripts/591269-weibo-toolkit-friend-radar) or `weibo-toolkit.user.js` from [GitHub Releases](https://github.com/Berunkasuteru/weibo-toolkit/releases/latest).
+3. Log in to `https://weibo.com/`, refresh the page, and click the **Weibo Toolkit** button in the bottom-right corner.
 
-### 友人档案：记住昵称背后的人
+**Updating:** Always update the script in place rather than uninstalling and reinstalling, so your userscript storage is preserved.
 
-> “去年摄影展认识的阿岚，喜欢拍海边。”
+## Key Boundaries & Data Safety
 
-给一个账号写下这样一句备注，再贴上“摄影”“熟人”几个标签。档案绑定的是对方的稳定 UID，所以对方改了名备注还在，两个同名的账号也不会混到一起。
+- **Observation, not inference:** Following and follower snapshots cover only what Weibo's API returns, which may differ from total counters. "Disappeared from visible list" means only that the API no longer returned the account (whether due to unfollow, block, account closure, or API filtering).
+- **Conservative automation:** Optional automatic snapshot checks (24h to 15d) run only when you open or refresh a Weibo page, never poll in the background, and never remove followers.
+- **Plain-text backups (`Backup v3`):** Export a JSON backup before clearing browser data, switching devices, or reinstalling. Backups include Friend Radar, Follower Snapshot, and Friend Notes for the current UID, and remain backward-compatible with `v1` and `v2` files. Restoring validates account ownership and previews all replacements before writing.
+- **Browser support:** Tested on desktop Chrome, Edge, Vivaldi, and Firefox with Tampermonkey. Mobile Safari, iPhone, and iPad are not supported. Refresh the page after switching Weibo accounts.
 
-- 在工具箱的 **友人档案** 里浏览、搜索、按标签筛选、编辑和删除。
-- 打开某人的 `/u/<UID>` 主页，在友人档案里选“为当前主页写档案”就能新建。不需要先跑关系雷达。
-- 可选在对方主页上直接显示档案，或在首页和“最新微博”的作者旁放一个小书签，刷到这个人时点开就能想起来。
+## Development
 
-备注和标签完全由你手写，只存在当前浏览器里。Toolkit 不会替你生成任何评价，也不会为这个功能发起微博请求。
+Source files in `src/` are concatenated in fixed order into `weibo-toolkit.user.js` with zero npm dependencies:
 
-### 关系雷达：关注列表里谁变了
-
-手动点一次 **立即更新**，Toolkit 读取接口返回的可见关注列表并存成快照。之后每次更新都和上一份比较，记下：
-
-- 谁出现在可见关注列表里，谁从里面消失了；
-- 列表里的账号开始或停止关注你；
-- 谁改了昵称。
-
-第一次更新只建立基线，从第二次开始才有事件。事件列表按账号归并，一个人一张卡片，显示最新的一条，其余的在这个人的时间线里。可以按昵称或 UID 搜索，可以导出 CSV 或 Markdown，也可以从卡片直接给这个人写友人档案。
-
-**关系概览** 可查看最新快照中的可见关注名单，筛选互相关注或单向关注，并按昵称、微博备注或 UID 搜索。从名单可打开对方主页、友人档案或已有关系时间线。
-
-**它只记亲眼看到的。** 快照只覆盖接口实际返回的可见结果，可能与微博显示的总数不同。“从可见列表消失”只说明接口不再返回这个账号，原因可能是取关、拉黑、销号，也可能只是接口的变化，Toolkit 不替你下结论。时间线同理，是 Toolkit 观察到的记录，不是完整的关系历史。
-
-### 粉丝快照与粉丝体检：看清粉丝列表
-
-**更新粉丝快照** 保存接口当前返回的粉丝结果，之后的更新会记下谁出现、谁消失。微博可能过滤掉一部分粉丝，所以快照同样只代表接口可见的那部分，“消失”也同样不说明原因。
-
-**粉丝变化** 可按昵称或 UID 搜索，并从事件卡片打开对方主页或写友人档案。
-
-**粉丝体检** 在已有快照上做本地筛选，本身不发请求。条件都是事实，例如：你没有关注对方、公开微博数或粉丝数不高于某个值、未认证、注册晚于某天、关注来源。它不给任何账号贴“机器人”“僵尸粉”的标签，判断交给你。
-
-### 移除粉丝：唯一会动真格的操作
-
-体检结果里可以移除单个粉丝，也可以移除选中的一批。
-
-**这会修改真实的微博关系。移除后对方不再是你的粉丝，Toolkit 无法撤销。**
-
-所以它被设计得很慢、很保守：
-
-- 每次都要你明确确认；
-- 只处理你选中的账号：可以逐个勾选、按页选择并跨页累积，或按筛选结果的顺序一次选满；
-- 按页选择和一次选满都会跳过快照中你也关注的人，以及你写过友人档案的人；这些账号只能逐个勾选；
-- 每批最多 200 个，确认前会列出完整名单；
-- 逐个顺序发送，每次成功后约等 3 秒；
-- 不自动重试；
-- 一旦失败、结果无法确认，或你点了停止，剩下的不再发送。
-
-一次不能移除超过 200 个，也没有后台自动移除。
-
-成功移除后，Toolkit 会尽力把这个账号写入本地的 **移除记录**：昵称、UID 和写入时的时间，可以搜索，可以导出 CSV。记录写不进去时不影响移除本身。它只保存在当前浏览器，最多保留最近 5000 条，不进备份。
-
-### 私信导出：把一段对话带走
-
-在微博网页版私信里手动打开一个普通的一对一会话，点会话界面上的 **导出 Markdown**，得到一个本地 `.md` 文件，保留消息顺序、正文、时间，以及图片和链接的标记。
-
-它只导出你当前打开的这一个会话，内容以接口当时实际返回的为准。不遍历全部会话，不支持群聊，不下载媒体，也不发送、删除或恢复任何消息。
-
-导出文件是明文，正文里可能有个人信息。Toolkit 本身不调用任何 AI 接口；把文件交给谁，由你决定。
-
-### 浏览体验：按你的习惯调页面
-
-全部默认关闭，在 **工具箱 → 浏览体验** 里按需打开，分三个页签：
-
-- **信息流**：首页优先进入最新微博、隐藏信息流中的推广内容、自动展开原创长微博。
-- **增强**：显示主页小档案、在主页显示友人档案、在信息流显示友人档案、微博计步器。
-- **净化**：隐藏微博热搜、隐藏整个右侧栏、隐藏顶部推荐入口和视频入口。
-
-自动展开只作用于原创长微博，转发保持折叠；展开可能触发微博自身的正文加载，Toolkit 不直接请求全文。
-
-有三项值得在打开前知道：
-
-- **推广过滤** 默认只隐藏被明确标记为“荐读”的卡片。**使用强力规则（可能误伤）** 会多识别一些推荐和广告信号，名字里已经写了代价。两者都不承诺去掉所有广告。
-- **显示主页小档案** 会在别人的主页上显示本地记录过的昵称和关系信息，同时**在本浏览器记录你访问该主页的次数和上次访问时间**。
-- **微博计步器** 会记录估算的活跃时间和浏览过的微博数量，可选在页面角落显示今日统计；统计面板提供含今日的近 7 天、近 30 天汇总，以及历史每日明细。阶段浏览条数按日累计，同一条微博在不同日期浏览会分别计入。
-
-后两项记录的是你的使用痕迹，和你手写的友人档案是两回事，互不依赖，也都不进备份。
-
-### 自动更新：可选，而且很克制
-
-关系雷达和粉丝快照可以各自开启自动更新，间隔从 24 小时到 15 天。默认关闭。
-
-它只在你打开或刷新微博页面时检查一次是否到期，不是常驻后台的服务，不轮询，失败了也不会连续重试。它永远不会自动移除粉丝。
-
-## 安装
-
-1. 用桌面浏览器装好 [Tampermonkey](https://www.tampermonkey.net/) 或兼容的用户脚本管理器。
-2. 从 [Greasy Fork](https://greasyfork.org/zh-CN/scripts/591269-weibo-toolkit-friend-radar) 安装 **Weibo Toolkit - Friend Radar**。也可以从 [GitHub Release](https://github.com/Berunkasuteru/weibo-toolkit/releases/latest) 下载 `weibo-toolkit.user.js` 手动安装。
-3. 登录 `https://weibo.com/` 并刷新页面。
-4. 右下角出现 **Weibo Toolkit** 按钮，点它。
-
-然后可以这样开始：
-
-- 想记人：先打开对方的 `/u/<UID>` 主页，再从工具箱里的 **友人档案** 选择“为当前主页写档案”。
-- 想看关系变化：点一次 **立即更新** 建立基线，过几天再更新一次。
-- 想看粉丝：点一次 **更新粉丝快照**，再打开 **粉丝体检**。
-- 想调页面：打开 **浏览体验**，所有开关都在那里。
-
-<details>
-<summary>没看到右下角的按钮？</summary>
-
-依次确认：
-
-- 用的是桌面浏览器，不是 iPhone、iPad 或 Mobile Safari；
-- 地址是 `https://weibo.com/`（私信导出所在的页面是 `https://api.weibo.com/chat...`）；
-- 用户脚本已启用，浏览器也允许 Tampermonkey 访问该站点；
-- 安装或修改脚本后已经刷新页面。
-
-用户脚本菜单里还有一个 **Weibo Toolkit：打开工具箱**，按钮不可用时可以从那里进。
-
-</details>
-
-<details>
-<summary>升级时注意</summary>
-
-在原有脚本上更新，不要删掉再装一份新的，否则本地数据可能读不到。手动安装的副本不会自动更新，需要自己替换内容并保存。普通升级不需要恢复备份。
-
-</details>
-
-## 你的数据
-
-关系雷达、粉丝快照、它们的事件和友人档案，都按当前登录的微博账号分开，保存在用户脚本的本地存储里。清除浏览器数据、卸载脚本或换设备之前，先导出一份备份。
-
-### 备份与恢复
-
-**导出备份** 生成一个本地 JSON 文件，包含关系雷达、粉丝快照与粉丝变化、友人档案。
-
-**备份是明文，里面有你手写的备注和标签，请自己保管好。** 它不包含登录凭据、浏览体验的开关、主页访问记录和计步器数据。
-
-**恢复备份** 是替换，不是合并：
-
-- 先验证文件，并要求备份属于当前登录的账号；
-- 再给你看一份预览，说明哪些内容会被替换；
-- 你确认之后才写入。
-
-旧格式的备份仍然能恢复，并且只替换它自己包含的部分：
-
-| 备份版本 | 关系雷达 | 粉丝快照与粉丝变化 | 友人档案 |
-|---|---|---|---|
-| v1 | 替换 | 保持不变 | 保持不变 |
-| v2 | 替换 | 替换 | 保持不变 |
-| v3 | 替换 | 替换 | 替换 |
-
-如果恢复中途出了问题，Toolkit 会如实告诉你结果：已全部回退、只恢复了一部分，还是最终状态无法确认。它不会把这些情况说成成功。
-
-## 支持范围
-
-- **支持**：桌面微博网页 `https://weibo.com/`。实际验证过的环境是 Tampermonkey 配 Chrome、Edge、Vivaldi 和 Firefox。
-- **未验证**：其他桌面浏览器和用户脚本管理器可能可用，但不作承诺。
-- **不支持**：iPhone、iPad 和 Mobile Safari 上的微博网页。
-
-页面上的功能依赖微博当前的页面结构。微博改版后，某个入口可能暂时消失；遇到无法确认作者或账号的情况，Toolkit 会选择不显示，而不是猜。
-
-切换微博账号后，请刷新页面再使用。
-
-<details>
-<summary>更细的限制和数字</summary>
-
-**关系雷达与粉丝快照**
-
-- 关系雷达单次最多发送 100 个请求，粉丝快照单次最多读取 100 个非空页。达到上限时不保存这次的不完整结果。
-- “开始关注你 / 停止关注你”只覆盖同时出现在可见关注列表里的账号。
-- 扫描跨多页进行，期间发生的关系变化可能被记成一次短暂的观察。
-- 浏览器无法在多个标签页之间可靠协调写入时，操作会失败或跳过，而不是覆盖数据。
-- 移除成功的账号会立刻从粉丝体检的列表里隐藏，可以直接选下一批，不需要先更新快照；关掉面板再打开也一样。粉丝快照本身不会自动变化，需要再更新一次才能看到接口当前的结果。
-
-**粉丝体检**
-
-- 结果每页 50 条。翻页会保留已选账号，修改筛选条件会清空选择。
-- 常用的筛选条件可以存成方案，每个账号最多 8 个。方案只保存在当前浏览器，不进备份。
-- 结果可以按粉丝数、公开微博数或注册时间排序。数值未知的账号排在最后，不会被当成零。
-- 批量移除时请保持标签页在前台。切到后台后，浏览器可能延后计时，批量可能变慢。
-- 批量移除进行期间面板不能关闭，可以随时点“停止后续操作”。某一个账号的操作超过 20 秒仍未完成时会提示：刷新页面可以退出，但那一个账号的结果将无法确认。
-- 未知的数值不会被当成零去匹配阈值。
-
-**友人档案**
-
-- 备注最多 1000 字；每个档案最多 12 个标签，每个标签最多 20 字；每个账号最多 2000 条档案。
-- 从工具箱为当前主页新建档案，需要 `/u/<UID>` 形式的地址，个性域名主页暂不支持；也可通过信息流书签为可靠识别的作者新建档案。
-- 信息流书签只出现在首页和原生“最新微博”，不覆盖搜索结果、评论区、私信和个人主页里的微博列表。转发微博只识别外层的转发者。
-- 档案里显示的昵称和关系信息来自 Toolkit 的本地记录，不是实时状态。
-- 两个标签页同时编辑同一份档案时，后保存的一方会看到冲突提示，输入不会丢。
-- 离开主页或信息流时，还没保存的输入不会保留。
-
-**微博计步器**
-
-- 页面可见、有焦点且最近有操作才计时，60 秒无活动后暂停。
-- 微博约一半可见并停留约 0.8 秒才计入，当天按微博去重。
-- 只保留最多 90 天的每日汇总，不保存微博正文和逐条浏览记录。
-
-**私信导出**
-
-- 格式为 `WEIBO_PM_AI_3`，用 A/B 表示对话双方，元数据里不写入双方的 UID 和昵称。
-- 接口没有返回的、已删除或已撤回的消息可能缺失。
-- 不支持服务消息和公共消息文件夹，不主动修改未读状态。
-
-</details>
-
-## 开发
-
-源码在 `src/` 下按固定顺序拆成多个片段，拼接后得到仓库里那个可直接安装的 `weibo-toolkit.user.js`。没有 npm 依赖。
-
-```text
-node scripts/build-userscript.mjs --check   # 源码片段与产物是否逐字节一致
-node scripts/build-userscript.mjs --write   # 从源码片段重新生成产物
-node tests/run.js                           # 构建一致性检查 + 公开测试
+```bash
+node scripts/build-userscript.mjs --check   # Verify src/ matches weibo-toolkit.user.js byte-for-byte
+node scripts/build-userscript.mjs --write   # Rebuild weibo-toolkit.user.js from src/
+node tests/run.js                           # Run build check + 13 offline test suites
 ```
 
-公开测试直接加载生成的用户脚本并调用其中的函数，不访问网络。它们覆盖关键的数据语义和安全边界，不能代替真实登录环境下的浏览器验证。
-
-新增源码片段时，需要同时加入 `scripts/build-userscript.mjs` 里的清单。
-
-## 版本
-
-当前版本为 `v0.12.0`，见 [更新说明](docs/releases/v0.12.0.md)。工具箱首页的 **更新记录** 里也能随时翻看从 v0.3.0 起的版本历史，内容随脚本内置，不联网读取。
-
-## English summary
-
-Weibo Toolkit is a local-first userscript for desktop web Weibo. It offers hand-written private notes and tags bound to stable UIDs (Friend Notes), tracking of API-visible following changes, API-visible follower snapshots with local filtering, bounded and confirmed follower removal, Markdown export of the currently open one-to-one conversation, and optional page enhancements that are off by default. The UI is in Chinese. Data stays in userscript-local browser storage; there is no project server, telemetry or cloud sync. Mobile Safari and iPhone/iPad Weibo web are not supported.
-
-## 许可证
+## License
 
 [Mozilla Public License 2.0](LICENSE)

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.12.0
+// @version      0.12.1
 // @description  Local-first Weibo toolkit with private friend notes, relationship tracking, follower tools, PM export, and optional page enhancements.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -16,11 +16,6 @@
 
 (function () {
   "use strict";
-
-  if (isPrivateMessageSurface()) {
-    installPrivateMessageExportModule();
-    return;
-  }
 
   function isPrivateMessageSurface() {
     return (
@@ -407,10 +402,50 @@
     };
   }
 
+  // The File System Access API lives on the page realm. Userscript sandboxes do
+  // not always mirror it, so the page window is preferred and the sandbox
+  // window is the fallback. No new @grant is required: unsafeWindow is already
+  // requested by this script.
+  function resolveSaveFilePickerWindow() {
+    try {
+      if (
+        typeof unsafeWindow !== "undefined" &&
+        unsafeWindow &&
+        typeof unsafeWindow.showSaveFilePicker === "function"
+      ) {
+        return unsafeWindow;
+      }
+    } catch (_) {
+      // A blocked page realm simply means the picker is unavailable.
+    }
+    try {
+      if (
+        typeof window !== "undefined" &&
+        window &&
+        typeof window.showSaveFilePicker === "function"
+      ) {
+        return window;
+      }
+    } catch (_) {
+      // Same: unavailable, never fatal.
+    }
+    return null;
+  }
+
+  async function abortWritableStreamQuietly(writable) {
+    if (!writable || typeof writable.abort !== "function") return;
+    try {
+      await writable.abort();
+    } catch (_) {
+      // The write already failed; cleanup errors add nothing.
+    }
+  }
+
   function installPrivateMessageExportModule() {
     const ENDPOINT = "/webim/2/direct_messages/conversation.json";
     const PAGE_SIZE = 100;
     const REQUEST_DELAY_MS = 750;
+    const REQUEST_TIMEOUT_MS = 30000;
     const AUTO_REST_PAGES = 100;
     const AUTO_REST_MS = 5000;
     // Final pathological-loop fuse: 5,000 proven 15-message pages is a
@@ -442,38 +477,11 @@
         checkpoint.hidden = mode !== "checkpoint";
       }
       if (status.textContent !== statusText) status.textContent = statusText;
+      if (status.title !== statusText) status.title = statusText;
       if (root.dataset.mode !== mode) root.dataset.mode = mode;
     }
 
-    // The File System Access API lives on the page realm. Userscript sandboxes do
-    // not always mirror it, so the page window is preferred and the sandbox
-    // window is the fallback. No new @grant is required: unsafeWindow is already
-    // requested by this script.
-    function privateMessagePickerWindow() {
-      try {
-        if (
-          typeof unsafeWindow !== "undefined" &&
-          unsafeWindow &&
-          typeof unsafeWindow.showSaveFilePicker === "function"
-        ) {
-          return unsafeWindow;
-        }
-      } catch (_) {
-        // A blocked page realm simply means the picker is unavailable.
-      }
-      try {
-        if (
-          typeof window !== "undefined" &&
-          window &&
-          typeof window.showSaveFilePicker === "function"
-        ) {
-          return window;
-        }
-      } catch (_) {
-        // Same: unavailable, never fatal.
-      }
-      return null;
-    }
+    const privateMessagePickerWindow = resolveSaveFilePickerWindow;
 
     function ensureControl() {
       scheduled = false;
@@ -491,11 +499,14 @@
         root = document.createElement("div");
         root.id = ROOT_ID;
         root.className = "wfr-pm-export-root";
+        applyThemeToRoot(root);
         const button = document.createElement("button");
         button.type = "button";
         button.className = "wfr-pm-export-button";
         const status = document.createElement("span");
         status.className = "wfr-pm-export-status";
+        status.setAttribute("role", "status");
+        status.setAttribute("aria-live", "polite");
         const checkpoint = document.createElement("div");
         checkpoint.className = "wfr-pm-export-checkpoint";
         checkpoint.hidden = true;
@@ -554,16 +565,30 @@
     }
 
     async function requestPage(session, cursor, controller) {
-      const response = await fetch(requestUrl(session.participantUid, cursor).href, {
-        method: "GET",
-        credentials: "same-origin",
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-        redirect: "follow",
-        signal: controller.signal,
-      });
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, REQUEST_TIMEOUT_MS);
+      let response;
+      let body;
+      try {
+        response = await fetch(requestUrl(session.participantUid, cursor).href, {
+          method: "GET",
+          credentials: "same-origin",
+          headers: { Accept: "application/json" },
+          cache: "no-store",
+          redirect: "follow",
+          signal: controller.signal,
+        });
+        body = await response.text();
+      } catch (error) {
+        if (timedOut && !task?.cancelled) throw new Error("REQUEST_TIMEOUT");
+        throw error;
+      } finally {
+        clearTimeout(timer);
+      }
       const contentType = response.headers.get("content-type") || "";
-      const body = await response.text();
       if (!response.ok) throw new Error(response.status === 401 ? "LOGIN_REQUIRED" : "HTTP_ERROR");
       if (!/(?:application|text)\/[^;]*json/i.test(contentType)) {
         throw new Error("UNEXPECTED_CONTENT_TYPE");
@@ -744,11 +769,7 @@
         await writable.write(markdown);
         await writable.close();
       } catch (_) {
-        try {
-          await writable.abort();
-        } catch (__) {
-          // The write already failed; cleanup errors add nothing.
-        }
+        await abortWritableStreamQuietly(writable);
         throw new Error("FILE_WRITE_FAILED");
       }
     }
@@ -799,6 +820,7 @@
       const messages = {
         LOGIN_REQUIRED: "登录状态异常",
         HTTP_ERROR: "读取失败，未生成文件",
+        REQUEST_TIMEOUT: "请求超时，未生成文件",
         UNEXPECTED_CONTENT_TYPE: "返回类型发生变化",
         NON_JSON_RESPONSE: "返回内容不是有效 JSON",
         UNEXPECTED_SCHEMA: "返回结构发生变化",
@@ -844,6 +866,8 @@
         recordsRead: 0,
         progress: "正在读取：0 条 · 0 页",
       };
+      privateMessageExportInFlight = true;
+      syncBeforeUnloadGuard();
       setUi("running", task.progress);
       try {
         const result = await collectHistory(session, token);
@@ -881,7 +905,11 @@
           setUi("idle", failureText(code));
         }
       } finally {
-        if (task?.token === token) task = null;
+        if (task?.token === token) {
+          task = null;
+          privateMessageExportInFlight = false;
+          syncBeforeUnloadGuard();
+        }
         scheduleEnsure();
       }
     }
@@ -903,6 +931,10 @@
     style.id = "wfr-pm-export-style";
     style.textContent = `
       .wfr-pm-export-root { color-scheme: light; --wfr-pm-bg: #faf9f6; --wfr-pm-text: #1f2328; --wfr-pm-border: #dcdad2; --wfr-pm-hover-bg: #f0eee8; --wfr-pm-accent: #3d6b5e; --wfr-pm-muted: #656963; position: absolute; top: 10px; right: 58px; z-index: 20; display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; max-width: min(520px, calc(100% - 68px)); font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", system-ui, sans-serif; }
+      .wfr-pm-export-root.wfr-theme-dark { color-scheme: dark; --wfr-pm-bg: #1e2022; --wfr-pm-text: #e6e8eb; --wfr-pm-border: #383c40; --wfr-pm-hover-bg: #292d30; --wfr-pm-accent: #68a694; --wfr-pm-muted: #9aa0a6; }
+      @media (prefers-color-scheme: dark) {
+        .wfr-pm-export-root.wfr-theme-system { color-scheme: dark; --wfr-pm-bg: #1e2022; --wfr-pm-text: #e6e8eb; --wfr-pm-border: #383c40; --wfr-pm-hover-bg: #292d30; --wfr-pm-accent: #68a694; --wfr-pm-muted: #9aa0a6; }
+      }
       .wfr-pm-export-button, .wfr-pm-export-choice { appearance: none; border: 1px solid var(--wfr-pm-border); border-radius: 8px; background: var(--wfr-pm-bg); color: var(--wfr-pm-text); font: inherit; font-weight: 500; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease; }
       .wfr-pm-export-button { padding: 5px 10px; }
       .wfr-pm-export-button:hover:not(:disabled), .wfr-pm-export-choice:hover:not(:disabled) { border-color: var(--wfr-pm-accent); background: var(--wfr-pm-hover-bg); color: var(--wfr-pm-accent); }
@@ -925,7 +957,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.12.0";
+  const APP_VERSION = "0.12.1";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -1040,6 +1072,20 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.12.1": Object.freeze({
+      added: Object.freeze([
+        "关系雷达手动更新支持中途取消，关系事件支持搜索改名事件的旧昵称",
+        "粉丝体检新增重置筛选，并可从体检卡片和移除记录直接打开主页或友人档案",
+      ]),
+      improved: Object.freeze([
+        "关系事件、粉丝变化、关系概览、友人档案、粉丝体检和移除记录从子页面返回时保留展开条数与滚动位置",
+        "自动更新间隔改为选择即保存；私信导出接入深浅色主题与 30 秒请求超时保护",
+        "优化多档案与长信息流的本地记录索引性能，补充信息流书签曾用名提示与关闭标签页前的未完成操作保护",
+      ]),
+      fixed: Object.freeze([
+        "修复私信页面启动顺序导致的初始化异常，以及粉丝体检未知移除结果在往返子页面后丢失隔离状态的问题",
+      ]),
+    }),
     "0.12.0": Object.freeze({
       added: Object.freeze([
         "关系概览新增当前可见关注名单，可按互关或单向关注筛选，按昵称、微博备注或 UID 搜索",
@@ -1292,36 +1338,40 @@
   });
 
   const FAILURE_LABELS = Object.freeze({
-    UID_UNAVAILABLE: "无法可靠识别当前登录账号",
-    ACCOUNT_CHANGED_DURING_SCAN: "扫描期间登录账号发生变化",
-    STALE_SCAN: "扫描结果早于当前已保存快照",
-    LOGIN_REQUIRED: "登录已失效，请重新登录",
-    HTTP_ERROR: "接口返回 HTTP 错误",
-    CHALLENGE_OR_UNEXPECTED_RESPONSE: "收到验证页面或意外 HTML",
-    NON_JSON_RESPONSE: "接口未返回有效 JSON",
-    UNEXPECTED_CONTENT_TYPE: "接口响应类型异常",
-    UNEXPECTED_SCHEMA: "接口数据结构异常",
-    PAGINATION_FAILURE: "分页链不可信",
-    NETWORK_ERROR: "网络请求失败",
-    PERSISTENCE_ERROR: "本地保存失败",
+    UID_UNAVAILABLE: "无法可靠识别当前登录账号。",
+    ACCOUNT_CHANGED_DURING_SCAN: "扫描期间登录账号发生变化。",
+    STALE_SCAN: "扫描结果早于当前已保存快照。",
+    RADAR_SCAN_CANCELLED: "读取已取消。",
+    LOGIN_REQUIRED: "登录已失效，请重新登录。",
+    HTTP_ERROR: "接口返回 HTTP 错误。",
+    CHALLENGE_OR_UNEXPECTED_RESPONSE: "收到验证页面或意外 HTML。",
+    NON_JSON_RESPONSE: "接口未返回有效 JSON。",
+    UNEXPECTED_CONTENT_TYPE: "接口响应类型异常。",
+    UNEXPECTED_SCHEMA: "接口数据结构异常。",
+    PAGINATION_FAILURE: "分页链不可信。",
+    NETWORK_ERROR: "网络请求失败。",
+    PERSISTENCE_ERROR: "本地保存失败。",
     CONCURRENT_MODIFICATION:
       "检测到另一个微博标签页正在修改关系雷达数据，本次操作未保存。请在其中一个标签页重新操作。",
-    STORAGE_ERROR: "本地状态无法读取",
-    BACKUP_EXPORT_ERROR: "备份导出失败",
-    BACKUP_RESTORE_ERROR: "备份恢复失败",
-    EVENT_EXPORT_ERROR: "事件导出失败",
-    UPDATE_ALREADY_RUNNING: "更新正在进行",
+    STORAGE_ERROR: "本地状态无法读取。",
+    BACKUP_EXPORT_ERROR: "备份导出失败。",
+    BACKUP_RESTORE_ERROR: "备份恢复失败。",
+    EVENT_EXPORT_ERROR: "事件导出失败。",
+    UPDATE_ALREADY_RUNNING: "另一个关系扫描正在进行。",
     STATE_LOCK_UNAVAILABLE:
       "暂时无法安全地保存本地数据，本次操作未保存。请稍后重试。",
-    UNKNOWN_FAILURE: "未知失败",
+    UNKNOWN_FAILURE: "未知失败。",
   });
 
   const hasOwn = (value, key) =>
     Object.prototype.hasOwnProperty.call(value, key);
 
   let updateRunning = false;
+  let radarCancelRequested = false;
   let followerUpdateRunning = false;
   let followerCancelRequested = false;
+  let privateMessageExportInFlight = false;
+  let beforeUnloadGuardInstalled = false;
   // A manual scan in this tab, so its progress panel can be reopened after it
   // was closed, and the outcome of one that finished while the user was
   // elsewhere. Both live only as long as the page: they are a convenience for
@@ -1379,6 +1429,8 @@
   let usageListenersInstalled = false;
   let usageFeedRoot = null;
   let usageFeedObserver = null;
+  let usageFeedMutationsScheduled = false;
+  let usagePendingMutations = [];
   let usageIntersectionObserver = null;
   let usageFeedDiscoveryTimer = null;
   let usageFeedDiscoveryCount = 0;
@@ -1424,6 +1476,61 @@
 
   function delay(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  }
+
+  function cancellableDelay(milliseconds, cancelSignal) {
+    if (!cancelSignal) return delay(milliseconds);
+    if (cancelSignal.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        cancelSignal.removeEventListener("abort", onAbort);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        cancelSignal.removeEventListener("abort", onAbort);
+        resolve();
+      }, milliseconds);
+      cancelSignal.addEventListener("abort", onAbort);
+    });
+  }
+
+  function clearNode(node) {
+    if (!node) return;
+    while (node.childNodes.length > 0) node.removeChild(node.childNodes[0]);
+  }
+
+  function handleBeforeUnload(event) {
+    if (!shouldProtectPageUnload()) return;
+    event.preventDefault();
+    event.returnValue = "";
+  }
+
+  function shouldProtectPageUnload() {
+    return Boolean(
+      privateMessageExportInFlight ||
+        followerRemovalInFlight ||
+        anyFriendNoteEditorHasUnsavedChanges()
+    );
+  }
+
+  function syncBeforeUnloadGuard() {
+    if (
+      typeof window === "undefined" ||
+      !window ||
+      typeof window.addEventListener !== "function" ||
+      typeof window.removeEventListener !== "function"
+    ) {
+      return;
+    }
+    const needed = shouldProtectPageUnload();
+    if (needed && !beforeUnloadGuardInstalled) {
+      window.addEventListener("beforeunload", handleBeforeUnload);
+      beforeUnloadGuardInstalled = true;
+    } else if (!needed && beforeUnloadGuardInstalled) {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      beforeUnloadGuardInstalled = false;
+    }
   }
 
   const SCAN_REQUEST_TIMEOUT_MS = 30000;
@@ -1505,9 +1612,9 @@
     );
   }
 
-  async function requestFollowingPage(ownerUid, page) {
+  async function requestFollowingPage(ownerUid, page, cancelSignal) {
     const url = buildRequestUrl(ownerUid, page);
-    const fetched = await fetchScanPage(url.href);
+    const fetched = await fetchScanPage(url.href, cancelSignal);
     if (!fetched.ok) return fetched;
     const { response, body } = fetched;
     const contentType = response.headers.get("content-type") || "unavailable";
@@ -1624,7 +1731,13 @@
     }
   }
 
-  async function scanFollowing(ownerUid, onProgress, beforeFirstRequest) {
+  async function scanFollowing(
+    ownerUid,
+    onProgress,
+    beforeFirstRequest,
+    isCancelled,
+    options = {}
+  ) {
     const recordsByUid = new Map();
     const seenNextCursors = new Set();
     const seenPaginationStates = new Set();
@@ -1633,16 +1746,40 @@
     let requestsMade = 0;
 
     for (let page = 1; page <= MAX_REQUESTS; page += 1) {
+      if (typeof isCancelled === "function" && isCancelled()) {
+        return { ok: false, failureKind: "RADAR_SCAN_CANCELLED", requestsMade };
+      }
       if (requestsMade === 0 && typeof beforeFirstRequest === "function") {
         const permission = beforeFirstRequest();
         if (!permission.ok) {
           return { ...permission, requestsMade: 0, failedPage: page };
         }
       }
-      if (requestsMade > 0) await delay(REQUEST_DELAY_MS);
+      if (requestsMade > 0) {
+        await cancellableDelay(REQUEST_DELAY_MS, options.cancelSignal);
+      }
+      if (typeof isCancelled === "function" && isCancelled()) {
+        return { ok: false, failureKind: "RADAR_SCAN_CANCELLED", requestsMade };
+      }
+      const ownerBeforeRequest = determineCurrentUid();
+      if (!ownerBeforeRequest.ok || ownerBeforeRequest.uid !== ownerUid) {
+        return {
+          ok: false,
+          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+          requestsMade,
+          failedPage: page,
+        };
+      }
       requestsMade += 1;
 
-      const response = await requestFollowingPage(ownerUid, page);
+      const response = await requestFollowingPage(
+        ownerUid,
+        page,
+        options.cancelSignal
+      );
+      if (typeof isCancelled === "function" && isCancelled()) {
+        return { ok: false, failureKind: "RADAR_SCAN_CANCELLED", requestsMade };
+      }
       if (!response.ok) {
         return { ...response, requestsMade, failedPage: page };
       }
@@ -1932,7 +2069,7 @@
   // never across a scan, a delay, or a UI wait.
   const FRIEND_RADAR_STATE_LOCK_PREFIX = "weibo-toolkit-friend-radar-state-";
 
-  function friendRadarStateLockUnavailable(reason, error) {
+  function stateLockUnavailable(reason, error) {
     const result = {
       ok: false,
       failureKind: "STATE_LOCK_UNAVAILABLE",
@@ -1942,26 +2079,33 @@
     return result;
   }
 
-  async function withFriendRadarStateLock(ownerUid, transaction) {
+  async function withExclusiveStateLock(lockName, transaction) {
     const lockManager = pageLockManager();
     if (lockManager === null) {
-      return friendRadarStateLockUnavailable("LOCK_UNAVAILABLE");
+      return stateLockUnavailable("LOCK_UNAVAILABLE");
     }
     try {
       return await lockManager.request.call(
         lockManager,
-        FRIEND_RADAR_STATE_LOCK_PREFIX + ownerUid,
+        lockName,
         { mode: "exclusive" },
         async (lock) => {
           if (lock === null) {
-            return friendRadarStateLockUnavailable("LOCK_NOT_ACQUIRED");
+            return stateLockUnavailable("LOCK_NOT_ACQUIRED");
           }
           return await transaction();
         }
       );
     } catch (error) {
-      return friendRadarStateLockUnavailable("LOCK_REQUEST_FAILED", error);
+      return stateLockUnavailable("LOCK_REQUEST_FAILED", error);
     }
+  }
+
+  async function withFriendRadarStateLock(ownerUid, transaction) {
+    return await withExclusiveStateLock(
+      FRIEND_RADAR_STATE_LOCK_PREFIX + ownerUid,
+      transaction
+    );
   }
 
   // Unlocked helper: callers must already hold the Friend Radar state lock. It
@@ -2203,7 +2347,12 @@
     return { ok: true };
   }
 
-  async function performUpdate(onProgress, beforeFirstRequest) {
+  async function performUpdate(
+    onProgress,
+    beforeFirstRequest,
+    isCancelled,
+    options = {}
+  ) {
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) return uidResult;
 
@@ -2219,7 +2368,9 @@
     const scan = await scanFollowing(
       uidResult.uid,
       onProgress,
-      beforeFirstRequest
+      beforeFirstRequest,
+      isCancelled,
+      options
     );
     if (!scan.ok) return scan;
 
@@ -2235,6 +2386,13 @@
     const committed = await withFriendRadarStateLock(
       uidResult.uid,
       async () => {
+        if (typeof isCancelled === "function" && isCancelled()) {
+          return {
+            ok: false,
+            failureKind: "RADAR_SCAN_CANCELLED",
+            requestsMade: scan.requestsMade,
+          };
+        }
         const loaded = loadState(uidResult.uid);
         if (!loaded.ok) return loaded;
         if (JSON.stringify(loaded.state.latestSnapshot) !== scanStartSnapshot) {
@@ -2531,7 +2689,9 @@
       if (typeof isCancelled === "function" && isCancelled()) {
         return { ok: false, failureKind: "FOLLOWER_SCAN_CANCELLED", requestsMade };
       }
-      if (requestsMade > 0) await delay(FOLLOWER_REQUEST_DELAY_MS);
+      if (requestsMade > 0) {
+        await cancellableDelay(FOLLOWER_REQUEST_DELAY_MS, options.cancelSignal);
+      }
       if (typeof isCancelled === "function" && isCancelled()) {
         return { ok: false, failureKind: "FOLLOWER_SCAN_CANCELLED", requestsMade };
       }
@@ -2930,38 +3090,13 @@
   // and batch pacing all stay outside it.
   const FOLLOWER_STATE_LOCK_PREFIX = "weibo-toolkit-follower-state-";
 
-  function followerStateLockUnavailable(reason, error) {
-    const result = {
-      ok: false,
-      failureKind: "STATE_LOCK_UNAVAILABLE",
-      reason,
-    };
-    if (error) result.errorName = error.name ? String(error.name) : "Error";
-    return result;
-  }
-
   // The transaction body must stay short and purely local. It is awaited while
   // the lock is held, so it must never fetch, wait, or open UI.
   async function withFollowerStateLock(ownerUid, transaction) {
-    const lockManager = pageLockManager();
-    if (lockManager === null) {
-      return followerStateLockUnavailable("LOCK_UNAVAILABLE");
-    }
-    try {
-      return await lockManager.request.call(
-        lockManager,
-        FOLLOWER_STATE_LOCK_PREFIX + ownerUid,
-        { mode: "exclusive" },
-        async (lock) => {
-          if (lock === null) {
-            return followerStateLockUnavailable("LOCK_NOT_ACQUIRED");
-          }
-          return await transaction();
-        }
-      );
-    } catch (error) {
-      return followerStateLockUnavailable("LOCK_REQUEST_FAILED", error);
-    }
+    return await withExclusiveStateLock(
+      FOLLOWER_STATE_LOCK_PREFIX + ownerUid,
+      transaction
+    );
   }
 
   function followerRemovalPendingKey(ownerUid) {
@@ -3881,6 +4016,17 @@
 
   function reconcileStrongTipsAdModules(root) {
     if (!root) return;
+    if (
+      !effectiveStrongFeedPromotionFilter() &&
+      typeof root.querySelectorAll === "function"
+    ) {
+      for (const node of root.querySelectorAll(
+        `.${STRONG_FEED_PROMOTION_HIDDEN_CLASS}`
+      )) {
+        setToolkitClass(node, STRONG_FEED_PROMOTION_HIDDEN_CLASS, false);
+      }
+      return;
+    }
     walkElementSubtree(root, applyStrongTipsAdVisibility);
   }
 
@@ -4862,6 +5008,28 @@
     }
   }
 
+  const MAX_PROFILE_VISIT_ENTRIES = 2000;
+  const PROFILE_VISIT_LOCK_PREFIX = "weibo-toolkit-profile-visits-";
+
+  function trimProfileVisitEntries(visits, protectedUid) {
+    const uids = Object.keys(visits);
+    if (uids.length <= MAX_PROFILE_VISIT_ENTRIES) return visits;
+    const removable = uids
+      .filter((uid) => uid !== protectedUid)
+      .sort(
+        (left, right) =>
+          Date.parse(visits[left].lastVisitedAt) -
+            Date.parse(visits[right].lastVisitedAt) ||
+          left.localeCompare(right)
+      );
+    const excess = uids.length - MAX_PROFILE_VISIT_ENTRIES;
+    const trimmed = { ...visits };
+    for (let index = 0; index < excess && index < removable.length; index += 1) {
+      delete trimmed[removable[index]];
+    }
+    return trimmed;
+  }
+
   function recordProfileVisit(ownerUid, targetUid, visitedAt) {
     const loaded = loadProfileVisits(ownerUid);
     if (!loaded.ok) return loaded;
@@ -4875,12 +5043,16 @@
       count: previous === null ? 1 : previous.count + 1,
       lastVisitedAt: visitedAt,
     };
-    const nextVisits = { ...loaded.visits, [targetUid]: nextRecord };
+    const nextVisits = trimProfileVisitEntries(
+      { ...loaded.visits, [targetUid]: nextRecord },
+      targetUid
+    );
     try {
       GM_setValue(profileVisitStorageKey(ownerUid), nextVisits);
       const saved = GM_getValue(profileVisitStorageKey(ownerUid), null);
       if (
         !isValidProfileVisitMap(saved) ||
+        !hasOwn(saved, targetUid) ||
         saved[targetUid].count !== nextRecord.count ||
         saved[targetUid].lastVisitedAt !== visitedAt
       ) {
@@ -4912,95 +5084,95 @@
     observations.push({ name, observedAt, order });
   }
 
-  function deriveProfileLocalFacts(targetUid, friendState, followerState) {
-    const names = [];
-    const relationshipEvents = [];
-    const evidenceTimes = [];
-    let order = 0;
-    let currentName = null;
-    let currentNameObservedAt = Number.NEGATIVE_INFINITY;
+  function createProfileLocalFactsAccumulator() {
+    return {
+      names: [],
+      relationshipEvents: [],
+      evidenceTimes: [],
+      order: 0,
+      currentName: null,
+      currentNameObservedAt: Number.NEGATIVE_INFINITY,
+      seenFriendSnapshot: false,
+      seenFollowerSnapshot: false,
+      finalized: null,
+    };
+  }
 
-    function observeName(name, observedAt) {
-      addProfileNameObservation(names, name, observedAt, order);
-      order += 1;
-      if (
-        typeof observedAt === "string" &&
-        Number.isFinite(Date.parse(observedAt))
-      ) {
-        evidenceTimes.push(observedAt);
-      }
+  function observeAccumulatorName(acc, name, observedAt) {
+    addProfileNameObservation(acc.names, name, observedAt, acc.order);
+    acc.order += 1;
+    if (
+      typeof observedAt === "string" &&
+      Number.isFinite(Date.parse(observedAt))
+    ) {
+      acc.evidenceTimes.push(observedAt);
     }
+  }
 
-    function observeCurrentName(name, observedAt) {
-      const observedTime = Date.parse(observedAt);
-      if (
-        typeof name === "string" &&
-        name.trim() !== "" &&
-        Number.isFinite(observedTime) &&
-        observedTime > currentNameObservedAt
-      ) {
-        currentName = name;
-        currentNameObservedAt = observedTime;
-      }
+  function observeAccumulatorCurrentName(acc, name, observedAt) {
+    const observedTime = Date.parse(observedAt);
+    if (
+      typeof name === "string" &&
+      name.trim() !== "" &&
+      Number.isFinite(observedTime) &&
+      observedTime > acc.currentNameObservedAt
+    ) {
+      acc.currentName = name;
+      acc.currentNameObservedAt = observedTime;
     }
+  }
 
-    if (friendState && friendState.latestSnapshot) {
-      const snapshot = friendState.latestSnapshot;
-      const record = snapshot.records.find((entry) => entry.uid === targetUid);
-      if (record) {
-        observeCurrentName(record.screenName, snapshot.capturedAt);
-        observeName(record.screenName, snapshot.capturedAt);
-      }
+  function observeFriendEventOnAccumulator(acc, event) {
+    acc.evidenceTimes.push(event.detectedAt);
+    acc.relationshipEvents.push({
+      observedAt: event.detectedAt,
+      label: EVENT_LABELS[event.type],
+    });
+    if (event.type === EVENT.SCREEN_NAME_CHANGED) {
+      observeAccumulatorName(acc, event.previous.screenName, event.detectedAt);
+      observeAccumulatorName(acc, event.current.screenName, event.detectedAt);
+    } else {
+      observeAccumulatorName(acc, event.displayName, event.detectedAt);
     }
-    if (friendState) {
-      for (const event of friendState.events) {
-        if (event.subjectUid !== targetUid) continue;
-        evidenceTimes.push(event.detectedAt);
-        relationshipEvents.push({
-          observedAt: event.detectedAt,
-          label: EVENT_LABELS[event.type],
-        });
-        if (event.type === EVENT.SCREEN_NAME_CHANGED) {
-          observeName(event.previous.screenName, event.detectedAt);
-          observeName(event.current.screenName, event.detectedAt);
-        } else {
-          observeName(event.displayName, event.detectedAt);
-        }
-      }
-    }
+  }
 
-    if (followerState && followerState.latestSnapshot) {
-      const snapshot = followerState.latestSnapshot;
-      const record = snapshot.records.find((entry) => entry.uid === targetUid);
-      if (record) {
-        observeCurrentName(record.screenName, snapshot.capturedAt);
-        observeName(record.screenName, snapshot.capturedAt);
-      }
-    }
-    if (followerState) {
-      for (const event of followerState.events) {
-        if (event.uid !== targetUid) continue;
-        evidenceTimes.push(event.observedAt);
-        relationshipEvents.push({
-          observedAt: event.observedAt,
-          label: FOLLOWER_EVENT_LABELS[event.type],
-        });
-        observeName(event.displayName, event.observedAt);
-      }
-    }
+  function observeFollowerEventOnAccumulator(acc, event) {
+    acc.evidenceTimes.push(event.observedAt);
+    acc.relationshipEvents.push({
+      observedAt: event.observedAt,
+      label: FOLLOWER_EVENT_LABELS[event.type],
+    });
+    observeAccumulatorName(acc, event.displayName, event.observedAt);
+  }
 
-    names.sort((left, right) => {
+  function emptyProfileLocalFacts() {
+    return {
+      currentName: null,
+      currentNameObservedAt: null,
+      historicalNames: [],
+      earliestLocalRecord: null,
+      recentRelationshipEvent: null,
+    };
+  }
+
+  function finalizeProfileLocalFactsAccumulator(acc) {
+    if (acc.finalized !== null) return acc.finalized;
+    acc.names.sort((left, right) => {
       const timeDifference =
         Date.parse(left.observedAt) - Date.parse(right.observedAt);
       return timeDifference || left.order - right.order;
     });
-    if (currentName === null && names.length > 0) {
-      currentName = names[names.length - 1].name;
-      currentNameObservedAt = Date.parse(names[names.length - 1].observedAt);
+    let currentName = acc.currentName;
+    let currentNameObservedAt = acc.currentNameObservedAt;
+    if (currentName === null && acc.names.length > 0) {
+      currentName = acc.names[acc.names.length - 1].name;
+      currentNameObservedAt = Date.parse(
+        acc.names[acc.names.length - 1].observedAt
+      );
     }
     const seenNames = new Set();
     const historicalNames = [];
-    for (const observation of names) {
+    for (const observation of acc.names) {
       if (
         observation.name === currentName ||
         seenNames.has(observation.name)
@@ -5010,16 +5182,23 @@
       seenNames.add(observation.name);
       historicalNames.push(observation.name);
     }
-    relationshipEvents.sort(
+    acc.relationshipEvents.sort(
       (left, right) =>
         Date.parse(right.observedAt) - Date.parse(left.observedAt)
     );
-    const earliestLocalRecord = evidenceTimes.length
-      ? new Date(
-          Math.min(...evidenceTimes.map((value) => Date.parse(value)))
-        ).toISOString()
+    let minEvidenceMs = Number.POSITIVE_INFINITY;
+    for (const value of acc.evidenceTimes) {
+      const ms = Date.parse(value);
+      if (Number.isNaN(ms)) {
+        minEvidenceMs = Number.NaN;
+        break;
+      }
+      if (ms < minEvidenceMs) minEvidenceMs = ms;
+    }
+    const earliestLocalRecord = acc.evidenceTimes.length
+      ? new Date(minEvidenceMs).toISOString()
       : null;
-    return {
+    acc.finalized = {
       currentName,
       // When the name above was recorded, so it is never presented as live.
       currentNameObservedAt: Number.isFinite(currentNameObservedAt)
@@ -5027,8 +5206,92 @@
         : null,
       historicalNames,
       earliestLocalRecord,
-      recentRelationshipEvent: relationshipEvents[0] || null,
+      recentRelationshipEvent: acc.relationshipEvents[0] || null,
     };
+    return acc.finalized;
+  }
+
+  function buildProfileLocalFactsIndex(friendState, followerState) {
+    const buckets = new Map();
+    const bucketFor = (uid) => {
+      let bucket = buckets.get(uid);
+      if (!bucket) {
+        bucket = createProfileLocalFactsAccumulator();
+        buckets.set(uid, bucket);
+      }
+      return bucket;
+    };
+    if (friendState && friendState.latestSnapshot) {
+      const snapshot = friendState.latestSnapshot;
+      for (const record of snapshot.records) {
+        const acc = bucketFor(record.uid);
+        if (acc.seenFriendSnapshot) continue;
+        acc.seenFriendSnapshot = true;
+        observeAccumulatorCurrentName(acc, record.screenName, snapshot.capturedAt);
+        observeAccumulatorName(acc, record.screenName, snapshot.capturedAt);
+      }
+    }
+    if (friendState) {
+      for (const event of friendState.events) {
+        observeFriendEventOnAccumulator(bucketFor(event.subjectUid), event);
+      }
+    }
+    if (followerState && followerState.latestSnapshot) {
+      const snapshot = followerState.latestSnapshot;
+      for (const record of snapshot.records) {
+        const acc = bucketFor(record.uid);
+        if (acc.seenFollowerSnapshot) continue;
+        acc.seenFollowerSnapshot = true;
+        observeAccumulatorCurrentName(acc, record.screenName, snapshot.capturedAt);
+        observeAccumulatorName(acc, record.screenName, snapshot.capturedAt);
+      }
+    }
+    if (followerState) {
+      for (const event of followerState.events) {
+        observeFollowerEventOnAccumulator(bucketFor(event.uid), event);
+      }
+    }
+    return {
+      get(targetUid) {
+        const acc = buckets.get(targetUid);
+        return acc
+          ? finalizeProfileLocalFactsAccumulator(acc)
+          : emptyProfileLocalFacts();
+      },
+    };
+  }
+
+  function deriveProfileLocalFacts(targetUid, friendState, followerState) {
+    const acc = createProfileLocalFactsAccumulator();
+    if (friendState && friendState.latestSnapshot) {
+      const snapshot = friendState.latestSnapshot;
+      const record = snapshot.records.find((entry) => entry.uid === targetUid);
+      if (record) {
+        observeAccumulatorCurrentName(acc, record.screenName, snapshot.capturedAt);
+        observeAccumulatorName(acc, record.screenName, snapshot.capturedAt);
+      }
+    }
+    if (friendState) {
+      for (const event of friendState.events) {
+        if (event.subjectUid !== targetUid) continue;
+        observeFriendEventOnAccumulator(acc, event);
+      }
+    }
+    if (followerState && followerState.latestSnapshot) {
+      const snapshot = followerState.latestSnapshot;
+      const record = snapshot.records.find((entry) => entry.uid === targetUid);
+      if (record) {
+        observeAccumulatorCurrentName(acc, record.screenName, snapshot.capturedAt);
+        observeAccumulatorName(acc, record.screenName, snapshot.capturedAt);
+      }
+    }
+    if (followerState) {
+      for (const event of followerState.events) {
+        if (event.uid !== targetUid) continue;
+        observeFollowerEventOnAccumulator(acc, event);
+      }
+    }
+    return finalizeProfileLocalFactsAccumulator(acc);
   }
 
   function loadProfileLocalFacts(ownerUid, targetUid) {
@@ -5092,7 +5355,7 @@
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value);
     const pad = (part) => String(part).padStart(2, "0");
-    return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
       date.getDate()
     )}`;
   }
@@ -5159,6 +5422,73 @@
     }
   }
 
+  function collectFocusableControls(root) {
+    const focusables = [];
+    if (!root) return focusables;
+    const visit = (parent) => {
+      const closedDetails = parent.tagName === "DETAILS" && !parent.open;
+      for (const child of elementChildren(parent)) {
+        if (child.hidden) continue;
+        if (closedDetails && child.tagName !== "SUMMARY") continue;
+        const tabIndexAttr =
+          typeof child.getAttribute === "function"
+            ? child.getAttribute("tabindex")
+            : null;
+        const tag = child.tagName;
+        const inherentlyFocusable =
+          tag === "BUTTON" ||
+          tag === "INPUT" ||
+          tag === "SELECT" ||
+          tag === "TEXTAREA" ||
+          tag === "SUMMARY" ||
+          (tag === "A" &&
+            Boolean(
+              child.href ||
+                (typeof child.getAttribute === "function" &&
+                  child.getAttribute("href"))
+            ));
+        if (
+          !child.disabled &&
+          tabIndexAttr !== "-1" &&
+          (inherentlyFocusable || tabIndexAttr === "0") &&
+          (typeof child.getClientRects !== "function" ||
+            child.getClientRects().length > 0)
+        ) {
+          focusables.push(child);
+        }
+        visit(child);
+      }
+    };
+    visit(root);
+    return focusables;
+  }
+
+  function trapDialogTabKey(event, root) {
+    if (!event || event.key !== "Tab" || !root) return;
+    const focusable = collectFocusableControls(root);
+    if (focusable.length === 0) {
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !focusable.includes(active))) {
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      if (typeof last.focus === "function") last.focus();
+    } else if (
+      !event.shiftKey &&
+      (active === last ||
+        !active ||
+        !root.contains(active) ||
+        (typeof active.getAttribute === "function" &&
+          active.getAttribute("tabindex") === "-1"))
+    ) {
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      if (typeof first.focus === "function") first.focus();
+    }
+  }
+
   function openProfileNicknamePopover(trigger, names) {
     if (!trigger || !trigger.parentNode || !Array.isArray(names)) return false;
     closeProfileNicknamePopover();
@@ -5170,6 +5500,7 @@
     popover.id = "wfr-profile-name-popover";
     popover.setAttribute("role", "dialog");
     popover.setAttribute("aria-label", "本地记录过的昵称");
+    popover.setAttribute("tabindex", "-1");
     const header = createElement("div", null, "wfr-profile-name-popover-header");
     header.append(createElement("strong", "本地记录过的昵称"));
     const closeButton = createElement(
@@ -5197,13 +5528,14 @@
       closeProfileNicknamePopover();
     };
     const onKeydown = (event) => {
-      if (
-        panelRoot === null &&
-        event &&
-        !event.defaultPrevented &&
-        event.key === "Escape"
-      ) {
+      if (panelRoot !== null || !event || event.defaultPrevented) return;
+      if (event.key === "Escape") {
+        if (typeof event.preventDefault === "function") event.preventDefault();
         closeProfileNicknamePopover(true);
+        return;
+      }
+      if (event.key === "Tab") {
+        trapDialogTabKey(event, popover);
       }
     };
     activeProfileNicknamePopover = {
@@ -5219,6 +5551,7 @@
       document.addEventListener("click", onDocumentClick, true);
       document.addEventListener("keydown", onKeydown);
     }
+    if (typeof closeButton.focus === "function") closeButton.focus();
     return true;
   }
 
@@ -5399,12 +5732,41 @@
     ) {
       teardownProfileExtras();
       const visitedAt = new Date().toISOString();
-      activeProfileContext = {
-        ownerUid: owner.uid,
-        targetUid,
-        facts: loadProfileLocalFacts(owner.uid, targetUid),
-        visit: recordProfileVisit(owner.uid, targetUid, visitedAt),
-      };
+      const ownerUid = owner.uid;
+      if (pageLockManager() === null) {
+        activeProfileContext = {
+          ownerUid,
+          targetUid,
+          facts: loadProfileLocalFacts(ownerUid, targetUid),
+          visit: recordProfileVisit(ownerUid, targetUid, visitedAt),
+        };
+      } else {
+        const context = {
+          ownerUid,
+          targetUid,
+          facts: loadProfileLocalFacts(ownerUid, targetUid),
+          visit: { ok: false, pending: true },
+        };
+        activeProfileContext = context;
+        void withExclusiveStateLock(
+          PROFILE_VISIT_LOCK_PREFIX + ownerUid,
+          async () => recordProfileVisit(ownerUid, targetUid, visitedAt)
+        )
+          .then((visitResult) => {
+            if (activeProfileContext !== context) return;
+            // An untakable lock must not cost the visit: recording without it
+            // is what this path did before the lock existed.
+            context.visit =
+              visitResult && visitResult.failureKind === "STATE_LOCK_UNAVAILABLE"
+                ? recordProfileVisit(ownerUid, targetUid, visitedAt)
+                : visitResult;
+            removeProfileExtrasNode();
+            ensureProfileExtras();
+          })
+          // Best effort only: the context keeps the visit, so the next route
+          // change or host mutation re-ensures and renders it.
+          .catch(() => {});
+      }
     }
 
     if (!profileContextHasContent(activeProfileContext)) {
@@ -5802,32 +6164,8 @@
     }
   }
 
-  function usageLockUnavailable(reason, error) {
-    const result = {
-      ok: false,
-      failureKind: "STATE_LOCK_UNAVAILABLE",
-      reason,
-    };
-    if (error) result.errorName = error.name ? String(error.name) : "Error";
-    return result;
-  }
-
   async function withUsageStateLock(ownerUid, transaction) {
-    const lockManager = pageLockManager();
-    if (lockManager === null) return usageLockUnavailable("LOCK_UNAVAILABLE");
-    try {
-      return await lockManager.request.call(
-        lockManager,
-        USAGE_LOCK_PREFIX + ownerUid,
-        { mode: "exclusive" },
-        async (lock) => {
-          if (lock === null) return usageLockUnavailable("LOCK_NOT_ACQUIRED");
-          return await transaction();
-        }
-      );
-    } catch (error) {
-      return usageLockUnavailable("LOCK_REQUEST_FAILED", error);
-    }
+    return await withExclusiveStateLock(USAGE_LOCK_PREFIX + ownerUid, transaction);
   }
 
   function usageMonotonicNow() {
@@ -6035,6 +6373,24 @@
     cleanupDisconnectedUsageCards();
   }
 
+  function scheduleUsageFeedMutations(mutations) {
+    if (Array.isArray(mutations) && mutations.length > 0) {
+      usagePendingMutations.push(...mutations);
+    }
+    if (usageFeedMutationsScheduled) return;
+    usageFeedMutationsScheduled = true;
+    const scheduleFrame =
+      typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame
+        : (callback) => setTimeout(callback, 0);
+    scheduleFrame(() => {
+      usageFeedMutationsScheduled = false;
+      const queued = usagePendingMutations;
+      usagePendingMutations = [];
+      if (queued.length > 0) processUsageFeedMutations(queued);
+    });
+  }
+
   function isUsageCardStillHalfVisible(card) {
     if (!card || typeof card.getBoundingClientRect !== "function") return false;
     const rect = card.getBoundingClientRect();
@@ -6140,6 +6496,8 @@
     }
     usageFeedRoot = null;
     usageFeedObserver = null;
+    usageFeedMutationsScheduled = false;
+    usagePendingMutations = [];
     usageIntersectionObserver = null;
     if (resetDiscovery) {
       usageFeedDiscoveryTimer = null;
@@ -6193,7 +6551,7 @@
       processUsageIntersections,
       { threshold: [0, USAGE_POST_VISIBILITY_RATIO, 1] }
     );
-    usageFeedObserver = new MutationObserver(processUsageFeedMutations);
+    usageFeedObserver = new MutationObserver(scheduleUsageFeedMutations);
     for (const card of root.querySelectorAll(".wbpro-scroller-item")) {
       registerUsageCard(card);
     }
@@ -6485,6 +6843,7 @@
     applyThemeToRoot(launcherButton);
     applyThemeToRoot(usageCornerButton);
     applyThemeToRoot(panelRoot);
+    applyThemeToRoot(document.getElementById("wfr-pm-export-root"));
     applyThemeToRoot(document.getElementById(PROFILE_EXTRAS_ID));
     applyThemeToRoot(
       profileFriendNotesContext === null ? null : profileFriendNotesContext.root
@@ -6502,10 +6861,12 @@
     panelReturnFocus = null;
     if (panelRoot && panelRoot.parentNode) panelRoot.parentNode.removeChild(panelRoot);
     panelRoot = null;
+    toolkitHomePanelRoot = null;
     friendNoteDetailView = null;
     panelSizeFixed = false;
     panelHeaderButtons = [];
     panelExitLocked = false;
+    syncBeforeUnloadGuard();
     // Scans, restores and event clearing all run from the panel, so the local
     // facts cached for the feed entries are re-read once it is really closed.
     markFeedFriendNotesStale();
@@ -6586,25 +6947,7 @@
       return;
     }
     if (event.key !== "Tab" || panelRoot === null) return;
-    const focusable = [
-      ...panelRoot.querySelectorAll(
-        'button, a[href], input, select, textarea, summary, [tabindex="0"]'
-      ),
-    ].filter((node) => !node.disabled && node.getClientRects().length > 0);
-    if (focusable.length === 0) {
-      event.preventDefault();
-      return;
-    }
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    const active = document.activeElement;
-    if (event.shiftKey && (active === first || !focusable.includes(active))) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && active === last) {
-      event.preventDefault();
-      first.focus();
-    }
+    trapDialogTabKey(event, panelRoot);
   }
 
   // Pages reached by navigating inside the Toolkit share one panel size, so the
@@ -6628,6 +6971,23 @@
     const root = createElement("div", null, "wfr-overlay wfr-root");
     applyThemeToRoot(root);
     root.addEventListener("keydown", handlePanelKeydown);
+    let backdropMouseDown = false;
+    root.addEventListener("mousedown", (event) => {
+      backdropMouseDown = Boolean(event && event.target === root);
+    });
+    root.addEventListener("click", (event) => {
+      const clickedBackdrop = backdropMouseDown && Boolean(event && event.target === root);
+      backdropMouseDown = false;
+      if (!clickedBackdrop) return;
+      if (
+        panelExitLocked ||
+        followerRemovalInFlight ||
+        panelHoldsUnsavedNote()
+      ) {
+        return;
+      }
+      closePanel();
+    });
     const panel = createElement(
       "section",
       null,
@@ -6776,27 +7136,51 @@
       "wfr-button wfr-danger"
     );
     clearButton.type = "button";
-    clearButton.addEventListener("click", async () => {
-      const confirmed = confirm(
-        "清空当前账号在本浏览器中的使用统计？\n此操作不会影响微博数据。"
+    const confirmSlot = createElement("div", null, "wfr-batch-panel");
+    clearButton.addEventListener("click", () => {
+      clearNode(confirmSlot);
+      const confirmation = createElement("div", null, "wfr-removal-confirm");
+      confirmation.append(
+        createElement("h3", "清空当前账号在本浏览器中的使用统计？"),
+        createElement("p", "此操作不会影响微博数据。", "wfr-muted")
       );
-      if (!confirmed) return;
-      const currentOwner = determineCurrentUid();
-      if (!currentOwner.ok || currentOwner.uid !== ownerUid) {
-        showFailure("微博计步器", {
-          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
-        });
-        return;
-      }
-      const cleared = await clearUsageStatisticsForOwner(ownerUid);
-      if (!cleared.ok) {
-        showFailure("微博计步器", cleared);
-        return;
-      }
-      showUsageStatistics("使用统计已清空。追踪偏好保持不变。");
+      const confirmActions = createElement("div", null, "wfr-actions");
+      const cancel = createElement("button", "取消", "wfr-button");
+      const confirmClear = createElement(
+        "button",
+        "确认清空",
+        "wfr-button wfr-danger"
+      );
+      cancel.type = "button";
+      confirmClear.type = "button";
+      cancel.addEventListener("click", () => {
+        clearNode(confirmSlot);
+        if (typeof clearButton.focus === "function") clearButton.focus();
+      });
+      confirmClear.addEventListener("click", async () => {
+        cancel.disabled = true;
+        confirmClear.disabled = true;
+        const currentOwner = determineCurrentUid();
+        if (!currentOwner.ok || currentOwner.uid !== ownerUid) {
+          showFailure("微博计步器", {
+            failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+          });
+          return;
+        }
+        const cleared = await clearUsageStatisticsForOwner(ownerUid);
+        if (!cleared.ok) {
+          showFailure("微博计步器", cleared);
+          return;
+        }
+        showUsageStatistics("使用统计已清空。追踪偏好保持不变。");
+      });
+      confirmActions.append(cancel, confirmClear);
+      confirmation.append(confirmActions);
+      confirmSlot.append(confirmation);
+      if (typeof cancel.focus === "function") cancel.focus();
     });
     actions.append(clearButton);
-    body.append(actions);
+    body.append(actions, confirmSlot);
   }
 
   function showUsageStatistics(statusText = null) {
@@ -7130,7 +7514,7 @@
       ? "首次关注快照已保存，从下次更新开始记录变化。"
       : `更新完成，发现 ${result.newEvents.length} 个新事件。`;
     body.append(createElement("p", message, "wfr-success"));
-    addLine(body, "API可见关注", result.snapshot.visibleCount);
+    addLine(body, "API 可见关注", result.snapshot.visibleCount);
     addLine(body, "接口总数", result.snapshot.reportedTotal);
     addLine(
       body,
@@ -7153,7 +7537,7 @@
     ["reportedTotal", "接口报告总数"],
   ]);
 
-  function showScanProgress() {
+  function showScanProgress(onCancel) {
     const body = showPanel("关系雷达更新");
     body.append(
       createElement("p", "正在读取可见关注，请保持页面打开。"),
@@ -7169,6 +7553,23 @@
       values.set(key, value);
       rows.append(row);
     }
+    if (typeof onCancel === "function") {
+      const cancelButton = createElement("button", "取消", "wfr-button");
+      cancelButton.type = "button";
+      if (radarCancelRequested) {
+        cancelButton.disabled = true;
+        cancelButton.textContent = "正在取消…";
+      }
+      cancelButton.addEventListener("click", () => {
+        radarCancelRequested = true;
+        cancelButton.disabled = true;
+        cancelButton.textContent = "正在取消…";
+        onCancel();
+      });
+      const actions = createElement("div", null, "wfr-actions");
+      actions.append(cancelButton);
+      body.append(actions);
+    }
     return function reportProgress(progress) {
       for (const [key] of PROGRESS_FIELDS) {
         const value = values.get(key);
@@ -7180,14 +7581,32 @@
   }
 
   function showRadarUpdateResult(result) {
-    if (result.ok) showUpdateSuccess(result);
-    else showFailure("关系雷达更新失败", result);
+    if (result.ok) {
+      showUpdateSuccess(result);
+      return;
+    }
+    if (result.failureKind === "RADAR_SCAN_CANCELLED") {
+      const body = showPanel("关系雷达已取消", true);
+      body.append(
+        createElement("p", "读取已取消。", "wfr-muted"),
+        createElement(
+          "p",
+          "已保留上一次成功快照，未生成关系变化事件。",
+          "wfr-muted"
+        )
+      );
+      if (typeof result.requestsMade === "number") {
+        addLine(body, "已发请求", result.requestsMade);
+      }
+      return;
+    }
+    showFailure("关系雷达更新失败", result);
   }
 
   // Opens (or reopens) the progress panel of the manual scan that is running
   // and replays the latest numbers into it.
   function attachRadarProgress(run) {
-    run.render = showScanProgress();
+    run.render = showScanProgress(run.cancel);
     run.root = panelRoot;
     if (run.latest !== null) run.render(run.latest);
   }
@@ -7233,11 +7652,14 @@
       });
       return;
     }
+    radarCancelRequested = false;
+    const cancelController = new AbortController();
     const run = {
       ownerUid: startOwner.ok ? startOwner.uid : null,
       latest: null,
       render: null,
       root: null,
+      cancel: () => cancelController.abort(),
     };
     manualRadarRun = run;
     unseenManualRadarResult = null;
@@ -7245,10 +7667,15 @@
     updateRunning = true;
     let result;
     try {
-      result = await performUpdate((progress) => {
-        run.latest = progress;
-        run.render(progress);
-      });
+      result = await performUpdate(
+        (progress) => {
+          run.latest = progress;
+          run.render(progress);
+        },
+        null,
+        () => radarCancelRequested,
+        { cancelSignal: cancelController.signal }
+      );
     } catch (error) {
       result = {
         ok: false,
@@ -7257,6 +7684,7 @@
       };
     } finally {
       updateRunning = false;
+      radarCancelRequested = false;
       manualRadarRun = null;
     }
     refreshUnreadBadge();
@@ -7264,11 +7692,18 @@
     // possibly with typed input in it. That panel is theirs: the outcome is
     // announced on the launcher and kept for Home to show.
     if (panelRoot !== run.root) {
-      unseenManualRadarResult = { ownerUid: run.ownerUid, result };
+      if (result.failureKind !== "RADAR_SCAN_CANCELLED") {
+        unseenManualRadarResult = { ownerUid: run.ownerUid, result };
+      }
       setLauncherStatus(
-        result.ok ? "关系雷达更新完成" : "关系雷达更新失败",
+        result.ok
+          ? "关系雷达更新完成"
+          : result.failureKind === "RADAR_SCAN_CANCELLED"
+            ? "关系雷达已取消"
+            : "关系雷达更新失败",
         AUTO_STATUS_DURATION_MS
       );
+      refreshOpenToolkitHome();
       return;
     }
     showRadarUpdateResult(result);
@@ -7422,7 +7857,7 @@
         counts[FOLLOWER_EVENT.VISIBLE_FOLLOWER_DISAPPEARED] || 0
       );
     }
-    addLine(body, "API可见粉丝", result.snapshot.uniqueRecordCount);
+    addLine(body, "API 可见粉丝", result.snapshot.uniqueRecordCount);
     addLine(body, "读取记录", result.snapshot.rawRecordCount);
     addLine(body, "跨页重复", result.snapshot.crossPageDuplicateCount);
     addLine(body, "请求数", result.requestsMade);
@@ -7440,7 +7875,7 @@
   function showFollowerScanProgress(onCancel) {
     const body = showPanel("粉丝快照更新");
     body.append(
-      createElement("p", "正在读取API可见粉丝，请保持页面打开。"),
+      createElement("p", "正在读取 API 可见粉丝，请保持页面打开。"),
       createElement("div", null, "wfr-progress")
     );
     const values = new Map();
@@ -7551,6 +7986,7 @@
             : "粉丝快照更新失败",
         AUTO_STATUS_DURATION_MS
       );
+      refreshOpenToolkitHome();
       return;
     }
     showFollowerUpdateResult(result);
@@ -7609,18 +8045,45 @@
     );
   }
 
-  function renderFollowerEvents(ownerUid, state, initialQuery = "") {
+  function renderFollowerEvents(ownerUid, state, initialQueryOrView = "") {
+    const view =
+      typeof initialQueryOrView === "string"
+        ? {
+            query: initialQueryOrView,
+            shown: FRIEND_NOTES_PAGE_SIZE,
+            scrollTop: 0,
+          }
+        : {
+            query:
+              initialQueryOrView && typeof initialQueryOrView.query === "string"
+                ? initialQueryOrView.query
+                : "",
+            shown:
+              initialQueryOrView &&
+              typeof initialQueryOrView.shown === "number" &&
+              Number.isFinite(initialQueryOrView.shown) &&
+              initialQueryOrView.shown >= FRIEND_NOTES_PAGE_SIZE
+                ? initialQueryOrView.shown
+                : FRIEND_NOTES_PAGE_SIZE,
+            scrollTop:
+              initialQueryOrView &&
+              typeof initialQueryOrView.scrollTop === "number" &&
+              Number.isFinite(initialQueryOrView.scrollTop)
+                ? initialQueryOrView.scrollTop
+                : 0,
+          };
     const body = showPanel("粉丝变化", true);
     const snapshot = state.latestSnapshot;
     addLine(body, "已有快照", snapshot ? "是" : "否");
     if (snapshot) {
       addLine(body, "上次成功更新", formatTime(snapshot.capturedAt));
-      addLine(body, "API可见粉丝", snapshot.uniqueRecordCount);
+      addLine(body, "API 可见粉丝", snapshot.uniqueRecordCount);
     }
     const countValue = addLine(body, "变化事件", state.events.length);
     appendFollowerVisibilityNote(body, snapshot);
 
     let events = state.events;
+    let shownLimit = view.shown;
     const notesLoaded = loadFriendNotesState(ownerUid);
     const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
     const clearAllActions = createElement("div", null, "wfr-actions");
@@ -7636,15 +8099,29 @@
     search.type = "search";
     search.placeholder = "搜索昵称或 UID";
     search.setAttribute("aria-label", "搜索昵称或 UID");
-    search.value = initialQuery;
+    search.value = view.query;
+    const summary = createElement("p", "", "wfr-muted");
+    summary.setAttribute("role", "status");
+    summary.setAttribute("aria-live", "polite");
     const status = createElement("p", "", "wfr-muted");
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
     const emptyNote = createElement("p", "暂无粉丝变化事件。", "wfr-muted wfr-empty");
     const list = createElement("div", null, "wfr-event-list");
-    body.append(clearAllActions, clearAllPanel, search, status, emptyNote, list);
-
-    function clearNode(node) {
-      while (node.childNodes.length > 0) node.removeChild(node.childNodes[0]);
-    }
+    const moreActions = createElement("div", null, "wfr-actions");
+    const moreButton = createElement("button", "加载更多", "wfr-button");
+    moreButton.type = "button";
+    moreActions.append(moreButton);
+    body.append(
+      clearAllActions,
+      clearAllPanel,
+      search,
+      summary,
+      status,
+      emptyNote,
+      list,
+      moreActions
+    );
 
     const renderedCards = new Map();
 
@@ -7656,18 +8133,22 @@
       const desired = allSorted.filter((event) =>
         matchesFollowerEventQuery(event, search.value || "")
       );
-      const desiredIds = new Set(desired.map((event) => event.id));
+      const visibleDesired = desired.slice(0, shownLimit);
+      const visibleIds = new Set(visibleDesired.map((event) => event.id));
       for (const [id, node] of [...renderedCards]) {
-        if (desiredIds.has(id)) continue;
+        if (visibleIds.has(id)) continue;
         if (node.parentNode) node.parentNode.removeChild(node);
         renderedCards.delete(id);
       }
-      for (const event of desired) {
+      for (const event of visibleDesired) {
         if (preserveExistingOrder && renderedCards.has(event.id)) continue;
         const card = renderedCards.get(event.id) || buildEventCard(event);
         renderedCards.set(event.id, card);
         list.append(card);
       }
+      const remaining = desired.length - visibleDesired.length;
+      moreActions.hidden = remaining <= 0;
+      moreButton.textContent = `加载更多（还有 ${remaining} 条）`;
       renderCounts(desired.length);
     }
 
@@ -7676,6 +8157,12 @@
       const noEvents = events.length === 0;
       const noMatches = matchingCount === 0;
       search.hidden = noEvents;
+      summary.hidden = noEvents;
+      summary.textContent = noEvents
+        ? ""
+        : matchingCount === events.length
+          ? `共 ${events.length} 条变化事件`
+          : `共 ${events.length} 条变化事件，匹配 ${matchingCount} 条`;
       emptyNote.textContent = noEvents
         ? "暂无粉丝变化事件。"
         : "没有匹配的粉丝变化事件。";
@@ -7732,6 +8219,7 @@
         }
         // Targeted reconciliation: surviving cards keep their nodes and the
         // reading position stays where it is.
+        shownLimit = Math.max(FRIEND_NOTES_PAGE_SIZE, renderedCards.size);
         syncList(true);
       });
       actions.append(clearButton, createFriendNoteProfileLink(event.uid));
@@ -7742,23 +8230,35 @@
           "wfr-button"
         );
         noteButton.type = "button";
-        noteButton.addEventListener("click", () =>
+        noteButton.addEventListener("click", () => {
+          const savedView = {
+            query: String(search.value || ""),
+            shown: Math.max(FRIEND_NOTES_PAGE_SIZE, renderedCards.size),
+            scrollTop: Number(body.scrollTop) || 0,
+          };
           showFriendNoteDetail(ownerUid, event.uid, null, () => {
             const fresh = loadFollowerState(ownerUid);
             renderFollowerEvents(
               ownerUid,
               fresh.ok ? fresh.state : { ...state, events },
-              String(search.value || "")
+              savedView
             );
-          })
-        );
+          });
+        });
         actions.append(noteButton);
       }
       item.append(actions);
       return item;
     }
 
-    search.addEventListener("input", () => syncList(false));
+    search.addEventListener("input", () => {
+      shownLimit = FRIEND_NOTES_PAGE_SIZE;
+      syncList(false);
+    });
+    moreButton.addEventListener("click", () => {
+      shownLimit += FRIEND_NOTES_PAGE_SIZE;
+      syncList(false);
+    });
 
     clearAllButton.addEventListener("click", () => {
       clearNode(clearAllPanel);
@@ -7791,6 +8291,7 @@
         if (!applyLocalWrite(result, "未能清空变化记录，本地数据未改变。")) {
           return;
         }
+        shownLimit = FRIEND_NOTES_PAGE_SIZE;
         syncList();
       });
       confirmActions.append(cancel, confirm);
@@ -7799,6 +8300,7 @@
     });
 
     syncList();
+    if (view.scrollTop > 0) body.scrollTop = view.scrollTop;
   }
 
   function viewFollowerEvents() {
@@ -8361,33 +8863,25 @@
   // stored list is read and written inside one lock. A failure here never
   // changes the outcome of the removal itself; it only means no log line.
   async function appendFollowerRemovalLog(ownerUid, record) {
-    const lockManager = pageLockManager();
-    if (lockManager === null) return false;
     const entry = {
       uid: record.uid,
       screenName: typeof record.screenName === "string" ? record.screenName : null,
       removedAt: new Date().toISOString(),
     };
     if (!isValidFollowerRemovalLogEntry(entry)) return false;
-    try {
-      return await lockManager.request.call(
-        lockManager,
-        "weibo-toolkit-follower-removal-log-" + ownerUid,
-        { mode: "exclusive" },
-        async (lock) => {
-          if (lock === null) return false;
-          const loaded = loadFollowerRemovalLog(ownerUid);
-          if (!loaded.ok) return false;
-          const entries = [...loaded.entries, entry].slice(-FOLLOWER_REMOVAL_LOG_LIMIT);
-          const serialized = JSON.stringify({ schemaVersion: 1, ownerUid, entries });
-          const key = FOLLOWER_REMOVAL_LOG_PREFIX + ownerUid;
-          GM_setValue(key, serialized);
-          return GM_getValue(key, null) === serialized;
-        }
-      );
-    } catch (_) {
-      return false;
-    }
+    const result = await withExclusiveStateLock(
+      "weibo-toolkit-follower-removal-log-" + ownerUid,
+      async () => {
+        const loaded = loadFollowerRemovalLog(ownerUid);
+        if (!loaded.ok) return false;
+        const entries = [...loaded.entries, entry].slice(-FOLLOWER_REMOVAL_LOG_LIMIT);
+        const serialized = JSON.stringify({ schemaVersion: 1, ownerUid, entries });
+        const key = FOLLOWER_REMOVAL_LOG_PREFIX + ownerUid;
+        GM_setValue(key, serialized);
+        return GM_getValue(key, null) === serialized;
+      }
+    );
+    return result === true;
   }
 
   function buildFollowerRemovalLogCsv(entries) {
@@ -8401,13 +8895,38 @@
 
   const FOLLOWER_REMOVAL_LOG_PAGE_SIZE = 100;
 
-  function showFollowerRemovalLog() {
+  function showFollowerRemovalLog(viewState) {
     const owner = determineCurrentUid();
     if (!owner.ok) {
       showFollowerFailure(owner);
       return;
     }
-    const body = showPanel("移除记录", showFollowerHygiene);
+    const view = isPlainObject(viewState)
+      ? {
+          query: typeof viewState.query === "string" ? viewState.query : "",
+          shown:
+            typeof viewState.shown === "number" &&
+            Number.isFinite(viewState.shown) &&
+            viewState.shown >= FOLLOWER_REMOVAL_LOG_PAGE_SIZE
+              ? viewState.shown
+              : FOLLOWER_REMOVAL_LOG_PAGE_SIZE,
+          scrollTop:
+            typeof viewState.scrollTop === "number" &&
+            Number.isFinite(viewState.scrollTop)
+              ? viewState.scrollTop
+              : 0,
+          onBack:
+            typeof viewState.onBack === "function"
+              ? viewState.onBack
+              : showFollowerHygiene,
+        }
+      : {
+          query: "",
+          shown: FOLLOWER_REMOVAL_LOG_PAGE_SIZE,
+          scrollTop: 0,
+          onBack: showFollowerHygiene,
+        };
+    const body = showPanel("移除记录", view.onBack);
     body.append(
       createElement(
         "p",
@@ -8433,6 +8952,7 @@
     exportButton.type = "button";
     const exportStatus = createElement("p", "", "wfr-muted wfr-hygiene-preset-status");
     exportStatus.setAttribute("role", "status");
+    exportStatus.setAttribute("aria-live", "polite");
     exportButton.addEventListener("click", () => {
       // The list on this page belongs to the account it was opened for.
       const current = determineCurrentUid();
@@ -8458,8 +8978,10 @@
     search.type = "search";
     search.placeholder = "搜索昵称或 UID";
     search.setAttribute("aria-label", "搜索移除记录");
+    search.value = view.query;
     const summary = createElement("p", "", "wfr-muted");
     summary.setAttribute("role", "status");
+    summary.setAttribute("aria-live", "polite");
     const list = createElement("div", null, "wfr-event-list");
     const moreActions = createElement("div", null, "wfr-actions");
     const moreButton = createElement("button", "加载更多", "wfr-button");
@@ -8467,21 +8989,49 @@
     moreActions.append(moreButton);
     body.append(search, summary, list, moreActions);
 
+    const notesLoaded = loadFriendNotesState(owner.uid);
+    const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
     let matching = newestFirst;
     let shown = 0;
-    function renderMore() {
-      for (const entry of matching.slice(shown, shown + FOLLOWER_REMOVAL_LOG_PAGE_SIZE)) {
+    function renderMore(batchSize = FOLLOWER_REMOVAL_LOG_PAGE_SIZE) {
+      const next = matching.slice(shown, shown + batchSize);
+      for (const entry of next) {
         const item = createElement("article", null, "wfr-event");
         item.append(createElement("h3", entry.screenName || "未知"));
         addLine(item, "时间", formatTime(entry.removedAt));
         addLine(item, "UID", entry.uid);
+        const cardActions = createElement("div", null, "wfr-actions");
+        cardActions.append(createFriendNoteProfileLink(entry.uid));
+        if (notedUids !== null) {
+          const noteButton = createElement(
+            "button",
+            hasOwn(notedUids, entry.uid) ? "友人档案" : "写档案",
+            "wfr-button"
+          );
+          noteButton.type = "button";
+          noteButton.addEventListener("click", () => {
+            const savedView = {
+              query: String(search.value || ""),
+              shown: Math.max(FOLLOWER_REMOVAL_LOG_PAGE_SIZE, shown),
+              scrollTop: Number(body.scrollTop) || 0,
+              onBack: view.onBack,
+            };
+            showFriendNoteDetail(owner.uid, entry.uid, null, () =>
+              showFollowerRemovalLog(savedView)
+            );
+          });
+          cardActions.append(noteButton);
+        }
+        item.append(cardActions);
         list.append(item);
       }
-      shown = Math.min(matching.length, shown + FOLLOWER_REMOVAL_LOG_PAGE_SIZE);
-      moreActions.hidden = shown >= matching.length;
+      shown += next.length;
+      const remaining = matching.length - shown;
+      moreActions.hidden = remaining <= 0;
+      moreButton.textContent = "加载更多（还有 " + String(remaining) + " 条）";
     }
-    function renderList() {
-      while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
+    function renderList(initialLimit = FOLLOWER_REMOVAL_LOG_PAGE_SIZE) {
+      clearNode(list);
       const needle = String(search.value || "").trim().toLowerCase();
       matching =
         needle === ""
@@ -8493,17 +9043,24 @@
             );
       shown = 0;
       summary.textContent =
-        needle === "" ? "" : "匹配 " + String(matching.length) + " 条";
+        needle === ""
+          ? "共 " + String(newestFirst.length) + " 条移除记录"
+          : "共 " +
+            String(newestFirst.length) +
+            " 条移除记录，匹配 " +
+            String(matching.length) +
+            " 条";
       if (matching.length === 0) {
-        list.append(createElement("p", "没有匹配的记录", "wfr-muted wfr-empty"));
+        list.append(createElement("p", "没有匹配的记录。", "wfr-muted wfr-empty"));
         moreActions.hidden = true;
         return;
       }
-      renderMore();
+      renderMore(initialLimit);
     }
-    search.addEventListener("input", renderList);
-    moreButton.addEventListener("click", renderMore);
-    renderList();
+    search.addEventListener("input", () => renderList());
+    moreButton.addEventListener("click", () => renderMore());
+    renderList(view.shown);
+    if (view.scrollTop > 0) body.scrollTop = view.scrollTop;
   }
 
   // Saved filter sets are a convenience preference of this browser, like the
@@ -8553,18 +9110,18 @@
   // stored list under this lock, so a tab never writes back the list it read
   // when its panel was opened. Returns null when no lock can be had.
   async function withHygienePresetsLock(ownerUid, transaction) {
-    const lockManager = pageLockManager();
-    if (lockManager === null) return null;
-    try {
-      return await lockManager.request.call(
-        lockManager,
-        "weibo-toolkit-follower-hygiene-presets-" + ownerUid,
-        { mode: "exclusive" },
-        async (lock) => (lock === null ? null : await transaction())
-      );
-    } catch (_) {
+    const result = await withExclusiveStateLock(
+      "weibo-toolkit-follower-hygiene-presets-" + ownerUid,
+      transaction
+    );
+    if (
+      isPlainObject(result) &&
+      result.ok === false &&
+      result.failureKind === "STATE_LOCK_UNAVAILABLE"
+    ) {
       return null;
     }
+    return result;
   }
 
   function saveHygienePresets(ownerUid, presets) {
@@ -8751,6 +9308,7 @@
       };
     }
     followerRemovalInFlight = true;
+    syncBeforeUnloadGuard();
     try {
       return await runFollowerRemovalBatch(
         records,
@@ -8759,6 +9317,7 @@
       );
     } finally {
       followerRemovalInFlight = false;
+      syncBeforeUnloadGuard();
     }
   }
 
@@ -8825,12 +9384,34 @@
         )
       );
     }
-    const profile = createElement("a", "查看主页", "wfr-button");
-    profile.href = "https://weibo.com/u/" + record.uid;
-    profile.target = "_blank";
-    profile.rel = "noopener noreferrer";
     const actions = createElement("div", null, "wfr-actions");
-    actions.append(profile);
+    actions.append(createFriendNoteProfileLink(record.uid));
+    if (
+      canonicalUid !== null &&
+      canonicalUid === record.uid &&
+      !batchActive &&
+      typeof removalState.noteLabel === "function" &&
+      typeof removalState.openFriendNote === "function"
+    ) {
+      const noteText = removalState.noteLabel(record.uid);
+      if (noteText !== null) {
+        const noteButton = createElement("button", noteText, "wfr-button");
+        noteButton.type = "button";
+        noteButton.disabled =
+          followerRemovalInFlight || followerUpdateRunning || updateRunning;
+        noteButton.addEventListener("click", () => {
+          if (
+            followerRemovalInFlight ||
+            (typeof removalState.isBatchActive === "function" &&
+              removalState.isBatchActive())
+          ) {
+            return;
+          }
+          removalState.openFriendNote(record.uid);
+        });
+        actions.append(noteButton);
+      }
+    }
     if (removed) {
       const removedStatus = createElement(
         "p",
@@ -8895,6 +9476,9 @@
           status.textContent = "请等待当前移除操作完成。";
           return;
         }
+        if (typeof removalState.dismissSingleConfirmation === "function") {
+          removalState.dismissSingleConfirmation();
+        }
         removeButton.disabled = true;
         const confirmation = createElement(
           "div",
@@ -8915,7 +9499,7 @@
           ),
           createElement(
             "p",
-            "Weibo Toolkit无法自动恢复这个操作。",
+            "Weibo Toolkit 无法自动恢复这个操作。",
             "wfr-muted"
           )
         );
@@ -8932,15 +9516,27 @@
         );
         cancelButton.type = "button";
         confirmButton.type = "button";
-        cancelButton.addEventListener("click", () => {
+        const dismissThisConfirmation = () => {
           if (confirmation.parentNode) {
             confirmation.parentNode.removeChild(confirmation);
           }
           removeButton.disabled = false;
+        };
+        if (typeof removalState.trackSingleConfirmation === "function") {
+          removalState.trackSingleConfirmation(dismissThisConfirmation);
+        }
+        cancelButton.addEventListener("click", () => {
+          dismissThisConfirmation();
+          if (typeof removalState.clearSingleConfirmation === "function") {
+            removalState.clearSingleConfirmation(dismissThisConfirmation);
+          }
         });
         confirmButton.addEventListener("click", async () => {
           cancelButton.disabled = true;
           confirmButton.disabled = true;
+          if (typeof removalState.clearSingleConfirmation === "function") {
+            removalState.clearSingleConfirmation(dismissThisConfirmation);
+          }
           status.textContent = "正在移除…";
           await removalState.confirmRemoval(record);
         });
@@ -8988,7 +9584,10 @@
     return item;
   }
 
-  function showFollowerHygiene() {
+  function showFollowerHygiene(initialViewState) {
+    const restoredView = isPlainObject(initialViewState)
+      ? initialViewState
+      : null;
     const owner = determineCurrentUid();
     if (!owner.ok) {
       showFollowerFailure(owner);
@@ -9022,7 +9621,16 @@
       body.append(updateButton);
       return;
     }
-    const successfullyRemovedUids = new Set();
+    // Child views keep the outcome of this snapshot's removals, including any
+    // unknown result that must stay ineligible until a fresh snapshot is read.
+    const previousResults =
+      restoredView !== null &&
+      restoredView.ownerUid === owner.uid &&
+      restoredView.snapshotCapturedAt === snapshot.capturedAt &&
+      isPlainObject(restoredView.removalResults)
+        ? restoredView.removalResults
+        : null;
+    const successfullyRemovedUids = new Set(previousResults?.successfullyRemovedUids);
     // Accounts this Toolkit has already removed but the snapshot still lists.
     // They are left out of the results, so the list moves on by itself and the
     // next batch can be picked without refreshing the snapshot first. The set
@@ -9036,8 +9644,8 @@
         if (pending[uid].confirmedAt > snapshotTime) hiddenRemovedUids.add(uid);
       }
     }
-    const uncertainRemovalUids = new Set();
-    const removalMessages = new Map();
+    const uncertainRemovalUids = new Set(previousResults?.uncertainRemovalUids);
+    const removalMessages = new Map(previousResults?.messages);
     const selectedUids = new Set();
     let currentPage = 1;
     let currentPageMatches = [];
@@ -9048,6 +9656,7 @@
     // and the ones the user has written a note about. Ticking such a card by
     // hand still works; that is a decision about one named account.
     let protectedReasons = new Map();
+    let notedUidsSnapshot = null;
     let protectionNotice = "";
 
     // Recomputed whenever it is about to be relied on, because notes can be
@@ -9058,6 +9667,7 @@
     function refreshProtection() {
       const notes = loadFriendNotesState(owner.uid);
       const noted = notes.ok ? notes.state.notes : null;
+      notedUidsSnapshot = noted;
       protectionNotice = notes.ok
         ? ""
         : "友人档案现在无法读取：批量选择只会跳过快照中你也关注的账号，不再跳过有友人档案的账号。";
@@ -9094,7 +9704,38 @@
     let batchStatus = null;
     let batchConfirmation = null;
     let filterInputs = [];
+    let filterInputTimer = null;
     let currentPagination = null;
+    let activeSingleConfirmationDismiss = null;
+    function clearPendingFilterInput() {
+      if (filterInputTimer !== null) {
+        clearTimeout(filterInputTimer);
+        filterInputTimer = null;
+      }
+    }
+    function flushPendingFilterInput() {
+      if (filterInputTimer !== null) {
+        clearPendingFilterInput();
+        renderResults(true);
+      }
+    }
+    function dismissSingleConfirmation() {
+      if (activeSingleConfirmationDismiss === null) return;
+      const dismiss = activeSingleConfirmationDismiss;
+      activeSingleConfirmationDismiss = null;
+      dismiss();
+    }
+    function trackSingleConfirmation(dismiss) {
+      activeSingleConfirmationDismiss = dismiss;
+    }
+    function clearSingleConfirmation(dismiss) {
+      if (activeSingleConfirmationDismiss === dismiss) {
+        activeSingleConfirmationDismiss = null;
+      }
+    }
+
+    let captureHygieneViewState = () => null;
+
     // Live handles on the currently rendered page, so selection and per-account
     // result updates never rebuild the result list.
     const cardNodes = new Map();
@@ -9110,6 +9751,23 @@
       registerCard,
       isBatchActive: () => Boolean(batchStatus && batchStatus.active),
       protectedReason: (uid) => protectedReasons.get(uid) || null,
+      dismissSingleConfirmation,
+      trackSingleConfirmation,
+      clearSingleConfirmation,
+      noteLabel: (uid) =>
+        notedUidsSnapshot === null
+          ? null
+          : hasOwn(notedUidsSnapshot, uid)
+            ? "友人档案"
+            : "写档案",
+      openFriendNote(uid) {
+        dismissSingleConfirmation();
+        invalidateBatchConfirmation();
+        const saved = captureHygieneViewState();
+        showFriendNoteDetail(owner.uid, uid, null, () =>
+          showFollowerHygiene(saved)
+        );
+      },
     };
 
     function registerCard(uid, element, selectionInput) {
@@ -9144,6 +9802,7 @@
     }
 
     function clearSelection() {
+      dismissSingleConfirmation();
       invalidateBatchConfirmation();
       selectedUids.clear();
       selectionMessage = "";
@@ -9182,6 +9841,7 @@
         selectedUids.add(record.uid);
         selectionMessage = "";
       }
+      dismissSingleConfirmation();
       invalidateBatchConfirmation();
       // Selection is ephemeral view state: nothing outside the toolbar depends on
       // it, so no card is rebuilt and the scroll position is untouched.
@@ -9201,6 +9861,7 @@
       }
       invalidateBatchConfirmation();
       followerRemovalInFlight = true;
+      syncBeforeUnloadGuard();
       let result;
       try {
         result = await removeSingleFollower(record.uid, owner.uid);
@@ -9213,6 +9874,7 @@
         };
       } finally {
         followerRemovalInFlight = false;
+        syncBeforeUnloadGuard();
       }
       if (result.ok) {
         successfullyRemovedUids.add(record.uid);
@@ -9267,7 +9929,12 @@
     filterToggle.type = "button";
     const removalLogButton = createElement("button", "移除记录", "wfr-button");
     removalLogButton.type = "button";
-    removalLogButton.addEventListener("click", showFollowerRemovalLog);
+    removalLogButton.addEventListener("click", () => {
+      const saved = captureHygieneViewState();
+      showFollowerRemovalLog({
+        onBack: () => showFollowerHygiene(saved),
+      });
+    });
     filterBar.append(filterSummary, removalLogButton, filterToggle);
     body.append(filterBar);
 
@@ -9392,9 +10059,11 @@
     controls.append(sourceGroup);
     controls.hidden = true;
     const collapseActions = createElement("div", null, "wfr-actions");
+    const resetFiltersButton = createElement("button", "重置筛选", "wfr-button");
+    resetFiltersButton.type = "button";
     const collapseButton = createElement("button", "收起筛选", "wfr-button");
     collapseButton.type = "button";
-    collapseActions.append(collapseButton);
+    collapseActions.append(resetFiltersButton, collapseButton);
     controls.append(collapseActions);
     body.append(controls);
 
@@ -9417,6 +10086,8 @@
     // controls stay reachable while reading a 50-card page. It sits after the
     // list, so at the end of the page it simply rests in normal flow.
     const selectionMessageNode = createElement("p", "", "wfr-muted");
+    selectionMessageNode.setAttribute("role", "status");
+    selectionMessageNode.setAttribute("aria-live", "polite");
     const selectionToolbar = createElement("div", null, "wfr-selection-bar");
     const selectionControls = createElement("div", null, "wfr-selection-row");
     const selectionCountNode = createElement("span", "", "wfr-selection-count");
@@ -9456,6 +10127,8 @@
     // the only stop control while a batch runs.
     const batchControls = createElement("div", null, "wfr-selection-row");
     const batchProgressNode = createElement("span", "", "wfr-selection-count");
+    batchProgressNode.setAttribute("role", "status");
+    batchProgressNode.setAttribute("aria-live", "polite");
     const stopBatchButton = createElement(
       "button",
       "停止后续操作",
@@ -9667,6 +10340,7 @@
         renderSelectionToolbar();
         return;
       }
+      flushPendingFilterInput();
       invalidateBatchConfirmation();
       refreshProtection();
       let refused = 0;
@@ -9724,6 +10398,7 @@
         renderSelectionToolbar();
         return;
       }
+      flushPendingFilterInput();
       invalidateBatchConfirmation();
       refreshProtection();
       const visible = new Set(currentPageMatches.map((match) => match.record.uid));
@@ -9854,6 +10529,8 @@
         renderSelectionToolbar();
         return;
       }
+      flushPendingFilterInput();
+      dismissSingleConfirmation();
       // The list about to be reviewed is marked with the protection as it is
       // now, not as it was when the accounts were selected.
       refreshProtection();
@@ -9886,7 +10563,7 @@
         ),
         createElement(
           "p",
-          "Weibo Toolkit无法自动恢复这些操作。",
+          "Weibo Toolkit 无法自动恢复这些操作。",
           "wfr-muted"
         ),
         createElement(
@@ -10081,6 +10758,8 @@
 
     function renderResults(resetPage) {
       if (batchStatus && batchStatus.active) return;
+      clearPendingFilterInput();
+      dismissSingleConfirmation();
       if (resetPage) {
         currentPage = 1;
         clearSelection();
@@ -10105,7 +10784,7 @@
       summaryLine.textContent =
         "快照：" +
         formatMinute(snapshot.capturedAt) +
-        " · API可见粉丝：" +
+        " · API 可见粉丝：" +
         String(snapshot.uniqueRecordCount) +
         (result.filters.activeCount === 0
           ? ""
@@ -10130,7 +10809,7 @@
         paginationSummary.textContent =
           hiddenCount > 0
             ? "符合筛选条件的粉丝都已移除。"
-            : "当前快照中没有符合筛选条件的API可见粉丝。";
+            : "当前快照中没有符合筛选条件的 API 可见粉丝。";
         paginationActions.hidden = true;
         paginationBar.hidden = false;
         currentPageMatches = [];
@@ -10199,6 +10878,15 @@
     filterToggle.addEventListener("click", () => {
       filtersExpanded = true;
       renderFilterBar(normalizeHygieneFilters(readFilters()));
+    });
+    resetFiltersButton.addEventListener("click", () => {
+      if (batchStatus && batchStatus.active) return;
+      applyFilters(normalizeHygieneFilters({}));
+      sortSelect.value = "SNAPSHOT";
+      presetSelect.value = "";
+      presetStatus.textContent = "";
+      syncPresetDeleteButton();
+      renderResults(true);
     });
     collapseButton.addEventListener("click", () => {
       filtersExpanded = false;
@@ -10303,21 +10991,111 @@
       createdAfter.input,
       ...sourceInputs.map((entry) => entry.input),
     ];
+    const prevDismissHandler = panelDismissHandler;
+    panelDismissHandler = () => {
+      clearPendingFilterInput();
+      if (typeof prevDismissHandler === "function") prevDismissHandler();
+    };
     for (const input of filterInputs) {
-      input.addEventListener("change", () => renderResults(true));
+      input.addEventListener("change", () => {
+        clearPendingFilterInput();
+        renderResults(true);
+      });
       if (input.tagName === "INPUT" && input.type !== "checkbox") {
-        input.addEventListener("input", () => renderResults(true));
+        input.addEventListener("input", () => {
+          clearPendingFilterInput();
+          filterInputTimer = setTimeout(() => {
+            filterInputTimer = null;
+            if (body.isConnected === false) return;
+            renderResults(true);
+          }, 160);
+        });
       }
     }
     // Disabled together with the filters while a batch runs, but they are not
     // filters themselves and must not trigger a re-filter on their own.
-    filterInputs.push(presetSelect, presetName, presetSave, presetDelete, removalLogButton);
-    renderResults(true);
+    filterInputs.push(
+      presetSelect,
+      presetName,
+      presetSave,
+      presetDelete,
+      resetFiltersButton,
+      removalLogButton
+    );
+    captureHygieneViewState = () => {
+      flushPendingFilterInput();
+      return {
+        ownerUid: owner.uid,
+        snapshotCapturedAt: snapshot.capturedAt,
+        removalResults: { successfullyRemovedUids, uncertainRemovalUids, messages: removalMessages },
+        filters: hygienePresetFilters(readFilters()),
+        sort: sortSelect.value,
+        page: currentPage,
+        scrollTop: Number(body.scrollTop) || 0,
+        filtersExpanded,
+        selectedUids: [...selectedUids],
+      };
+    };
+    if (restoredView !== null) {
+      if (isPlainObject(restoredView.filters)) {
+        applyFilters(normalizeHygieneFilters(restoredView.filters));
+      }
+      if (
+        typeof restoredView.sort === "string" &&
+        FOLLOWER_HYGIENE_SORTS.some(([value]) => value === restoredView.sort)
+      ) {
+        sortSelect.value = restoredView.sort;
+      }
+      filtersExpanded = Boolean(restoredView.filtersExpanded);
+      if (
+        typeof restoredView.page === "number" &&
+        Number.isFinite(restoredView.page) &&
+        restoredView.page >= 1
+      ) {
+        currentPage = Math.floor(restoredView.page);
+      }
+      if (Array.isArray(restoredView.selectedUids)) {
+        for (const uid of restoredView.selectedUids) {
+          if (
+            normalizeStableUid(uid) === uid &&
+            !hiddenRemovedUids.has(uid) &&
+            selectedUids.size < FOLLOWER_BATCH_MAX_SELECTION
+          ) {
+            selectedUids.add(uid);
+          }
+        }
+      }
+      renderResults(false);
+      // Drop any restored selections that no longer match the current filter set.
+      const matchedSet = new Set(currentMatches.map((match) => match.record.uid));
+      for (const uid of [...selectedUids]) {
+        if (!matchedSet.has(uid)) selectedUids.delete(uid);
+      }
+      renderSelectionToolbar();
+      if (
+        typeof restoredView.scrollTop === "number" &&
+        Number.isFinite(restoredView.scrollTop) &&
+        restoredView.scrollTop > 0
+      ) {
+        body.scrollTop = restoredView.scrollTop;
+      }
+    } else {
+      renderResults(true);
+    }
   }
 
   function formatTime(value) {
     const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+    if (Number.isNaN(date.getTime())) return String(value);
+    const pad = (part) => String(part).padStart(2, "0");
+    return (
+      `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+        date.getDate()
+      )} ` +
+      `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(
+        date.getSeconds()
+      )}`
+    );
   }
 
   // Minute precision for compact headers; the stored timestamp is untouched.
@@ -10326,7 +11104,9 @@
     if (Number.isNaN(date.getTime())) return String(value);
     const pad = (part) => String(part).padStart(2, "0");
     return (
-      `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()} ` +
+      `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+        date.getDate()
+      )} ` +
       `${pad(date.getHours())}:${pad(date.getMinutes())}`
     );
   }
@@ -10411,7 +11191,10 @@
     if (needle === "") return true;
     return (
       event.subjectUid.includes(needle) ||
-      event.displayName.toLowerCase().includes(needle)
+      event.displayName.toLowerCase().includes(needle) ||
+      (event.type === EVENT.SCREEN_NAME_CHANGED &&
+        typeof event.previous?.screenName === "string" &&
+        event.previous.screenName.toLowerCase().includes(needle))
     );
   }
 
@@ -10419,7 +11202,33 @@
     return events.filter((event) => matchesEventQuery(event, query));
   }
 
-  function renderEvents(ownerUid, state, notice, initialQuery = "") {
+  function renderEvents(ownerUid, state, notice, initialQueryOrView = "") {
+    const view =
+      typeof initialQueryOrView === "string"
+        ? {
+            query: initialQueryOrView,
+            shown: FRIEND_NOTES_PAGE_SIZE,
+            scrollTop: 0,
+          }
+        : {
+            query:
+              initialQueryOrView && typeof initialQueryOrView.query === "string"
+                ? initialQueryOrView.query
+                : "",
+            shown:
+              initialQueryOrView &&
+              typeof initialQueryOrView.shown === "number" &&
+              Number.isFinite(initialQueryOrView.shown) &&
+              initialQueryOrView.shown >= FRIEND_NOTES_PAGE_SIZE
+                ? initialQueryOrView.shown
+                : FRIEND_NOTES_PAGE_SIZE,
+            scrollTop:
+              initialQueryOrView &&
+              typeof initialQueryOrView.scrollTop === "number" &&
+              Number.isFinite(initialQueryOrView.scrollTop)
+                ? initialQueryOrView.scrollTop
+                : 0,
+          };
     const body = showPanel("关系事件", true);
     if (notice) body.append(createElement("p", notice, "wfr-success"));
     // Opening the list only reflects read state; it never changes it.
@@ -10427,6 +11236,9 @@
     showUnreadBadge(unread);
     addLine(body, "事件总数", state.events.length);
     addLine(body, "未读", unread);
+
+    let search = null;
+    let shown = 0;
 
     if (unread > 0) {
       const markButton = createElement("button", "全部标为已读", "wfr-button wfr-primary");
@@ -10452,18 +11264,17 @@
           showFailure("标记失败", saved);
           return;
         }
-        renderEvents(
-          ownerUid,
-          saved.state,
-          "全部事件已标为已读。",
-          String(search ? search.value || "" : initialQuery)
-        );
+        renderEvents(ownerUid, saved.state, "全部事件已标为已读。", {
+          query: String(search ? search.value || "" : view.query),
+          shown: Math.max(FRIEND_NOTES_PAGE_SIZE, shown || view.shown),
+          scrollTop: Number(body.scrollTop) || 0,
+        });
       });
       body.append(markButton);
     }
 
     if (state.events.length === 0) {
-      body.append(createElement("p", "暂无事件", "wfr-muted wfr-empty"));
+      body.append(createElement("p", "暂无事件。", "wfr-muted wfr-empty"));
       return;
     }
 
@@ -10486,30 +11297,60 @@
       )
     );
 
-    const search = createElement("input", null, "wfr-search");
+    search = createElement("input", null, "wfr-search");
     search.type = "search";
-    search.placeholder = "搜索昵称或 UID";
-    search.setAttribute("aria-label", "搜索昵称或 UID");
-    search.value = initialQuery;
+    search.placeholder = "搜索昵称、旧昵称或 UID";
+    search.setAttribute("aria-label", "搜索昵称、旧昵称或 UID");
+    search.value = view.query;
     body.append(search);
 
+    const summary = createElement("p", "", "wfr-muted");
+    summary.setAttribute("role", "status");
+    summary.setAttribute("aria-live", "polite");
     const list = createElement("div", null, "wfr-event-list");
-    body.append(list);
+    const moreActions = createElement("div", null, "wfr-actions");
+    const moreButton = createElement("button", "加载更多", "wfr-button");
+    moreButton.type = "button";
+    moreActions.append(moreButton);
+    body.append(summary, list, moreActions);
 
     const newestFirst = sortEventsNewestFirst(state.events);
+    const totalAccounts = new Set(newestFirst.map((event) => event.subjectUid)).size;
     // Read once per render of the page; the cards only need to know whether a
     // note exists. Unreadable notes simply mean no shortcut is offered.
     const notesLoaded = loadFriendNotesState(ownerUid);
     const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
-    const returnToEvents = () =>
-      renderEvents(ownerUid, state, null, String(search.value || ""));
-    function renderList(query) {
-      while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
-      const matching = filterEvents(newestFirst, query);
-      if (matching.length === 0) {
-        list.append(createElement("p", "没有匹配的事件", "wfr-muted wfr-empty"));
-        return;
+    const captureReturnToEvents = () => {
+      const savedView = {
+        query: String(search.value || ""),
+        shown: Math.max(FRIEND_NOTES_PAGE_SIZE, shown),
+        scrollTop: Number(body.scrollTop) || 0,
+      };
+      return () => {
+        const fresh = loadState(ownerUid);
+        renderEvents(ownerUid, fresh.ok ? fresh.state : state, null, savedView);
+      };
+    };
+
+    let groupList = [];
+
+    function renderMore(batchSize = FRIEND_NOTES_PAGE_SIZE) {
+      const next = groupList.slice(shown, shown + batchSize);
+      for (const group of next) {
+        list.append(
+          buildEventCard(ownerUid, state, group, notedUids, captureReturnToEvents)
+        );
       }
+      shown += next.length;
+      const remaining = groupList.length - shown;
+      moreActions.hidden = remaining <= 0;
+      moreButton.textContent = `加载更多（还有 ${remaining} 条）`;
+    }
+
+    function renderList(query, initialLimit = FRIEND_NOTES_PAGE_SIZE) {
+      clearNode(list);
+      shown = 0;
+      const matching = filterEvents(newestFirst, query);
       // One card per account, placed where its newest matching event falls.
       // The card shows that newest event; the rest are one click away in the
       // account's timeline, so an account that changed often no longer fills
@@ -10520,22 +11361,29 @@
         if (group) group.push(event);
         else groups.set(event.subjectUid, [event]);
       }
-      for (const group of groups.values()) {
-        list.append(
-          buildEventCard(ownerUid, state, group, notedUids, returnToEvents)
-        );
+      groupList = [...groups.values()];
+      summary.textContent =
+        matching.length === newestFirst.length
+          ? `共 ${totalAccounts} 个账号（${newestFirst.length} 条事件）`
+          : `共 ${totalAccounts} 个账号（${newestFirst.length} 条事件），匹配 ${groupList.length} 个账号（${matching.length} 条事件）`;
+      if (groupList.length === 0) {
+        list.append(createElement("p", "没有匹配的事件。", "wfr-muted wfr-empty"));
       }
+      renderMore(initialLimit);
     }
+
     search.addEventListener("input", () => renderList(search.value || ""));
-    renderList(initialQuery);
+    moreButton.addEventListener("click", () => renderMore());
+    renderList(view.query, view.shown);
+    if (view.scrollTop > 0) body.scrollTop = view.scrollTop;
   }
 
   // group: the matching events of one account, newest first.
-  function buildEventCard(ownerUid, state, group, notedUids, onReturn) {
-    const returnToEvents =
-      typeof onReturn === "function"
-        ? onReturn
-        : () => renderEvents(ownerUid, state, null);
+  function buildEventCard(ownerUid, state, group, notedUids, captureReturn) {
+    const captureReturnToEvents =
+      typeof captureReturn === "function"
+        ? captureReturn
+        : () => () => renderEvents(ownerUid, state, null);
     const event = group[0];
     const read = group.every((entry) => entry.read);
     const item = createElement(
@@ -10551,6 +11399,7 @@
     );
     addLine(item, "时间", formatTime(event.detectedAt));
     addLine(item, "名称", event.displayName);
+    addLine(item, "UID", event.subjectUid);
     if (event.type === EVENT.SCREEN_NAME_CHANGED) {
       addLine(item, "变化", describeEvent(event));
     }
@@ -10558,7 +11407,7 @@
     const detailButton = createElement("button", "详情", "wfr-button");
     detailButton.type = "button";
     detailButton.addEventListener("click", () =>
-      showEventDetail(ownerUid, state, event, returnToEvents)
+      showEventDetail(ownerUid, state, event, captureReturnToEvents())
     );
     actions.append(detailButton);
     // The whole stored history of the account, not just what the search
@@ -10567,15 +11416,16 @@
     if (historyCount > 1) {
       const moreButton = createElement(
         "button",
-        `该账号共 ${historyCount} 条事件`,
+        `关系时间线（${historyCount} 条事件）`,
         "wfr-button"
       );
       moreButton.type = "button";
       moreButton.addEventListener("click", () =>
-        showTimeline(ownerUid, state, event.subjectUid, returnToEvents)
+        showTimeline(ownerUid, state, event.subjectUid, captureReturnToEvents())
       );
       actions.append(moreButton);
     }
+    actions.append(createFriendNoteProfileLink(event.subjectUid));
     if (notedUids !== null) {
       const noteButton = createElement(
         "button",
@@ -10584,7 +11434,7 @@
       );
       noteButton.type = "button";
       noteButton.addEventListener("click", () =>
-        showFriendNoteDetail(ownerUid, event.subjectUid, null, returnToEvents)
+        showFriendNoteDetail(ownerUid, event.subjectUid, null, captureReturnToEvents())
       );
       actions.append(noteButton);
     }
@@ -10611,11 +11461,8 @@
       addLine(body, "变化前", transition.previous);
       addLine(body, "变化后", transition.current);
     }
-    addLine(
-      body,
-      "该 UID 的已存事件",
-      eventsForSubject(state.events, event.subjectUid).length
-    );
+    const historyCount = eventsForSubject(state.events, event.subjectUid).length;
+    addLine(body, "该 UID 的已存事件", historyCount);
 
     if (event.type === EVENT.VISIBLE_FOLLOWING_DISAPPEARED) {
       body.append(
@@ -10627,33 +11474,68 @@
       );
     }
 
+    const actions = createElement("div", null, "wfr-actions");
     const timelineButton = createElement(
       "button",
-      "查看关系时间线",
+      `关系时间线（${historyCount} 条事件）`,
       "wfr-button wfr-primary"
     );
     timelineButton.type = "button";
+    const reopenDetail = () =>
+      showEventDetail(ownerUid, state, event, backToEvents);
     timelineButton.addEventListener("click", () =>
-      showTimeline(ownerUid, state, event.subjectUid, () =>
-        showEventDetail(ownerUid, state, event, backToEvents)
-      )
+      showTimeline(ownerUid, state, event.subjectUid, reopenDetail)
     );
-    body.append(timelineButton);
+    actions.append(timelineButton, createFriendNoteProfileLink(event.subjectUid));
+    const notesLoaded = loadFriendNotesState(ownerUid);
+    if (notesLoaded.ok) {
+      const noteButton = createElement(
+        "button",
+        hasOwn(notesLoaded.state.notes, event.subjectUid) ? "友人档案" : "写档案",
+        "wfr-button"
+      );
+      noteButton.type = "button";
+      noteButton.addEventListener("click", () =>
+        showFriendNoteDetail(ownerUid, event.subjectUid, null, reopenDetail)
+      );
+      actions.append(noteButton);
+    }
+    body.append(actions);
   }
 
   function showTimeline(ownerUid, state, subjectUid, onBack) {
     const history = eventsForSubject(state.events, subjectUid);
-    const body = showPanel(
-      `${bestDisplayName(state, subjectUid)} · 关系时间线`,
+    const backAction =
       typeof onBack === "function"
         ? onBack
-        : () => renderEvents(ownerUid, state, null)
+        : () => renderEvents(ownerUid, state, null);
+    const body = showPanel(
+      `${bestDisplayName(state, subjectUid)} · 关系时间线`,
+      backAction
     );
     addLine(body, "UID", subjectUid);
     addLine(body, "历史事件", history.length);
+    const actions = createElement("div", null, "wfr-actions wfr-compact-actions");
+    actions.append(createFriendNoteProfileLink(subjectUid));
+    const notesLoaded = loadFriendNotesState(ownerUid);
+    if (notesLoaded.ok) {
+      const noteButton = createElement(
+        "button",
+        hasOwn(notesLoaded.state.notes, subjectUid) ? "友人档案" : "写档案",
+        "wfr-button"
+      );
+      noteButton.type = "button";
+      noteButton.addEventListener("click", () =>
+        showFriendNoteDetail(ownerUid, subjectUid, null, () =>
+          showTimeline(ownerUid, state, subjectUid, backAction)
+        )
+      );
+      actions.append(noteButton);
+    }
+    body.append(actions);
 
     if (history.length === 0) {
-      body.append(createElement("p", "暂无事件", "wfr-muted wfr-empty"));
+      body.append(createElement("p", "暂无事件。", "wfr-muted wfr-empty"));
       return;
     }
 
@@ -10705,7 +11587,7 @@
     addLine(body, "已有快照", snapshot ? "是" : "否");
     if (snapshot) {
       addLine(body, "上次成功更新", formatTime(snapshot.capturedAt));
-      addLine(body, "API可见关注", snapshot.visibleCount);
+      addLine(body, "API 可见关注", snapshot.visibleCount);
       addLine(body, "接口总数", snapshot.reportedTotal);
       addLine(
         body,
@@ -10899,38 +11781,13 @@
     return friendNotesStateFromRaw(raw, ownerUid);
   }
 
-  function friendNotesLockUnavailable(reason, error) {
-    const result = {
-      ok: false,
-      failureKind: "STATE_LOCK_UNAVAILABLE",
-      reason,
-    };
-    if (error) result.errorName = error.name ? String(error.name) : "Error";
-    return result;
-  }
-
   // Owner-scoped cross-tab serialization, mirroring the other durable modules.
   // The transaction must stay local and short: no fetch, no delay, no UI wait.
   async function withFriendNotesLock(ownerUid, transaction) {
-    const lockManager = pageLockManager();
-    if (lockManager === null) {
-      return friendNotesLockUnavailable("LOCK_UNAVAILABLE");
-    }
-    try {
-      return await lockManager.request.call(
-        lockManager,
-        FRIEND_NOTES_LOCK_PREFIX + ownerUid,
-        { mode: "exclusive" },
-        async (lock) => {
-          if (lock === null) {
-            return friendNotesLockUnavailable("LOCK_NOT_ACQUIRED");
-          }
-          return await transaction();
-        }
-      );
-    } catch (error) {
-      return friendNotesLockUnavailable("LOCK_REQUEST_FAILED", error);
-    }
+    return await withExclusiveStateLock(
+      FRIEND_NOTES_LOCK_PREFIX + ownerUid,
+      transaction
+    );
   }
 
   // Unlocked helper: callers must already hold the Friend Notes lock. It writes
@@ -11113,9 +11970,10 @@
   // derivation the profile page uses, read from the states as they are now, so
   // evidence that has been cleared or replaced stops matching immediately.
   function deriveFriendNoteEntries(notesState, friendState, followerState) {
+    const factsIndex = buildProfileLocalFactsIndex(friendState, followerState);
     return Object.keys(notesState.notes)
       .map((uid) => {
-        const facts = deriveProfileLocalFacts(uid, friendState, followerState);
+        const facts = factsIndex.get(uid);
         return {
           uid,
           record: notesState.notes[uid],
@@ -11206,7 +12064,7 @@
   }
 
   function clearFriendNoteNode(node) {
-    while (node.childNodes.length > 0) node.removeChild(node.childNodes[0]);
+    clearNode(node);
   }
 
   function focusFriendNoteControl(control) {
@@ -11393,6 +12251,7 @@
     function renderView(focusPrimary) {
       mode = "view";
       draftChanged = null;
+      syncBeforeUnloadGuard();
       clearFriendNoteNode(content);
       if (record === null) {
         content.append(
@@ -11465,6 +12324,7 @@
       const counter = createElement("p", "", "wfr-muted wfr-note-counter");
       const syncCounter = () => {
         counter.textContent = `${String(textarea.value).length} / ${FRIEND_NOTE_MAX_LENGTH}`;
+        syncBeforeUnloadGuard();
       };
       textarea.addEventListener("input", syncCounter);
       syncCounter();
@@ -11479,6 +12339,7 @@
       tagInput.id = `${fieldId}-tag`;
       tagInput.maxLength = FRIEND_NOTE_TAG_MAX_LENGTH;
       tagInput.placeholder = "输入标签后按回车";
+      tagInput.addEventListener("input", syncBeforeUnloadGuard);
       draftChanged = () =>
         String(textarea.value) !== draft.note ||
         String(tagInput.value) !== "" ||
@@ -11513,6 +12374,7 @@
           item.append(createElement("span", tag), removeButton);
           tagList.append(item);
         }
+        syncBeforeUnloadGuard();
       }
 
       // Returns false only when pending input was rejected, so a save never
@@ -11630,10 +12492,12 @@
           return;
         }
         busy = true;
+        syncBeforeUnloadGuard();
         setControlsDisabled(true);
         setStatus("正在保存…");
         const result = await attemptSave(draft);
         busy = false;
+        syncBeforeUnloadGuard();
         if (result.ok) {
           adopt(result.record);
           renderView(true);
@@ -11744,11 +12608,13 @@
           return;
         }
         busy = true;
+        syncBeforeUnloadGuard();
         cancelButton.disabled = true;
         confirmButton.disabled = true;
         setStatus("正在删除…");
         const result = await attemptSave({ note: "", tags: [] });
         busy = false;
+        syncBeforeUnloadGuard();
         if (result.ok) {
           adopt(null);
           renderView(true);
@@ -11817,8 +12683,21 @@
   }
 
   function showFriendNotesManager(viewState) {
-    // Search text and tag filter survive a round trip through a detail view.
+    // Search text, tag filter, loaded page count and scroll position survive a
+    // round trip through a detail view.
     const view = viewState || { query: "", tag: null };
+    if (typeof view.query !== "string") view.query = "";
+    if (typeof view.tag !== "string") view.tag = null;
+    if (
+      typeof view.shown !== "number" ||
+      !Number.isFinite(view.shown) ||
+      view.shown < FRIEND_NOTES_PAGE_SIZE
+    ) {
+      view.shown = FRIEND_NOTES_PAGE_SIZE;
+    }
+    if (typeof view.scrollTop !== "number" || !Number.isFinite(view.scrollTop)) {
+      view.scrollTop = 0;
+    }
     const owner = determineCurrentUid();
     if (!owner.ok) {
       showFailure("友人档案", owner);
@@ -11856,6 +12735,13 @@
       );
     }
 
+    let shown = 0;
+    const openSubjectFromManager = (subjectUid) => {
+      if (shown > 0) view.shown = Math.max(FRIEND_NOTES_PAGE_SIZE, shown);
+      view.scrollTop = Number(body.scrollTop) || 0;
+      showFriendNoteDetail(ownerUid, subjectUid, view);
+    };
+
     const routeSubject = friendNoteRouteSubject(ownerUid);
     if (routeSubject !== null) {
       const routeActions = createElement("div", null, "wfr-actions");
@@ -11866,7 +12752,7 @@
         "wfr-button wfr-primary"
       );
       routeButton.addEventListener("click", () =>
-        showFriendNoteDetail(ownerUid, routeSubject, view)
+        openSubjectFromManager(routeSubject)
       );
       routeActions.append(routeButton);
       body.append(routeActions);
@@ -11931,7 +12817,6 @@
     body.append(summary, list, moreActions);
 
     let matching = [];
-    let shown = 0;
 
     function buildCard(entry) {
       const item = createElement("article", null, "wfr-event");
@@ -11972,23 +12857,24 @@
       const actions = createElement("div", null, "wfr-actions");
       const openButton = createFriendNoteButton("查看与编辑");
       openButton.addEventListener("click", () =>
-        showFriendNoteDetail(ownerUid, entry.uid, view)
+        openSubjectFromManager(entry.uid)
       );
       actions.append(openButton, createFriendNoteProfileLink(entry.uid));
       item.append(actions);
       return item;
     }
 
-    function renderMore() {
-      const next = matching.slice(shown, shown + FRIEND_NOTES_PAGE_SIZE);
+    function renderMore(batchSize = FRIEND_NOTES_PAGE_SIZE) {
+      const next = matching.slice(shown, shown + batchSize);
       for (const entry of next) list.append(buildCard(entry));
       shown += next.length;
+      view.shown = Math.max(FRIEND_NOTES_PAGE_SIZE, shown);
       const remaining = matching.length - shown;
       moreActions.hidden = remaining <= 0;
       moreButton.textContent = `加载更多（还有 ${remaining} 条）`;
     }
 
-    function renderList() {
+    function renderList(initialLimit = FRIEND_NOTES_PAGE_SIZE) {
       clearFriendNoteNode(list);
       matching = filterFriendNoteEntries(entries, view.query, view.tag);
       shown = 0;
@@ -11997,21 +12883,26 @@
           ? `共 ${entries.length} 条档案`
           : `共 ${entries.length} 条档案，匹配 ${matching.length} 条`;
       if (matching.length === 0) {
-        list.append(createElement("p", "没有匹配的档案", "wfr-muted wfr-empty"));
+        list.append(createElement("p", "没有匹配的档案。", "wfr-muted wfr-empty"));
       }
-      renderMore();
+      renderMore(initialLimit);
     }
 
     search.addEventListener("input", () => {
       view.query = String(search.value || "");
+      view.shown = FRIEND_NOTES_PAGE_SIZE;
+      view.scrollTop = 0;
       renderList();
     });
     tagSelect.addEventListener("change", () => {
       view.tag = tagSelect.value === "" ? null : String(tagSelect.value);
+      view.shown = FRIEND_NOTES_PAGE_SIZE;
+      view.scrollTop = 0;
       renderList();
     });
-    moreButton.addEventListener("click", renderMore);
-    renderList();
+    moreButton.addEventListener("click", () => renderMore());
+    renderList(view.shown);
+    if (view.scrollTop > 0) body.scrollTop = view.scrollTop;
   }
 
   function showFriendNoteDetail(ownerUid, subjectUid, viewState, onBack) {
@@ -12075,7 +12966,7 @@
       ).length;
       const timelineActions = createElement("div", null, "wfr-actions");
       const timelineButton = createFriendNoteButton(
-        `查看关系时间线（${eventCount} 条本地事件）`
+        `关系时间线（${eventCount} 条事件）`
       );
       timelineButton.addEventListener("click", () =>
         showTimeline(ownerUid, subject.friend.state, subjectUid, () =>
@@ -12119,6 +13010,7 @@
     cancelProfileFriendNotesDiscovery();
     removeProfileFriendNotesNode();
     profileFriendNotesContext = null;
+    syncBeforeUnloadGuard();
   }
 
   function scheduleProfileFriendNotesEnsure() {
@@ -12257,7 +13149,7 @@
           "wfr-actions wfr-compact-actions"
         );
         const timelineButton = createFriendNoteButton(
-          `关系时间线（${eventCount} 条本地事件）`
+          `关系时间线（${eventCount} 条事件）`
         );
         timelineButton.addEventListener("click", () =>
           showTimeline(
@@ -12342,6 +13234,17 @@
   let feedFriendNotes = null;
   // { ownerUid, subjectUid, editor, root, notice, entry, onKeydown, ... }
   let feedFriendNoteCard = null;
+
+  function anyFriendNoteEditorHasUnsavedChanges() {
+    return Boolean(
+      panelHoldsUnsavedNote() ||
+        (profileFriendNotesContext !== null &&
+          profileFriendNotesContext.editor &&
+          profileFriendNotesContext.editor.hasUnsavedChanges()) ||
+        (feedFriendNoteCard !== null &&
+          feedFriendNoteCard.editor.hasUnsavedChanges())
+    );
+  }
 
   function feedFriendNotesActiveForRoute() {
     return Boolean(
@@ -12467,7 +13370,7 @@
   }
 
   // One read of each state per activation, shared by every card. The verified
-  // notes map and the per-UID derived facts are reused until the data is
+  // notes map and the pre-indexed local facts are reused until the data is
   // reloaded as a whole.
   function loadFeedFriendNotesData(ownerUid) {
     const notes = loadFriendNotesState(ownerUid);
@@ -12476,21 +13379,15 @@
     const follower = loadFollowerState(ownerUid);
     return {
       notes: notes.state.notes,
-      friendState: friend.ok ? friend.state : null,
-      followerState: follower.ok ? follower.state : null,
-      factsByUid: new Map(),
+      factsIndex: buildProfileLocalFactsIndex(
+        friend.ok ? friend.state : null,
+        follower.ok ? follower.state : null
+      ),
     };
   }
 
   function feedFriendNoteFacts(uid) {
-    const data = feedFriendNotes.data;
-    if (!data.factsByUid.has(uid)) {
-      data.factsByUid.set(
-        uid,
-        deriveProfileLocalFacts(uid, data.friendState, data.followerState)
-      );
-    }
-    return data.factsByUid.get(uid);
+    return feedFriendNotes.data.factsIndex.get(uid);
   }
 
   function reloadFeedFriendNotesData() {
@@ -12572,10 +13469,12 @@
         ? `友人档案：已为${who}写过备注，打开查看${hint === "" ? "" : `；${hint}`}`
         : `友人档案：为${who}写备注${hint === "" ? "" : `；${hint}`}`
     );
+    const baseTitle = hasNote ? "查看友人档案" : "为这位作者写备注";
     entry.button.setAttribute(
       "title",
-      hasNote ? "查看友人档案" : "为这位作者写备注"
+      hint === "" ? baseTitle : `${baseTitle}（${hint}）`
     );
+    setToolkitClass(entry.button, "wfr-feed-note-has-hint", hint !== "");
     entry.hintText = hint;
     entry.hint.textContent = hint;
     entry.hint.hidden = hint === "";
@@ -12989,6 +13888,7 @@
     const card = feedFriendNoteCard;
     if (card === null) return;
     feedFriendNoteCard = null;
+    syncBeforeUnloadGuard();
     if (typeof document.removeEventListener === "function") {
       document.removeEventListener("keydown", card.onKeydown);
       document.removeEventListener("click", card.onDocumentClick, true);
@@ -13149,13 +14049,19 @@
       resizeObserver: null,
       onKeydown: (event) => {
         if (
-          panelRoot === null &&
-          event &&
-          !event.defaultPrevented &&
-          event.key === "Escape" &&
-          !isFriendNoteImeKeyEvent(event)
+          panelRoot !== null ||
+          !event ||
+          event.defaultPrevented ||
+          isFriendNoteImeKeyEvent(event)
         ) {
+          return;
+        }
+        if (event.key === "Escape") {
           requestCloseFeedFriendNoteCard(true);
+          return;
+        }
+        if (event.key === "Tab") {
+          trapDialogTabKey(event, root);
         }
       },
       onDocumentClick: (event) => {
@@ -14623,8 +15529,7 @@
       return;
     }
     if (file === null) {
-      const cancelled = showPanel("恢复已取消", true);
-      cancelled.append(createElement("p", "恢复已取消。", "wfr-muted"));
+      announceCancelWithoutReplacingPanel("恢复已取消。");
       return;
     }
 
@@ -14714,25 +15619,43 @@
     }
   }
 
-  async function saveBackup(json, filename) {
+  function announceCancelWithoutReplacingPanel(text) {
+    setLauncherStatus(text, AUTO_STATUS_DURATION_MS);
     if (
-      typeof unsafeWindow !== "undefined" &&
-      typeof unsafeWindow.showSaveFilePicker === "function"
+      panelExitLocked ||
+      !panelRoot ||
+      typeof panelRoot.querySelector !== "function"
     ) {
+      return;
+    }
+    const body = panelRoot.querySelector(".wfr-body");
+    if (!body) return;
+    const existing = panelRoot.querySelector(".wfr-inline-cancel-status");
+    if (existing) {
+      existing.textContent = text;
+      return;
+    }
+    const note = createElement("p", text, "wfr-muted wfr-inline-cancel-status");
+    note.setAttribute("role", "status");
+    note.setAttribute("aria-live", "polite");
+    if (body.childNodes.length > 0) body.insertBefore(note, body.childNodes[0]);
+    else body.append(note);
+  }
+
+  async function saveBackup(json, filename) {
+    const pickerWindow = resolveSaveFilePickerWindow();
+    if (pickerWindow !== null) {
       let fileHandle;
       try {
-        fileHandle = await unsafeWindow.showSaveFilePicker.call(
-          unsafeWindow,
-          {
-            suggestedName: filename,
-            types: [
-              {
-                description: "JSON backup",
-                accept: { "application/json": [".json"] },
-              },
-            ],
-          }
-        );
+        fileHandle = await pickerWindow.showSaveFilePicker.call(pickerWindow, {
+          suggestedName: filename,
+          types: [
+            {
+              description: "JSON backup",
+              accept: { "application/json": [".json"] },
+            },
+          ],
+        });
       } catch (error) {
         const errorName = error && error.name ? String(error.name) : "Error";
         if (errorName === "AbortError") return { cancelled: true };
@@ -14752,11 +15675,13 @@
       try {
         await writable.write(json);
       } catch (error) {
+        await abortWritableStreamQuietly(writable);
         throw backupExportError("WRITE_FILE", error);
       }
       try {
         await writable.close();
       } catch (error) {
+        await abortWritableStreamQuietly(writable);
         throw backupExportError("CLOSE_FILE", error);
       }
       return {
@@ -14825,8 +15750,7 @@
     }
 
     if (saveResult.cancelled) {
-      const body = showPanel("导出已取消", true);
-      body.append(createElement("p", "导出已取消", "wfr-muted"));
+      announceCancelWithoutReplacingPanel("导出已取消。");
       return;
     }
 
@@ -14927,8 +15851,24 @@
       isPlainObject(viewState) &&
       typeof viewState.filter === "string" &&
       typeof viewState.query === "string"
-        ? { filter: viewState.filter, query: viewState.query }
-        : { filter: "ALL", query: "" };
+        ? {
+            filter: viewState.filter,
+            query: viewState.query,
+            shown:
+              typeof viewState.shown === "number" && viewState.shown > 0
+                ? viewState.shown
+                : FRIEND_NOTES_PAGE_SIZE,
+            scrollTop:
+              typeof viewState.scrollTop === "number" && viewState.scrollTop >= 0
+                ? viewState.scrollTop
+                : 0,
+          }
+        : {
+            filter: "ALL",
+            query: "",
+            shown: FRIEND_NOTES_PAGE_SIZE,
+            scrollTop: 0,
+          };
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
       showFailure("关系概览", uidResult);
@@ -14956,7 +15896,7 @@
       );
     } else {
       addLine(body, "快照时间", formatTime(overview.current.capturedAt));
-      addLine(body, "API可见关注", overview.current.visibleFollowing);
+      addLine(body, "API 可见关注", overview.current.visibleFollowing);
       addLine(body, "互相关注", overview.current.mutual);
       addLine(body, "单向关注", overview.current.oneWay);
       body.append(
@@ -15016,6 +15956,8 @@
       body.append(search);
 
       const summary = createElement("p", "", "wfr-muted");
+      summary.setAttribute("role", "status");
+      summary.setAttribute("aria-live", "polite");
       const list = createElement("div", null, "wfr-event-list");
       const moreActions = createElement("div", null, "wfr-actions");
       const moreButton = createElement("button", "加载更多", "wfr-button");
@@ -15025,11 +15967,15 @@
 
       let matching = [];
       let shown = 0;
-      const returnToOverview = () =>
-        showRelationshipOverview({
+      const captureReturnToOverview = () => {
+        const savedView = {
           filter: filterSelect.value,
           query: String(search.value || ""),
-        });
+          shown: Math.max(FRIEND_NOTES_PAGE_SIZE, shown),
+          scrollTop: Number(body.scrollTop) || 0,
+        };
+        return () => showRelationshipOverview(savedView);
+      };
 
       function buildRecordCard(record) {
         const item = createElement("article", null, "wfr-event");
@@ -15054,12 +16000,12 @@
         if (eventCount > 0) {
           const timelineButton = createElement(
             "button",
-            `关系时间线（${eventCount}）`,
+            `关系时间线（${eventCount} 条事件）`,
             "wfr-button"
           );
           timelineButton.type = "button";
           timelineButton.addEventListener("click", () =>
-            showTimeline(ownerUid, loaded.state, record.uid, returnToOverview)
+            showTimeline(ownerUid, loaded.state, record.uid, captureReturnToOverview())
           );
           actions.append(timelineButton);
         }
@@ -15071,7 +16017,7 @@
           );
           noteButton.type = "button";
           noteButton.addEventListener("click", () =>
-            showFriendNoteDetail(ownerUid, record.uid, null, returnToOverview)
+            showFriendNoteDetail(ownerUid, record.uid, null, captureReturnToOverview())
           );
           actions.append(noteButton);
         }
@@ -15079,17 +16025,20 @@
         return item;
       }
 
-      function renderMore() {
-        const next = matching.slice(shown, shown + FRIEND_NOTES_PAGE_SIZE);
+      function renderMore(batchSize = FRIEND_NOTES_PAGE_SIZE) {
+        const next = matching.slice(shown, shown + batchSize);
         for (const record of next) list.append(buildRecordCard(record));
         shown += next.length;
         const remaining = matching.length - shown;
         moreActions.hidden = remaining <= 0;
-        moreButton.textContent = `加载更多（还有 ${remaining} 个）`;
+        moreButton.textContent = `加载更多（还有 ${remaining} 条）`;
       }
 
-      function renderList() {
-        while (list.childNodes.length > 0) list.removeChild(list.childNodes[0]);
+      function renderList(
+        initialShown = FRIEND_NOTES_PAGE_SIZE,
+        initialScrollTop = 0
+      ) {
+        clearNode(list);
         matching = filterOverviewFollowingRecords(
           records,
           view.filter,
@@ -15102,22 +16051,27 @@
             : `共 ${records.length} 个关注账号，匹配 ${matching.length} 个`;
         if (matching.length === 0) {
           list.append(
-            createElement("p", "没有匹配的关注账号", "wfr-muted wfr-empty")
+            createElement("p", "没有匹配的关注账号。", "wfr-muted wfr-empty")
           );
         }
-        renderMore();
+        renderMore(Math.max(FRIEND_NOTES_PAGE_SIZE, initialShown));
+        if (initialScrollTop > 0) body.scrollTop = initialScrollTop;
       }
 
       filterSelect.addEventListener("change", () => {
         view.filter = filterSelect.value;
+        view.shown = FRIEND_NOTES_PAGE_SIZE;
+        view.scrollTop = 0;
         renderList();
       });
       search.addEventListener("input", () => {
         view.query = String(search.value || "");
+        view.shown = FRIEND_NOTES_PAGE_SIZE;
+        view.scrollTop = 0;
         renderList();
       });
-      moreButton.addEventListener("click", renderMore);
-      renderList();
+      moreButton.addEventListener("click", () => renderMore());
+      renderList(view.shown, view.scrollTop);
     }
   }
 
@@ -15242,6 +16196,7 @@
 
           updateRunning = true;
           setLauncherStatus("关系雷达正在自动更新…");
+          refreshOpenToolkitHome();
           let result;
           // An outcome is only ever written for an attempt the storage layer
           // actually accepted, so a rejected attempt cannot leave an orphan
@@ -15290,6 +16245,7 @@
             AUTO_STATUS_DURATION_MS
           );
           refreshUnreadBadge();
+          refreshOpenToolkitHome();
           return result;
         }
       );
@@ -15360,6 +16316,7 @@
 
           followerUpdateRunning = true;
           setLauncherStatus("粉丝快照正在自动更新…");
+          refreshOpenToolkitHome();
           let result;
           try {
             result = await performFollowerUpdate(
@@ -15396,6 +16353,7 @@
                 : "粉丝快照自动更新失败，且结果记录未保存",
             AUTO_STATUS_DURATION_MS
           );
+          refreshOpenToolkitHome();
           return result;
         }
       );
@@ -15415,6 +16373,15 @@
     markFeedFriendNotesStale();
     return { friendRadar, followerSnapshot };
   }
+
+  const AUTO_INTERVAL_CHOICES = [
+    [0, "关闭"],
+    [24, "每 24 小时"],
+    [48, "每 48 小时"],
+    [72, "每 72 小时"],
+    [168, "每 7 天"],
+    [360, "每 15 天"],
+  ];
 
   function showAutoUpdateSettings(notice) {
     const uidResult = determineCurrentUid();
@@ -15468,203 +16435,118 @@
 
     const body = showPanel("自动更新与外观", true);
     if (notice) body.append(createElement("p", notice, "wfr-success"));
-    body.append(createElement("h3", "关系雷达自动更新"));
-    body.append(
-      createElement(
-        "p",
-        "仅在打开微博网页时检查。",
-        "wfr-muted"
-      )
-    );
-    if (!loaded.ok) {
+
+    function appendAutoIntervalSection(config) {
+      body.append(createElement("h3", config.title));
       body.append(
-        createElement("p", "关系雷达本地数据无法读取。", "wfr-error")
+        createElement("p", "仅在打开微博网页时检查。", "wfr-muted")
       );
-    } else if (loaded.state.latestSnapshot === null) {
-      body.append(
-        createElement(
-          "p",
-          "请先手动完成一次关系雷达更新，自动更新不会保存首次快照。",
-          "wfr-muted"
+      if (!config.stateLoaded.ok) {
+        body.append(createElement("p", config.unreadableText, "wfr-error"));
+      } else if (config.stateLoaded.state.latestSnapshot === null) {
+        body.append(createElement("p", config.emptySnapshotHint, "wfr-muted"));
+      }
+      let currentHours = config.initialHours;
+      const label = createElement("label", "自动更新间隔：", "wfr-row");
+      const select = createElement("select", null, "wfr-select");
+      select.setAttribute("aria-label", config.selectLabel);
+      for (const [hours, text] of AUTO_INTERVAL_CHOICES) {
+        const option = createElement("option", text);
+        option.value = String(hours);
+        option.selected = hours === currentHours;
+        select.append(option);
+      }
+      select.value = String(currentHours);
+      label.append(select);
+      body.append(label);
+      addLine(
+        body,
+        "上次成功更新",
+        !config.stateLoaded.ok
+          ? "无法读取"
+          : config.stateLoaded.state.latestSnapshot === null
+            ? "—"
+            : formatTime(config.stateLoaded.state.latestSnapshot.capturedAt)
+      );
+      addLine(
+        body,
+        "上次自动尝试",
+        config.lastAttempt === null ? "—" : formatTime(config.lastAttempt)
+      );
+      addLine(
+        body,
+        "上次自动结果",
+        describeAutomaticOutcomeForAttempt(
+          config.lastAttempt,
+          config.lastOutcome
         )
       );
+      if (config.extraHint) {
+        body.append(createElement("p", config.extraHint, "wfr-muted"));
+      }
+      const statusNode = createElement("p", "", "wfr-success wfr-browse-status");
+      statusNode.setAttribute("role", "status");
+      statusNode.setAttribute("aria-live", "polite");
+      select.addEventListener("change", () => {
+        const currentUid = determineCurrentUid();
+        if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
+          select.value = String(currentHours);
+          showFailure("自动更新设置", {
+            failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+          });
+          return;
+        }
+        const selectedHours = Number(select.value);
+        if (!AUTO_INTERVAL_HOURS.includes(selectedHours)) {
+          select.value = String(currentHours);
+          showFailure("自动更新设置", {
+            failureKind: "STORAGE_ERROR",
+            reason: config.invalidReason,
+          });
+          return;
+        }
+        const saved = config.save(uidResult.uid, selectedHours);
+        if (!saved.ok) {
+          select.value = String(currentHours);
+          showFailure("自动更新设置", saved);
+          return;
+        }
+        currentHours = selectedHours;
+        statusNode.textContent = config.savedNotice;
+      });
+      body.append(statusNode);
     }
-    const label = createElement("label", "自动更新间隔：", "wfr-row");
-    const select = createElement("select", null, "wfr-select");
-    const choices = [
-      [0, "关闭"],
-      [24, "每 24 小时"],
-      [48, "每 48 小时"],
-      [72, "每 72 小时"],
-      [168, "每 7 天"],
-      [360, "每 15 天"],
-    ];
-    for (const [hours, text] of choices) {
-      const option = createElement("option", text);
-      option.value = String(hours);
-      option.selected = hours === interval.value;
-      select.append(option);
-    }
-    select.value = String(interval.value);
-    label.append(select);
-    body.append(label);
-    addLine(
-      body,
-      "上次成功更新",
-      !loaded.ok
-        ? "无法读取"
-        : loaded.state.latestSnapshot === null
-          ? "—"
-          : formatTime(loaded.state.latestSnapshot.capturedAt)
-    );
-    addLine(
-      body,
-      "上次自动尝试",
-      lastAttempt.value === null ? "—" : formatTime(lastAttempt.value)
-    );
-    addLine(
-      body,
-      "上次自动结果",
-      describeAutomaticOutcomeForAttempt(lastAttempt.value, lastOutcome.value)
-    );
 
-    const saveButton = createElement("button", "保存设置", "wfr-button wfr-primary");
-    saveButton.type = "button";
-    saveButton.addEventListener("click", () => {
-      const currentUid = determineCurrentUid();
-      if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
-        showFailure("自动更新设置", {
-          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
-        });
-        return;
-      }
-      const value = Number(select.value);
-      if (!AUTO_INTERVAL_HOURS.includes(value)) {
-        showFailure("自动更新设置", {
-          failureKind: "STORAGE_ERROR",
-          reason: "AUTO_INTERVAL_INVALID",
-        });
-        return;
-      }
-      const saved = saveAutoInterval(uidResult.uid, value);
-      if (!saved.ok) {
-        showFailure("自动更新设置", saved);
-        return;
-      }
-      showAutoUpdateSettings("关系雷达自动更新设置已保存。");
+    appendAutoIntervalSection({
+      title: "关系雷达自动更新",
+      selectLabel: "关系雷达自动更新间隔",
+      stateLoaded: loaded,
+      unreadableText: "关系雷达本地数据无法读取。",
+      emptySnapshotHint:
+        "请先手动完成一次关系雷达更新，自动更新不会保存首次快照。",
+      initialHours: interval.value,
+      lastAttempt: lastAttempt.value,
+      lastOutcome: lastOutcome.value,
+      invalidReason: "AUTO_INTERVAL_INVALID",
+      save: saveAutoInterval,
+      savedNotice: "关系雷达自动更新间隔已保存。",
     });
-    body.append(saveButton);
 
-    body.append(createElement("h3", "粉丝快照自动更新"));
-    body.append(
-      createElement(
-        "p",
-        "仅在打开微博网页时检查。",
-        "wfr-muted"
-      )
-    );
-    if (!followerState.ok) {
-      body.append(
-        createElement("p", "粉丝快照本地状态无法读取。", "wfr-error")
-      );
-    } else if (followerState.state.latestSnapshot === null) {
-      body.append(
-        createElement(
-          "p",
-          "首次到期的自动更新会保存首次粉丝快照，不会生成历史变化事件。",
-          "wfr-muted"
-        )
-      );
-    }
-    const followerIntervalLabel = createElement(
-      "label",
-      "自动更新间隔：",
-      "wfr-row"
-    );
-    const followerIntervalSelect = createElement(
-      "select",
-      null,
-      "wfr-select"
-    );
-    for (const [hours, text] of [
-      [0, "关闭"],
-      [24, "每 24 小时"],
-      [48, "每 48 小时"],
-      [72, "每 72 小时"],
-      [168, "每 7 天"],
-      [360, "每 15 天"],
-    ]) {
-      const option = createElement("option", text);
-      option.value = String(hours);
-      followerIntervalSelect.append(option);
-    }
-    followerIntervalSelect.value = String(followerInterval.value);
-    followerIntervalLabel.append(followerIntervalSelect);
-    body.append(followerIntervalLabel);
-    addLine(
-      body,
-      "上次成功更新",
-      !followerState.ok
-        ? "无法读取"
-        : followerState.state.latestSnapshot === null
-          ? "—"
-          : formatTime(followerState.state.latestSnapshot.capturedAt)
-    );
-    addLine(
-      body,
-      "上次自动尝试",
-      followerLastAttempt.value === null
-        ? "—"
-        : formatTime(followerLastAttempt.value)
-    );
-    addLine(
-      body,
-      "上次自动结果",
-      describeAutomaticOutcomeForAttempt(
-        followerLastAttempt.value,
-        followerLastOutcome.value
-      )
-    );
-    body.append(
-      createElement(
-        "p",
-        "首次启用建议选择每 72 小时。",
-        "wfr-muted"
-      )
-    );
-    const followerSaveButton = createElement(
-      "button",
-      "保存设置",
-      "wfr-button wfr-primary"
-    );
-    followerSaveButton.type = "button";
-    followerSaveButton.addEventListener("click", () => {
-      const currentUid = determineCurrentUid();
-      if (!currentUid.ok || currentUid.uid !== uidResult.uid) {
-        showFailure("自动更新设置", {
-          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
-        });
-        return;
-      }
-      const selectedHours = Number(followerIntervalSelect.value);
-      if (!AUTO_INTERVAL_HOURS.includes(selectedHours)) {
-        showFailure("自动更新设置", {
-          failureKind: "STORAGE_ERROR",
-          reason: "FOLLOWER_AUTO_INTERVAL_INVALID",
-        });
-        return;
-      }
-      const saved = saveFollowerAutoInterval(
-        uidResult.uid,
-        selectedHours
-      );
-      if (!saved.ok) {
-        showFailure("自动更新设置", saved);
-        return;
-      }
-      showAutoUpdateSettings("粉丝快照自动更新设置已保存。");
+    appendAutoIntervalSection({
+      title: "粉丝快照自动更新",
+      selectLabel: "粉丝快照自动更新间隔",
+      stateLoaded: followerState,
+      unreadableText: "粉丝快照本地状态无法读取。",
+      emptySnapshotHint:
+        "首次到期的自动更新会保存首次粉丝快照，不会生成历史变化事件。",
+      initialHours: followerInterval.value,
+      lastAttempt: followerLastAttempt.value,
+      lastOutcome: followerLastOutcome.value,
+      extraHint: "首次启用建议选择每 72 小时。",
+      invalidReason: "FOLLOWER_AUTO_INTERVAL_INVALID",
+      save: saveFollowerAutoInterval,
+      savedNotice: "粉丝快照自动更新间隔已保存。",
     });
-    body.append(followerSaveButton);
 
     body.append(createElement("h3", "外观"));
     body.append(buildAppearanceControl());
@@ -15680,6 +16562,8 @@
   function showPageSettings() {
     const body = showPanel("浏览体验", true);
     const status = createElement("p", "", "wfr-muted wfr-browse-status");
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
     const tabList = createElement("div", null, "wfr-browse-tabs");
     tabList.setAttribute("role", "tablist");
     tabList.setAttribute("aria-label", "浏览体验分类");
@@ -15735,475 +16619,309 @@
     const feedPanel = createBrowseTab("feed", "信息流", true);
     const enhancementPanel = createBrowseTab("enhancement", "增强", false);
     const cleanupPanel = createBrowseTab("cleanup", "净化", false);
-    body.append(tabList, feedPanel, enhancementPanel, cleanupPanel);
+    body.append(tabList, status, feedPanel, enhancementPanel, cleanupPanel);
 
-    function appendToggle(container, labelText, key, property, description) {
+    function appendPreferenceToggle(container, options) {
       const label = createElement(
         "label",
         null,
-        "wfr-toggle wfr-row wfr-setting-label"
+        options.suboption
+          ? "wfr-toggle wfr-row wfr-setting-label wfr-suboption"
+          : "wfr-toggle wfr-row wfr-setting-label"
       );
       const input = createElement("input");
       input.type = "checkbox";
-      input.checked = pageCleanupPreferences[property];
-      input.setAttribute("aria-label", labelText);
-      label.append(input, createElement("span", labelText));
+      input.checked = options.read() === true;
+      input.setAttribute("aria-label", options.label);
+      label.append(input, createElement("span", options.label));
       input.addEventListener("change", () => {
-        const previous = pageCleanupPreferences[property];
+        const previous = options.read();
         const next = input.checked === true;
-        const saved = savePageCleanupPreference(key, next);
+        const saved = savePageCleanupPreference(options.key, next);
         if (!saved.ok) {
           input.checked = previous;
-          status.textContent = "页面净化偏好未能保存，微博页面未改变。";
+          status.textContent = options.saveErrorText;
           return;
         }
-        pageCleanupPreferences[property] = next;
-        try {
-          applyPageCleanupStyles();
-        } catch (_) {
-          pageCleanupPreferences[property] = previous;
-          savePageCleanupPreference(key, previous);
-          input.checked = previous;
+        options.write(next);
+        if (typeof options.apply === "function") {
           try {
-            applyPageCleanupStyles();
+            const applied = options.apply(next);
+            if (applied === false) {
+              options.write(previous);
+              savePageCleanupPreference(options.key, previous);
+              input.checked = previous;
+              if (typeof options.recover === "function") options.recover(previous);
+              status.textContent = options.applyErrorText;
+              return;
+            }
           } catch (_) {
-            // Preferences remain fail-closed if presentation recovery also fails.
+            options.write(previous);
+            savePageCleanupPreference(options.key, previous);
+            input.checked = previous;
+            if (typeof options.recover === "function") {
+              try {
+                options.recover(previous);
+              } catch (_) {
+                // Preferences remain fail-closed if presentation recovery also fails.
+              }
+            }
+            status.textContent = options.applyErrorText;
+            return;
           }
-          status.textContent = "页面净化偏好未能应用，微博页面未改变。";
-          return;
         }
-        status.textContent = next ? "已隐藏所选页面组件。" : "已恢复所选页面组件。";
+        status.textContent = options.successText(next);
       });
       container.append(label);
-      if (description) {
+      if (options.description) {
         container.append(
           createElement(
             "p",
-            description,
-            "wfr-muted wfr-setting-description"
+            options.description,
+            options.suboption
+              ? "wfr-muted wfr-setting-description wfr-suboption-description"
+              : "wfr-muted wfr-setting-description"
           )
         );
       }
     }
 
-    const latestLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const latestInput = createElement("input");
-    latestInput.type = "checkbox";
-    latestInput.checked = preferLatestFeed;
-    latestInput.setAttribute("aria-label", "首页优先进入最新微博");
-    latestLabel.append(latestInput, createElement("span", "首页优先进入最新微博"));
-    latestInput.addEventListener("change", () => {
-      const previous = preferLatestFeed;
-      const next = latestInput.checked === true;
-      const saved = savePageCleanupPreference(PREFER_LATEST_FEED_KEY, next);
-      if (!saved.ok) {
-        latestInput.checked = previous;
-        status.textContent = "浏览体验偏好未能保存。";
-        return;
-      }
-      preferLatestFeed = next;
-      if (!next) latestFeedNavigationPending = false;
-      status.textContent = next
-        ? "每个标签页首次进入微博首页时将打开最新微博。"
-        : "已停止自动进入最新微博。";
-    });
-    feedPanel.append(
-      latestLabel,
-      createElement(
-        "p",
+    function appendToggle(container, labelText, key, property, description) {
+      appendPreferenceToggle(container, {
+        label: labelText,
+        key,
+        read: () => pageCleanupPreferences[property],
+        write: (next) => {
+          pageCleanupPreferences[property] = next;
+        },
+        apply: () => {
+          applyPageCleanupStyles();
+        },
+        recover: () => {
+          applyPageCleanupStyles();
+        },
+        saveErrorText: "页面净化偏好未能保存，微博页面未改变。",
+        applyErrorText: "页面净化偏好未能应用，微博页面未改变。",
+        successText: (next) =>
+          next ? "已隐藏所选页面组件。" : "已恢复所选页面组件。",
+        description,
+      });
+    }
+
+    const applyFeedFilterPreferences = () => {
+      applyPageCleanupStyles();
+      installLatestFeedRecommendationFilter();
+    };
+
+    appendPreferenceToggle(feedPanel, {
+      label: "首页优先进入最新微博",
+      key: PREFER_LATEST_FEED_KEY,
+      read: () => preferLatestFeed,
+      write: (next) => {
+        preferLatestFeed = next;
+        if (!next) latestFeedNavigationPending = false;
+      },
+      saveErrorText: "浏览体验偏好未能保存。",
+      successText: (next) =>
+        next
+          ? "每个标签页首次进入微博首页时将打开最新微博。"
+          : "已停止自动进入最新微博。",
+      description:
         "每个标签页首次打开微博首页时自动进入按时间排序的“最新微博”。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
+    });
 
-    const latestRecommendedLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const latestRecommendedInput = createElement("input");
-    latestRecommendedInput.type = "checkbox";
-    latestRecommendedInput.checked =
-      pageCleanupPreferences.hideLatestRecommended;
-    latestRecommendedInput.setAttribute(
-      "aria-label",
-      "隐藏信息流中的推广内容"
-    );
-    latestRecommendedLabel.append(
-      latestRecommendedInput,
-      createElement("span", "隐藏信息流中的推广内容")
-    );
-    latestRecommendedInput.addEventListener("change", () => {
-      const previous = pageCleanupPreferences.hideLatestRecommended;
-      const next = latestRecommendedInput.checked === true;
-      const saved = savePageCleanupPreference(
-        HIDE_LATEST_RECOMMENDED_KEY,
+    appendPreferenceToggle(feedPanel, {
+      label: "隐藏信息流中的推广内容",
+      key: HIDE_LATEST_RECOMMENDED_KEY,
+      read: () => pageCleanupPreferences.hideLatestRecommended,
+      write: (next) => {
+        pageCleanupPreferences.hideLatestRecommended = next;
+      },
+      apply: applyFeedFilterPreferences,
+      recover: applyFeedFilterPreferences,
+      saveErrorText: "浏览体验偏好未能保存。",
+      applyErrorText: "“荐读”隐藏设置未能应用，微博内容未改变。",
+      successText: (next) =>
         next
-      );
-      if (!saved.ok) {
-        latestRecommendedInput.checked = previous;
-        status.textContent = "浏览体验偏好未能保存。";
-        return;
-      }
-      pageCleanupPreferences.hideLatestRecommended = next;
-      try {
-        applyPageCleanupStyles();
-        installLatestFeedRecommendationFilter();
-      } catch (_) {
-        pageCleanupPreferences.hideLatestRecommended = previous;
-        savePageCleanupPreference(HIDE_LATEST_RECOMMENDED_KEY, previous);
-        latestRecommendedInput.checked = previous;
-        try {
-          applyPageCleanupStyles();
-          installLatestFeedRecommendationFilter();
-        } catch (_) {
-          // The previous fail-closed state remains the recovery boundary.
-        }
-        status.textContent = "“荐读”隐藏设置未能应用，微博内容未改变。";
-        return;
-      }
-      status.textContent = next
-        ? "已隐藏首页和“最新微博”中明确标记为“荐读”的内容。"
-        : "已停止隐藏信息流推广内容；强力规则偏好会保留但不生效。";
+          ? "已隐藏首页和“最新微博”中明确标记为“荐读”的内容。"
+          : "已停止隐藏信息流推广内容；强力规则偏好会保留但不生效。",
+      description: "默认仅隐藏明确标记为“荐读”的内容。",
     });
-    feedPanel.append(
-      latestRecommendedLabel,
-      createElement(
-        "p",
-        "默认仅隐藏明确标记为“荐读”的内容。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
 
-    const strongPromotionLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label wfr-suboption"
-    );
-    const strongPromotionInput = createElement("input");
-    strongPromotionInput.type = "checkbox";
-    strongPromotionInput.checked =
-      pageCleanupPreferences.strongFeedPromotionFilter;
-    strongPromotionInput.setAttribute(
-      "aria-label",
-      "使用强力规则（可能误伤）"
-    );
-    strongPromotionLabel.append(
-      strongPromotionInput,
-      createElement("span", "使用强力规则（可能误伤）")
-    );
-    strongPromotionInput.addEventListener("change", () => {
-      const previous = pageCleanupPreferences.strongFeedPromotionFilter;
-      const next = strongPromotionInput.checked === true;
-      const saved = savePageCleanupPreference(
-        STRONG_FEED_PROMOTION_FILTER_KEY,
+    appendPreferenceToggle(feedPanel, {
+      label: "使用强力规则（可能误伤）",
+      key: STRONG_FEED_PROMOTION_FILTER_KEY,
+      suboption: true,
+      read: () => pageCleanupPreferences.strongFeedPromotionFilter,
+      write: (next) => {
+        pageCleanupPreferences.strongFeedPromotionFilter = next;
+      },
+      apply: applyFeedFilterPreferences,
+      recover: applyFeedFilterPreferences,
+      saveErrorText: "强力过滤偏好未能保存。",
+      applyErrorText: "强力过滤规则未能应用，微博内容未改变。",
+      successText: (next) =>
         next
-      );
-      if (!saved.ok) {
-        strongPromotionInput.checked = previous;
-        status.textContent = "强力过滤偏好未能保存。";
-        return;
-      }
-      pageCleanupPreferences.strongFeedPromotionFilter = next;
-      try {
-        applyPageCleanupStyles();
-        installLatestFeedRecommendationFilter();
-      } catch (_) {
-        pageCleanupPreferences.strongFeedPromotionFilter = previous;
-        savePageCleanupPreference(STRONG_FEED_PROMOTION_FILTER_KEY, previous);
-        strongPromotionInput.checked = previous;
-        try {
-          applyPageCleanupStyles();
-          installLatestFeedRecommendationFilter();
-        } catch (_) {
-          // The previous fail-closed state remains the recovery boundary.
-        }
-        status.textContent = "强力过滤规则未能应用，微博内容未改变。";
-        return;
-      }
-      status.textContent = next
-        ? pageCleanupPreferences.hideLatestRecommended
-          ? "已启用强力推广过滤。"
-          : "已保存强力规则偏好；启用上方推广过滤后才会生效。"
-        : "已停用强力规则，精确“荐读”规则保持不变。";
+          ? pageCleanupPreferences.hideLatestRecommended
+            ? "已启用强力推广过滤。"
+            : "已保存强力规则偏好；启用上方推广过滤后才会生效。"
+          : "已停用强力规则，精确“荐读”规则保持不变。",
+      description: "额外识别推荐、广告等推广标签和明确广告模块。",
     });
-    feedPanel.append(
-      strongPromotionLabel,
-      createElement(
-        "p",
-        "额外识别推荐、广告等推广标签和明确广告模块。",
-        "wfr-muted wfr-setting-description wfr-suboption-description"
-      )
-    );
 
-    const autoExpandLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const autoExpandInput = createElement("input");
-    autoExpandInput.type = "checkbox";
-    autoExpandInput.checked = pageCleanupPreferences.autoExpandLongPosts;
-    autoExpandInput.setAttribute("aria-label", "自动展开原创长微博");
-    autoExpandLabel.append(
-      autoExpandInput,
-      createElement("span", "自动展开原创长微博")
-    );
-    autoExpandInput.addEventListener("change", () => {
-      const previous = pageCleanupPreferences.autoExpandLongPosts;
-      const next = autoExpandInput.checked === true;
-      const saved = savePageCleanupPreference(AUTO_EXPAND_LONG_POSTS_KEY, next);
-      if (!saved.ok) {
-        autoExpandInput.checked = previous;
-        status.textContent = "自动展开偏好未能保存。";
-        return;
-      }
-      pageCleanupPreferences.autoExpandLongPosts = next;
-      try {
+    appendPreferenceToggle(feedPanel, {
+      label: "自动展开原创长微博",
+      key: AUTO_EXPAND_LONG_POSTS_KEY,
+      read: () => pageCleanupPreferences.autoExpandLongPosts,
+      write: (next) => {
+        pageCleanupPreferences.autoExpandLongPosts = next;
+      },
+      apply: () => {
         installLatestFeedRecommendationFilter();
-      } catch (_) {
-        pageCleanupPreferences.autoExpandLongPosts = previous;
-        savePageCleanupPreference(AUTO_EXPAND_LONG_POSTS_KEY, previous);
-        autoExpandInput.checked = previous;
-        try {
-          installLatestFeedRecommendationFilter();
-        } catch (_) {
-          // The previous fail-closed state remains the recovery boundary.
-        }
-        status.textContent = "自动展开未能启动，微博正文未改变。";
-        return;
-      }
-      status.textContent = next
-        ? "已启用视口内长微博自动展开。"
-        : "已停止后续自动展开；已经展开的正文不会被强制收起。";
+      },
+      recover: () => {
+        installLatestFeedRecommendationFilter();
+      },
+      saveErrorText: "自动展开偏好未能保存。",
+      applyErrorText: "自动展开未能启动，微博正文未改变。",
+      successText: (next) =>
+        next
+          ? "已启用视口内长微博自动展开。"
+          : "已停止后续自动展开；已经展开的正文不会被强制收起。",
+      description: "停下来阅读原创长微博时自动展开；转发微博保持折叠。",
     });
-    feedPanel.append(
-      autoExpandLabel,
-      createElement(
-        "p",
-        "停下来阅读原创长微博时自动展开；转发微博保持折叠。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
 
-    const profileExtrasLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const profileExtrasInput = createElement("input");
-    profileExtrasInput.type = "checkbox";
-    profileExtrasInput.checked = pageCleanupPreferences.showProfileExtras;
-    profileExtrasInput.setAttribute("aria-label", "显示主页小档案");
-    profileExtrasLabel.append(
-      profileExtrasInput,
-      createElement("span", "显示主页小档案")
-    );
-    profileExtrasInput.addEventListener("change", () => {
-      const previous = pageCleanupPreferences.showProfileExtras;
-      const next = profileExtrasInput.checked === true;
-      const saved = savePageCleanupPreference(SHOW_PROFILE_EXTRAS_KEY, next);
-      if (!saved.ok) {
-        profileExtrasInput.checked = previous;
-        status.textContent = "主页小档案设置未能保存。";
-        return;
-      }
-      pageCleanupPreferences.showProfileExtras = next;
-      if (next) {
-        ensureProfileExtras();
-      } else {
-        teardownProfileExtras(false);
-      }
-      // The friend-notes panel shows observed facts only while Profile Extras is
-      // off, so it is rebuilt to keep the two from repeating each other.
-      rebuildProfileFriendNotes();
-      status.textContent = next
-        ? "已启用其他用户主页的 Toolkit 本地小档案与访问记录。"
-        : "已停止显示主页小档案和记录主页访问。";
-    });
-    enhancementPanel.append(
-      profileExtrasLabel,
-      createElement(
-        "p",
+    appendPreferenceToggle(enhancementPanel, {
+      label: "显示主页小档案",
+      key: SHOW_PROFILE_EXTRAS_KEY,
+      read: () => pageCleanupPreferences.showProfileExtras,
+      write: (next) => {
+        pageCleanupPreferences.showProfileExtras = next;
+      },
+      apply: (next) => {
+        if (next) {
+          ensureProfileExtras();
+        } else {
+          teardownProfileExtras(false);
+        }
+        // The friend-notes panel shows observed facts only while Profile Extras is
+        // off, so it is rebuilt to keep the two from repeating each other.
+        rebuildProfileFriendNotes();
+      },
+      recover: (previous) => {
+        if (previous) ensureProfileExtras();
+        else teardownProfileExtras(false);
+        rebuildProfileFriendNotes();
+      },
+      saveErrorText: "主页小档案设置未能保存。",
+      applyErrorText: "主页小档案设置未能应用。",
+      successText: (next) =>
+        next
+          ? "已启用其他用户主页的 Toolkit 本地小档案与访问记录。"
+          : "已停止显示主页小档案和记录主页访问。",
+      description:
         "显示历史昵称等本地资料，并在本浏览器记录访问次数和上次访问时间。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
+    });
 
-    const friendNotesLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const friendNotesInput = createElement("input");
-    friendNotesInput.type = "checkbox";
-    friendNotesInput.checked = pageCleanupPreferences.showProfileFriendNotes;
-    friendNotesInput.setAttribute("aria-label", "在主页显示友人档案");
-    friendNotesLabel.append(
-      friendNotesInput,
-      createElement("span", "在主页显示友人档案")
-    );
-    friendNotesInput.addEventListener("change", () => {
-      const previous = pageCleanupPreferences.showProfileFriendNotes;
-      const next = friendNotesInput.checked === true;
-      const saved = savePageCleanupPreference(
-        SHOW_PROFILE_FRIEND_NOTES_KEY,
+    appendPreferenceToggle(enhancementPanel, {
+      label: "在主页显示友人档案",
+      key: SHOW_PROFILE_FRIEND_NOTES_KEY,
+      read: () => pageCleanupPreferences.showProfileFriendNotes,
+      write: (next) => {
+        pageCleanupPreferences.showProfileFriendNotes = next;
+      },
+      apply: () => {
+        rebuildProfileFriendNotes();
+      },
+      recover: () => {
+        rebuildProfileFriendNotes();
+      },
+      saveErrorText: "友人档案显示设置未能保存。",
+      applyErrorText: "友人档案显示设置未能应用。",
+      successText: (next) =>
         next
-      );
-      if (!saved.ok) {
-        friendNotesInput.checked = previous;
-        status.textContent = "友人档案显示设置未能保存。";
-        return;
-      }
-      pageCleanupPreferences.showProfileFriendNotes = next;
-      rebuildProfileFriendNotes();
-      status.textContent = next
-        ? "已在其他用户主页显示友人档案。"
-        : "已停止在主页显示友人档案；已保存的备注和标签不受影响。";
+          ? "已在其他用户主页显示友人档案。"
+          : "已停止在主页显示友人档案；已保存的备注和标签不受影响。",
+      description: "在其他用户的主页显示你手写的备注和标签，可直接编辑。",
     });
-    enhancementPanel.append(
-      friendNotesLabel,
-      createElement(
-        "p",
-        "在其他用户的主页显示你手写的备注和标签，可直接编辑。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
 
-    const feedFriendNotesLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const feedFriendNotesInput = createElement("input");
-    feedFriendNotesInput.type = "checkbox";
-    feedFriendNotesInput.checked = pageCleanupPreferences.showFeedFriendNotes;
-    feedFriendNotesInput.setAttribute("aria-label", "在信息流显示友人档案");
-    feedFriendNotesLabel.append(
-      feedFriendNotesInput,
-      createElement("span", "在信息流显示友人档案")
-    );
-    feedFriendNotesInput.addEventListener("change", () => {
-      const previous = pageCleanupPreferences.showFeedFriendNotes;
-      const next = feedFriendNotesInput.checked === true;
-      const saved = savePageCleanupPreference(SHOW_FEED_FRIEND_NOTES_KEY, next);
-      if (!saved.ok) {
-        feedFriendNotesInput.checked = previous;
-        status.textContent = "信息流友人档案设置未能保存。";
-        return;
-      }
-      pageCleanupPreferences.showFeedFriendNotes = next;
-      try {
+    appendPreferenceToggle(enhancementPanel, {
+      label: "在信息流显示友人档案",
+      key: SHOW_FEED_FRIEND_NOTES_KEY,
+      read: () => pageCleanupPreferences.showFeedFriendNotes,
+      write: (next) => {
+        pageCleanupPreferences.showFeedFriendNotes = next;
+      },
+      apply: () => {
         installLatestFeedRecommendationFilter();
-      } catch (_) {
-        pageCleanupPreferences.showFeedFriendNotes = previous;
-        savePageCleanupPreference(SHOW_FEED_FRIEND_NOTES_KEY, previous);
-        feedFriendNotesInput.checked = previous;
-        try {
-          installLatestFeedRecommendationFilter();
-        } catch (_) {
-          // The previous fail-closed state remains the recovery boundary.
-        }
-        status.textContent = "信息流友人档案未能启动，微博页面未改变。";
-        return;
-      }
-      status.textContent = next
-        ? "已在首页和“最新微博”的作者旁显示友人档案入口。"
-        : "已停止在信息流显示友人档案；已保存的备注和标签不受影响。";
+      },
+      recover: () => {
+        installLatestFeedRecommendationFilter();
+      },
+      saveErrorText: "信息流友人档案设置未能保存。",
+      applyErrorText: "信息流友人档案未能启动，微博页面未改变。",
+      successText: (next) =>
+        next
+          ? "已在首页和“最新微博”的作者旁显示友人档案入口。"
+          : "已停止在信息流显示友人档案；已保存的备注和标签不受影响。",
+      description: "在作者旁显示小书签，已有档案时高亮，点击可查看和编辑。",
     });
-    enhancementPanel.append(
-      feedFriendNotesLabel,
-      createElement(
-        "p",
-        "在作者旁显示小书签，已有档案时高亮，点击可查看和编辑。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
 
-    const usageEnabledLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label"
-    );
-    const usageEnabledInput = createElement("input");
-    usageEnabledInput.type = "checkbox";
-    usageEnabledInput.checked = usageEnabledPreference;
-    usageEnabledInput.setAttribute("aria-label", "记录网页版使用统计");
-    usageEnabledLabel.append(
-      usageEnabledInput,
-      createElement("span", "记录网页版使用统计")
-    );
-    usageEnabledInput.addEventListener("change", () => {
-      const previous = usageEnabledPreference;
-      const next = usageEnabledInput.checked === true;
-      const saved = savePageCleanupPreference(USAGE_ENABLED_KEY, next);
-      if (!saved.ok) {
-        usageEnabledInput.checked = previous;
-        status.textContent = "使用统计设置未能保存。";
-        return;
-      }
-      usageEnabledPreference = next;
-      if (next) {
-        const started = startUsageTracking(true);
-        if (!started.ok) {
-          usageEnabledPreference = previous;
-          savePageCleanupPreference(USAGE_ENABLED_KEY, previous);
-          usageEnabledInput.checked = previous;
-          stopUsageTracking(false);
-          status.textContent =
-            "当前无法安全启动使用统计；设置未改变，也没有开始记录。";
-          return;
+    appendPreferenceToggle(enhancementPanel, {
+      label: "记录网页版使用统计",
+      key: USAGE_ENABLED_KEY,
+      read: () => usageEnabledPreference,
+      write: (next) => {
+        usageEnabledPreference = next;
+      },
+      apply: (next) => {
+        if (next) {
+          const started = startUsageTracking(true);
+          if (!started.ok) return false;
+        } else {
+          stopUsageTracking(true);
         }
-        status.textContent = "已开始在本浏览器记录网页版使用统计。";
-      } else {
-        stopUsageTracking(true);
-        status.textContent = "已停止记录；已有统计会保留到手动清空。";
-      }
-      syncUsageCorner();
+        syncUsageCorner();
+        return true;
+      },
+      recover: () => {
+        stopUsageTracking(false);
+        syncUsageCorner();
+      },
+      saveErrorText: "使用统计设置未能保存。",
+      applyErrorText: "当前无法安全启动使用统计；设置未改变，也没有开始记录。",
+      successText: (next) =>
+        next
+          ? "已开始在本浏览器记录网页版使用统计。"
+          : "已停止记录；已有统计会保留到手动清空。",
+      description: "仅在当前浏览器记录估算活跃时间和浏览数量。",
     });
-    enhancementPanel.append(
-      usageEnabledLabel,
-      createElement(
-        "p",
-        "仅在当前浏览器记录估算活跃时间和浏览数量。",
-        "wfr-muted wfr-setting-description"
-      )
-    );
 
-    const usageCornerLabel = createElement(
-      "label",
-      null,
-      "wfr-toggle wfr-row wfr-setting-label wfr-suboption"
-    );
-    const usageCornerInput = createElement("input");
-    usageCornerInput.type = "checkbox";
-    usageCornerInput.checked = usageCornerPreference;
-    usageCornerInput.setAttribute("aria-label", "在页面角落显示今日统计");
-    usageCornerLabel.append(
-      usageCornerInput,
-      createElement("span", "在页面角落显示今日统计")
-    );
-    usageCornerInput.addEventListener("change", () => {
-      const previous = usageCornerPreference;
-      const next = usageCornerInput.checked === true;
-      const saved = savePageCleanupPreference(USAGE_CORNER_KEY, next);
-      if (!saved.ok) {
-        usageCornerInput.checked = previous;
-        status.textContent = "角落统计设置未能保存。";
-        return;
-      }
-      usageCornerPreference = next;
-      syncUsageCorner();
-      status.textContent = next
-        ? usageEnabledPreference
-          ? "已显示今日统计。"
-          : "角落统计已准备；开启使用统计后显示。"
-        : "已隐藏角落统计。";
+    appendPreferenceToggle(enhancementPanel, {
+      label: "在页面角落显示今日统计",
+      key: USAGE_CORNER_KEY,
+      suboption: true,
+      read: () => usageCornerPreference,
+      write: (next) => {
+        usageCornerPreference = next;
+      },
+      apply: () => {
+        syncUsageCorner();
+      },
+      recover: () => {
+        syncUsageCorner();
+      },
+      saveErrorText: "角落统计设置未能保存。",
+      applyErrorText: "角落统计设置未能应用。",
+      successText: (next) =>
+        next
+          ? usageEnabledPreference
+            ? "已显示今日统计。"
+            : "角落统计已准备；开启使用统计后显示。"
+          : "已隐藏角落统计。",
+      description: "开启记录后，可在页面角落显示今日分钟数和浏览数量。",
     });
+
     const usageActions = createElement(
       "div",
       null,
@@ -16217,15 +16935,7 @@
     usagePanelButton.type = "button";
     usagePanelButton.addEventListener("click", () => showUsageStatistics());
     usageActions.append(usagePanelButton);
-    enhancementPanel.append(
-      usageCornerLabel,
-      createElement(
-        "p",
-        "开启记录后，可在页面角落显示今日分钟数和浏览数量。",
-        "wfr-muted wfr-setting-description wfr-suboption-description"
-      ),
-      usageActions
-    );
+    enhancementPanel.append(usageActions);
 
     cleanupPanel.append(createElement("h3", "侧栏"));
     appendToggle(
@@ -16256,7 +16966,6 @@
       HIDE_TOP_VIDEO_KEY,
       "hideTopVideo"
     );
-    body.append(status);
   }
 
   // A manual update that finished after its progress panel was left is
@@ -16276,7 +16985,36 @@
     actions.append(button);
   }
 
-  function showToolkitHome() {
+  let toolkitHomePanelRoot = null;
+
+  function refreshOpenToolkitHome() {
+    if (
+      panelRoot !== null &&
+      panelRoot === toolkitHomePanelRoot &&
+      !panelExitLocked &&
+      !followerRemovalInFlight &&
+      !panelHoldsUnsavedNote()
+    ) {
+      const openBody =
+        typeof panelRoot.querySelector === "function"
+          ? panelRoot.querySelector(".wfr-body")
+          : null;
+      showToolkitHome({
+        scrollTop: openBody ? Number(openBody.scrollTop) || 0 : 0,
+      });
+    }
+  }
+
+  function showToolkitHome(viewState) {
+    // Only a refresh of an already open home passes state; the launcher, the
+    // script menu and every back action open it from the top.
+    const initialScrollTop =
+      isPlainObject(viewState) &&
+      typeof viewState.scrollTop === "number" &&
+      Number.isFinite(viewState.scrollTop) &&
+      viewState.scrollTop > 0
+        ? viewState.scrollTop
+        : 0;
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) {
       showFailure("Weibo Toolkit", uidResult, false);
@@ -16287,6 +17025,9 @@
     const loaded = loadState(uidResult.uid);
 
     const body = showPanel("Weibo Toolkit", false, true);
+    if (panelRoot !== null && panelRoot.contains(body)) {
+      toolkitHomePanelRoot = panelRoot;
+    }
     body.classList.add("wfr-home");
     const grid = createElement("div", null, "wfr-home-grid");
     body.append(grid);
@@ -16312,11 +17053,15 @@
         "上次成功更新",
         snapshot ? formatTime(snapshot.capturedAt) : "尚未建立快照"
       );
-      addLine(radarSection, "API可见关注", snapshot ? snapshot.visibleCount : "—");
+      addLine(radarSection, "API 可见关注", snapshot ? snapshot.visibleCount : "—");
       addLine(radarSection, "未读事件", unread);
       if (!snapshot) {
         radarSection.append(
           createElement("p", "首次更新建立基线，下次开始记录变化。", "wfr-muted wfr-home-hint")
+        );
+      } else if (loaded.state.events.length >= 2000) {
+        radarSection.append(
+          createElement("p", "本地已累计较多事件记录，建议定期导出备份。", "wfr-muted wfr-home-hint")
         );
       }
     }
@@ -16325,12 +17070,24 @@
       manualRadarRun !== null && manualRadarRun.ownerUid === uidResult.uid;
     const followerRunning =
       manualFollowerRun !== null && manualFollowerRun.ownerUid === uidResult.uid;
+    const autoRadarRunning = updateRunning && !radarRunning;
+    const autoFollowerRunning = followerUpdateRunning && !followerRunning;
+    const anyTaskBusy =
+      updateRunning || followerUpdateRunning || followerRemovalInFlight;
+    if (autoRadarRunning) {
+      radarSection.append(
+        createElement("p", "后台自动更新正在进行…", "wfr-muted wfr-home-hint")
+      );
+    }
     const actions = createElement("div", null, "wfr-actions");
     const updateButton = createElement(
       "button",
-      radarRunning ? "查看进度" : "立即更新",
+      radarRunning ? "查看进度" : autoRadarRunning ? "自动更新中…" : "立即更新",
       "wfr-button wfr-primary"
     );
+    if (!radarRunning && anyTaskBusy) {
+      updateButton.disabled = true;
+    }
     const eventsButton = createElement("button", "查看事件", "wfr-button");
     const overviewButton = createElement("button", "关系概览", "wfr-button");
     const statusButton = createElement("button", "查看状态", "wfr-button");
@@ -16413,18 +17170,35 @@
       );
       addLine(
         followerSection,
-        "API可见粉丝",
+        "API 可见粉丝",
         followerSnapshot ? followerSnapshot.uniqueRecordCount : "—"
       );
       addLine(followerSection, "变化事件", followerLoaded.state.events.length);
       appendFollowerVisibilityNote(followerSection, followerSnapshot);
+      if (followerLoaded.state.events.length >= 2000) {
+        followerSection.append(
+          createElement("p", "本地已累计较多事件记录，建议定期导出备份。", "wfr-muted wfr-home-hint")
+        );
+      }
+    }
+    if (autoFollowerRunning) {
+      followerSection.append(
+        createElement("p", "后台自动更新正在进行…", "wfr-muted wfr-home-hint")
+      );
     }
     const followerActions = createElement("div", null, "wfr-actions");
     const followerUpdateButton = createElement(
       "button",
-      followerRunning ? "查看进度" : "更新粉丝快照",
+      followerRunning
+        ? "查看进度"
+        : autoFollowerRunning
+          ? "自动更新中…"
+          : "更新粉丝快照",
       "wfr-button wfr-primary"
     );
+    if (!followerRunning && anyTaskBusy) {
+      followerUpdateButton.disabled = true;
+    }
     const followerEventsButton = createElement(
       "button",
       "查看粉丝变化",
@@ -16537,6 +17311,7 @@
       changelogFooter.append(changelogButton);
       body.append(changelogFooter);
     }
+    if (initialScrollTop > 0) body.scrollTop = initialScrollTop;
   }
 
   // Toolkit-only appearance preference: it changes nothing but Toolkit styling.
@@ -16555,6 +17330,7 @@
       const chosen = normalizeTheme(select.value);
       const saved = saveTheme(chosen);
       if (!saved.ok) {
+        select.value = currentTheme;
         showFailure("外观设置", saved);
         return;
       }
@@ -16588,10 +17364,10 @@
   // Every Toolkit colour is a custom property carried by the Toolkit roots, so a
   // theme is selected purely by which token block wins on `.wfr-root`.
   const LIGHT_THEME_TOKENS =
-    "color-scheme: light; --wfr-overlay-bg: rgba(24,27,30,.44); --wfr-panel-bg: #faf9f6; --wfr-panel-text: #1f2328; --wfr-panel-shadow: 0 12px 36px rgba(15,20,26,.14); --wfr-border: #e1dfd8; --wfr-control-border: #cfcdc5; --wfr-button-bg: #fffefd; --wfr-button-text: #262a30; --wfr-button-hover: #f0eee8; --wfr-primary-bg: #23272e; --wfr-primary-text: #faf9f6; --wfr-primary-hover: #363c46; --wfr-accent: #3d6b5e; --wfr-danger-bg: #a53f37; --wfr-danger-text: #fff; --wfr-danger-border: #96382f; --wfr-danger-hover-bg: #89332c; --wfr-success: #2b6349; --wfr-error: #a13832; --wfr-muted: #656963; --wfr-field-bg: #fffefd; --wfr-field-text: #1f2328; --wfr-card-bg: #f3f1ec; --wfr-launcher-bg: #faf9f6; --wfr-launcher-text: #262a30; --wfr-launcher-border: #cfcdc5; --wfr-launcher-hover-bg: #f0eee8; --wfr-launcher-hover-border: #8c948e; --wfr-badge-bg: #a53f37; --wfr-badge-text: #fff; --wfr-bar-shadow: none;";
+    "color-scheme: light; --wfr-overlay-bg: rgba(24,27,30,.44); --wfr-panel-bg: #faf9f6; --wfr-panel-text: #1f2328; --wfr-panel-shadow: 0 12px 36px rgba(15,20,26,.14); --wfr-border: #e1dfd8; --wfr-control-border: #cfcdc5; --wfr-button-bg: #fffefd; --wfr-button-text: #262a30; --wfr-button-hover: #f0eee8; --wfr-primary-bg: #23272e; --wfr-primary-text: #faf9f6; --wfr-primary-hover: #363c46; --wfr-accent: #3d6b5e; --wfr-danger-bg: #a53f37; --wfr-danger-text: #fff; --wfr-danger-border: #96382f; --wfr-danger-hover-bg: #89332c; --wfr-success: #2b6349; --wfr-error: #a13832; --wfr-muted: #656963; --wfr-field-bg: #fffefd; --wfr-field-text: #1f2328; --wfr-card-bg: #f3f1ec; --wfr-launcher-bg: #faf9f6; --wfr-launcher-text: #262a30; --wfr-launcher-border: #cfcdc5; --wfr-launcher-hover-bg: #f0eee8; --wfr-launcher-hover-border: #8c948e; --wfr-badge-bg: #a53f37; --wfr-badge-text: #fff;";
 
   const DARK_THEME_TOKENS =
-    "color-scheme: dark; --wfr-overlay-bg: rgba(8,10,12,.68); --wfr-panel-bg: #191b1f; --wfr-panel-text: #ece9e1; --wfr-panel-shadow: 0 12px 36px rgba(0,0,0,.42); --wfr-border: #2f333a; --wfr-control-border: #414750; --wfr-button-bg: #23262b; --wfr-button-text: #ece9e1; --wfr-button-hover: #2d3138; --wfr-primary-bg: #ece9e1; --wfr-primary-text: #191b1f; --wfr-primary-hover: #ffffff; --wfr-accent: #8ec5b2; --wfr-danger-bg: #923b35; --wfr-danger-text: #fff; --wfr-danger-border: #b85449; --wfr-danger-hover-bg: #aa453c; --wfr-success: #8cc9a8; --wfr-error: #f1a69d; --wfr-muted: #9ea3ae; --wfr-field-bg: #141619; --wfr-field-text: #ece9e1; --wfr-card-bg: #202328; --wfr-launcher-bg: #191b1f; --wfr-launcher-text: #ece9e1; --wfr-launcher-border: #414750; --wfr-launcher-hover-bg: #262a30; --wfr-launcher-hover-border: #78808c; --wfr-badge-bg: #d97b70; --wfr-badge-text: #211715; --wfr-bar-shadow: none;";
+    "color-scheme: dark; --wfr-overlay-bg: rgba(8,10,12,.68); --wfr-panel-bg: #191b1f; --wfr-panel-text: #ece9e1; --wfr-panel-shadow: 0 12px 36px rgba(0,0,0,.42); --wfr-border: #2f333a; --wfr-control-border: #414750; --wfr-button-bg: #23262b; --wfr-button-text: #ece9e1; --wfr-button-hover: #2d3138; --wfr-primary-bg: #ece9e1; --wfr-primary-text: #191b1f; --wfr-primary-hover: #ffffff; --wfr-accent: #8ec5b2; --wfr-danger-bg: #923b35; --wfr-danger-text: #fff; --wfr-danger-border: #b85449; --wfr-danger-hover-bg: #aa453c; --wfr-success: #8cc9a8; --wfr-error: #f1a69d; --wfr-muted: #9ea3ae; --wfr-field-bg: #141619; --wfr-field-text: #ece9e1; --wfr-card-bg: #202328; --wfr-launcher-bg: #191b1f; --wfr-launcher-text: #ece9e1; --wfr-launcher-border: #414750; --wfr-launcher-hover-bg: #262a30; --wfr-launcher-hover-border: #78808c; --wfr-badge-bg: #d97b70; --wfr-badge-text: #211715;";
 
   function installStyles() {
     const style = createElement("style");
@@ -16661,9 +17437,10 @@
       .wfr-setting-description { margin: 0 0 16px; padding-left: 23px; font-size: 13px; line-height: 1.65; }
       .wfr-suboption { margin-left: 22px; }
       .wfr-suboption-description { margin-left: 22px; }
-      .wfr-browse-status { margin: 9px 0 0; }
+      .wfr-browse-status { margin: 8px 0 12px; }
       .wfr-browse-status:empty { display: none; }
       .wfr-event-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; margin-top: 14px; }
+      .wfr-event-list[hidden] { display: none; }
       .wfr-event { min-width: 0; overflow-wrap: anywhere; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); padding: 14px 16px; background: var(--wfr-card-bg); transition: border-color 120ms ease; }
       .wfr-event:hover { border-color: var(--wfr-control-border); }
       .wfr-event h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
@@ -16689,7 +17466,6 @@
       .wfr-hygiene-control { display: flex; flex-direction: column; align-items: stretch; gap: 5px; }
       .wfr-hygiene-check { display: flex; align-items: center; gap: 8px; }
       .wfr-hygiene-input { width: 100%; max-width: none; box-sizing: border-box; padding: 7px 10px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; transition: border-color 120ms ease; }
-      .wfr-hygiene-reasons { margin: 6px 0 10px; padding-left: 22px; }
       .wfr-event-list .wfr-event { padding: 10px 13px; }
       .wfr-hygiene-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
       .wfr-hygiene-head .wfr-hygiene-check { flex: 0 0 auto; }
@@ -16716,7 +17492,6 @@
       .wfr-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
       .wfr-actions .wfr-primary { margin: 0; }
       .wfr-compact-actions { margin-top: 6px; }
-      .wfr-module { margin-top: 22px; }
       .wfr-body h3 { margin: 18px 0 6px; font-size: 15px; font-weight: 600; }
       .wfr-body h3:first-child { margin-top: 0; }
       .wfr-body > h3:not(:first-child) { margin-top: 26px; padding-top: 22px; border-top: 1px solid var(--wfr-border); }
@@ -16750,7 +17525,7 @@
       .wfr-profile-name-trigger:focus-visible, .wfr-profile-name-close:focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 2px; }
       .wfr-profile-name-popover { position: absolute; top: calc(100% + 5px); left: 0; z-index: 20; box-sizing: border-box; min-width: min(220px, calc(100vw - 48px)); max-width: min(320px, calc(100vw - 48px)); padding: 12px 14px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: var(--wfr-panel-shadow); }
       .wfr-profile-name-popover-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-      .wfr-profile-name-close { appearance: none; border: 0; padding: 1px 3px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
+      .wfr-profile-name-close { appearance: none; display: inline-flex; align-items: center; justify-content: center; min-width: 24px; min-height: 24px; border: 0; border-radius: var(--wfr-radius-s); padding: 0 4px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
       .wfr-profile-name-list { max-height: 180px; margin: 7px 0 0; padding-left: 20px; overflow-y: auto; }
       .wfr-note-editor { min-width: 0; }
       .wfr-note-text { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -16759,7 +17534,7 @@
       .wfr-note-tags { display: flex; flex-wrap: wrap; gap: 5px; margin: 5px 0; padding: 0; list-style: none; }
       .wfr-note-tags[hidden] { display: none; }
       .wfr-note-tag { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; box-sizing: border-box; padding: 2px 8px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-s); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); font-size: 12px; overflow-wrap: anywhere; }
-      .wfr-note-tag-remove { appearance: none; border: 0; padding: 0 2px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
+      .wfr-note-tag-remove { appearance: none; display: inline-flex; align-items: center; justify-content: center; min-width: 22px; min-height: 22px; margin: -2px -4px -2px 0; border: 0; border-radius: var(--wfr-radius-s); padding: 0 4px; background: transparent; color: var(--wfr-muted); font: inherit; cursor: pointer; }
       .wfr-note-tag-remove:focus-visible, .wfr-note-textarea:focus-visible, .wfr-note-tag-input:focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 2px; }
       .wfr-note-field-label { display: block; margin: 7px 0 3px; font-weight: 600; }
       .wfr-note-textarea { display: block; width: 100%; min-height: 96px; box-sizing: border-box; resize: vertical; padding: 9px 12px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; transition: border-color 120ms ease; }
@@ -16781,12 +17556,16 @@
       .wfr-profile-notes-observed { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--wfr-border); color: var(--wfr-muted); font-size: 13px; }
       .wfr-profile-notes-subhead { font-weight: 600; }
       .wfr-feed-note { display: inline-flex; flex-wrap: nowrap; align-items: center; gap: 0; min-width: 0; max-width: 100%; margin-left: 5px; vertical-align: middle; color: inherit; font: 13px/1.5 var(--wfr-sans); }
-      .wfr-feed-note-entry { appearance: none; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: var(--wfr-radius-s); padding: 0; background: transparent; color: inherit; font-size: 0; opacity: .45; cursor: pointer; vertical-align: middle; }
+      .wfr-feed-note-entry { position: relative; appearance: none; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: var(--wfr-radius-s); padding: 0; background: transparent; color: inherit; font-size: 0; opacity: .62; cursor: pointer; vertical-align: middle; }
       .wfr-feed-note-entry::before { content: ""; width: 14px; height: 14px; background: currentColor; -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 4h12v17l-6-4-6 4z' fill='none' stroke='white' stroke-width='1.7' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 4h12v17l-6-4-6 4z' fill='none' stroke='white' stroke-width='1.7' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; }
       .wfr-feed-note-entry:hover, .wfr-feed-note-entry:focus-visible, .wfr-feed-note-entry[aria-expanded="true"] { opacity: 1; }
       .wfr-feed-note-entry:focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 2px; }
       .wfr-feed-note-entry.wfr-feed-note-has::before { -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 4h12v17l-6-4-6 4z' fill='white' stroke='white' stroke-width='1.7' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 4h12v17l-6-4-6 4z' fill='white' stroke='white' stroke-width='1.7' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; }
       .wfr-feed-note-entry.wfr-feed-note-has { color: var(--wfr-accent); opacity: 1; }
+      .wfr-feed-note-entry.wfr-feed-note-has-hint { opacity: .82; }
+      .wfr-feed-note-entry.wfr-feed-note-has.wfr-feed-note-has-hint { opacity: 1; }
+      .wfr-feed-note-entry.wfr-feed-note-has-hint:hover, .wfr-feed-note-entry.wfr-feed-note-has-hint:focus-visible, .wfr-feed-note-entry.wfr-feed-note-has-hint[aria-expanded="true"] { opacity: 1; }
+      .wfr-feed-note-entry.wfr-feed-note-has-hint::after { content: ""; position: absolute; top: 3px; right: 3px; width: 5px; height: 5px; border-radius: 999px; background: var(--wfr-accent); }
       .wfr-feed-note-hint { display: none; }
       .wfr-feed-note-hint[hidden] { display: none; }
       .wfr-feed-note-card { position: absolute; top: 0; left: 0; z-index: 2147482500; box-sizing: border-box; display: flex; flex-direction: column; width: min(360px, calc(100vw - 24px)); max-height: min(560px, calc(100vh - 24px)); overflow: hidden; padding: 14px 16px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-l); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: var(--wfr-panel-shadow); font: 14px/1.55 var(--wfr-sans); font-weight: 400; overflow-wrap: anywhere; }
@@ -16860,6 +17639,12 @@
   }
 
   currentTheme = loadTheme();
+  // Both surfaces use shared theme and unload state, initialized above before
+  // either entry point runs. Chat still skips all normal-page startup work.
+  if (isPrivateMessageSurface()) {
+    installPrivateMessageExportModule();
+    return;
+  }
   pageCleanupPreferences = loadPageCleanupPreferences();
   preferLatestFeed = loadPageCleanupPreference(PREFER_LATEST_FEED_KEY);
   usageEnabledPreference = loadPageCleanupPreference(USAGE_ENABLED_KEY);

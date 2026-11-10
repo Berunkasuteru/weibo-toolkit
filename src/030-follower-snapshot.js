@@ -256,7 +256,9 @@
       if (typeof isCancelled === "function" && isCancelled()) {
         return { ok: false, failureKind: "FOLLOWER_SCAN_CANCELLED", requestsMade };
       }
-      if (requestsMade > 0) await delay(FOLLOWER_REQUEST_DELAY_MS);
+      if (requestsMade > 0) {
+        await cancellableDelay(FOLLOWER_REQUEST_DELAY_MS, options.cancelSignal);
+      }
       if (typeof isCancelled === "function" && isCancelled()) {
         return { ok: false, failureKind: "FOLLOWER_SCAN_CANCELLED", requestsMade };
       }
@@ -655,38 +657,13 @@
   // and batch pacing all stay outside it.
   const FOLLOWER_STATE_LOCK_PREFIX = "weibo-toolkit-follower-state-";
 
-  function followerStateLockUnavailable(reason, error) {
-    const result = {
-      ok: false,
-      failureKind: "STATE_LOCK_UNAVAILABLE",
-      reason,
-    };
-    if (error) result.errorName = error.name ? String(error.name) : "Error";
-    return result;
-  }
-
   // The transaction body must stay short and purely local. It is awaited while
   // the lock is held, so it must never fetch, wait, or open UI.
   async function withFollowerStateLock(ownerUid, transaction) {
-    const lockManager = pageLockManager();
-    if (lockManager === null) {
-      return followerStateLockUnavailable("LOCK_UNAVAILABLE");
-    }
-    try {
-      return await lockManager.request.call(
-        lockManager,
-        FOLLOWER_STATE_LOCK_PREFIX + ownerUid,
-        { mode: "exclusive" },
-        async (lock) => {
-          if (lock === null) {
-            return followerStateLockUnavailable("LOCK_NOT_ACQUIRED");
-          }
-          return await transaction();
-        }
-      );
-    } catch (error) {
-      return followerStateLockUnavailable("LOCK_REQUEST_FAILED", error);
-    }
+    return await withExclusiveStateLock(
+      FOLLOWER_STATE_LOCK_PREFIX + ownerUid,
+      transaction
+    );
   }
 
   function followerRemovalPendingKey(ownerUid) {

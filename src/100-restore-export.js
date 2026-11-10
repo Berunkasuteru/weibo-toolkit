@@ -850,8 +850,7 @@
       return;
     }
     if (file === null) {
-      const cancelled = showPanel("恢复已取消", true);
-      cancelled.append(createElement("p", "恢复已取消。", "wfr-muted"));
+      announceCancelWithoutReplacingPanel("恢复已取消。");
       return;
     }
 
@@ -941,25 +940,43 @@
     }
   }
 
-  async function saveBackup(json, filename) {
+  function announceCancelWithoutReplacingPanel(text) {
+    setLauncherStatus(text, AUTO_STATUS_DURATION_MS);
     if (
-      typeof unsafeWindow !== "undefined" &&
-      typeof unsafeWindow.showSaveFilePicker === "function"
+      panelExitLocked ||
+      !panelRoot ||
+      typeof panelRoot.querySelector !== "function"
     ) {
+      return;
+    }
+    const body = panelRoot.querySelector(".wfr-body");
+    if (!body) return;
+    const existing = panelRoot.querySelector(".wfr-inline-cancel-status");
+    if (existing) {
+      existing.textContent = text;
+      return;
+    }
+    const note = createElement("p", text, "wfr-muted wfr-inline-cancel-status");
+    note.setAttribute("role", "status");
+    note.setAttribute("aria-live", "polite");
+    if (body.childNodes.length > 0) body.insertBefore(note, body.childNodes[0]);
+    else body.append(note);
+  }
+
+  async function saveBackup(json, filename) {
+    const pickerWindow = resolveSaveFilePickerWindow();
+    if (pickerWindow !== null) {
       let fileHandle;
       try {
-        fileHandle = await unsafeWindow.showSaveFilePicker.call(
-          unsafeWindow,
-          {
-            suggestedName: filename,
-            types: [
-              {
-                description: "JSON backup",
-                accept: { "application/json": [".json"] },
-              },
-            ],
-          }
-        );
+        fileHandle = await pickerWindow.showSaveFilePicker.call(pickerWindow, {
+          suggestedName: filename,
+          types: [
+            {
+              description: "JSON backup",
+              accept: { "application/json": [".json"] },
+            },
+          ],
+        });
       } catch (error) {
         const errorName = error && error.name ? String(error.name) : "Error";
         if (errorName === "AbortError") return { cancelled: true };
@@ -979,11 +996,13 @@
       try {
         await writable.write(json);
       } catch (error) {
+        await abortWritableStreamQuietly(writable);
         throw backupExportError("WRITE_FILE", error);
       }
       try {
         await writable.close();
       } catch (error) {
+        await abortWritableStreamQuietly(writable);
         throw backupExportError("CLOSE_FILE", error);
       }
       return {
@@ -1052,8 +1071,7 @@
     }
 
     if (saveResult.cancelled) {
-      const body = showPanel("导出已取消", true);
-      body.append(createElement("p", "导出已取消", "wfr-muted"));
+      announceCancelWithoutReplacingPanel("导出已取消。");
       return;
     }
 

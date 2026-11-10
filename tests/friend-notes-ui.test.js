@@ -683,9 +683,70 @@ async function unsavedNoteGuardAndCallerReturn() {
   );
 }
 
+async function listsRestorePositionAfterChildViews() {
+  const browser = createSharedBrowser();
+  const dom = createFakeDocument();
+  // Detached elements have no layout box: their native scrollTop reads as 0.
+  const createElement = dom.document.createElement.bind(dom.document);
+  dom.document.createElement = (tag) => {
+    const node = createElement(tag);
+    let position = 0;
+    Object.defineProperty(node, "scrollTop", {
+      get: () => dom.document.body.contains(node) ? position : 0,
+      set: (value) => { position = value; },
+    });
+    return node;
+  };
+  const records = Array.from({ length: 45 }, (_, index) => ({
+    uid: String(5000 + index), screenName: `账号${index}`, following: true,
+    followsMe: false, remark: "摄影",
+  }));
+  const state = {
+    schemaVersion: 1, ownerUid: OWNER,
+    latestSnapshot: { capturedAt: T, reportedTotal: 45, visibleCount: 45, unresolvedRelationCount: 0, records },
+    events: records.flatMap((record, index) => [0, 1].map((sequence) => ({
+      id: `e${index}-${sequence}`, type: "FOLLOW_ME_LOST", detectedAt: T,
+      subjectUid: record.uid, displayName: record.screenName, read: true,
+      previous: { followsMe: true }, current: { followsMe: false },
+    }))),
+  };
+  browser.storage.set(radarKey(OWNER), JSON.stringify(state));
+  const tab = openTab(browser, NAMES, {
+    ownerUid: OWNER,
+    context: { document: dom.document, MutationObserver: dom.MutationObserver },
+  });
+  for (const [view, actions] of [
+    ["events", ["详情", "关系时间线（2 条事件）", "写档案"]],
+    ["overview", ["关系时间线（2 条事件）", "写档案"]],
+  ]) {
+    for (const action of actions) {
+      if (view === "events") tab.product.renderEvents(OWNER, state, null, "账号");
+      else tab.product.showRelationshipOverview({ filter: "ONE_WAY", query: "摄影" });
+      const more = findAll(dom.document.body, (node) => node.tagName === "BUTTON" && node.textContent.startsWith("加载更多"))[0];
+      await more.click();
+      const body = dom.document.querySelector(".wfr-body");
+      body.scrollTop = 700;
+      const first = findAll(body, (node) => node.tagName === "ARTICLE")[0];
+      await findButton(first, action).click();
+      assert(body.scrollTop === 0, "the old list is detached before the return action runs");
+      await findButton(dom.document.body, "← 返回").click();
+      const restored = dom.document.querySelector(".wfr-body");
+      assert(restored.scrollTop === 700, `${view} restores its position after ${action}`);
+      assert(findAll(restored, (node) => node.tagName === "ARTICLE").length === 40,
+        "the expanded page count survives the round trip");
+      assert(findAll(restored, (node) => node.tagName === "INPUT")[0].value === (view === "events" ? "账号" : "摄影"),
+        "the search query survives the round trip");
+      if (view === "overview") assert(findAll(restored, (node) => node.tagName === "SELECT")[0].value === "ONE_WAY",
+        "the overview relationship filter survives the round trip");
+    }
+  }
+  assert(browser.fetchCalls === 0, "restoring a local list sends no requests");
+}
+
 (async () => {
   await lockedPanelIsNotReplaced();
   await unsavedNoteGuardAndCallerReturn();
+  await listsRestorePositionAfterChildViews();
   await profilePanel();
   await observedFactsAreNotDuplicated();
   await manager();

@@ -206,32 +206,8 @@
     }
   }
 
-  function usageLockUnavailable(reason, error) {
-    const result = {
-      ok: false,
-      failureKind: "STATE_LOCK_UNAVAILABLE",
-      reason,
-    };
-    if (error) result.errorName = error.name ? String(error.name) : "Error";
-    return result;
-  }
-
   async function withUsageStateLock(ownerUid, transaction) {
-    const lockManager = pageLockManager();
-    if (lockManager === null) return usageLockUnavailable("LOCK_UNAVAILABLE");
-    try {
-      return await lockManager.request.call(
-        lockManager,
-        USAGE_LOCK_PREFIX + ownerUid,
-        { mode: "exclusive" },
-        async (lock) => {
-          if (lock === null) return usageLockUnavailable("LOCK_NOT_ACQUIRED");
-          return await transaction();
-        }
-      );
-    } catch (error) {
-      return usageLockUnavailable("LOCK_REQUEST_FAILED", error);
-    }
+    return await withExclusiveStateLock(USAGE_LOCK_PREFIX + ownerUid, transaction);
   }
 
   function usageMonotonicNow() {
@@ -439,6 +415,24 @@
     cleanupDisconnectedUsageCards();
   }
 
+  function scheduleUsageFeedMutations(mutations) {
+    if (Array.isArray(mutations) && mutations.length > 0) {
+      usagePendingMutations.push(...mutations);
+    }
+    if (usageFeedMutationsScheduled) return;
+    usageFeedMutationsScheduled = true;
+    const scheduleFrame =
+      typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame
+        : (callback) => setTimeout(callback, 0);
+    scheduleFrame(() => {
+      usageFeedMutationsScheduled = false;
+      const queued = usagePendingMutations;
+      usagePendingMutations = [];
+      if (queued.length > 0) processUsageFeedMutations(queued);
+    });
+  }
+
   function isUsageCardStillHalfVisible(card) {
     if (!card || typeof card.getBoundingClientRect !== "function") return false;
     const rect = card.getBoundingClientRect();
@@ -544,6 +538,8 @@
     }
     usageFeedRoot = null;
     usageFeedObserver = null;
+    usageFeedMutationsScheduled = false;
+    usagePendingMutations = [];
     usageIntersectionObserver = null;
     if (resetDiscovery) {
       usageFeedDiscoveryTimer = null;
@@ -597,7 +593,7 @@
       processUsageIntersections,
       { threshold: [0, USAGE_POST_VISIBILITY_RATIO, 1] }
     );
-    usageFeedObserver = new MutationObserver(processUsageFeedMutations);
+    usageFeedObserver = new MutationObserver(scheduleUsageFeedMutations);
     for (const card of root.querySelectorAll(".wbpro-scroller-item")) {
       registerUsageCard(card);
     }

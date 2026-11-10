@@ -3,7 +3,7 @@
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
   const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.12.0";
+  const APP_VERSION = "0.12.1";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -118,6 +118,20 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.12.1": Object.freeze({
+      added: Object.freeze([
+        "关系雷达手动更新支持中途取消，关系事件支持搜索改名事件的旧昵称",
+        "粉丝体检新增重置筛选，并可从体检卡片和移除记录直接打开主页或友人档案",
+      ]),
+      improved: Object.freeze([
+        "关系事件、粉丝变化、关系概览、友人档案、粉丝体检和移除记录从子页面返回时保留展开条数与滚动位置",
+        "自动更新间隔改为选择即保存；私信导出接入深浅色主题与 30 秒请求超时保护",
+        "优化多档案与长信息流的本地记录索引性能，补充信息流书签曾用名提示与关闭标签页前的未完成操作保护",
+      ]),
+      fixed: Object.freeze([
+        "修复私信页面启动顺序导致的初始化异常，以及粉丝体检未知移除结果在往返子页面后丢失隔离状态的问题",
+      ]),
+    }),
     "0.12.0": Object.freeze({
       added: Object.freeze([
         "关系概览新增当前可见关注名单，可按互关或单向关注筛选，按昵称、微博备注或 UID 搜索",
@@ -370,36 +384,40 @@
   });
 
   const FAILURE_LABELS = Object.freeze({
-    UID_UNAVAILABLE: "无法可靠识别当前登录账号",
-    ACCOUNT_CHANGED_DURING_SCAN: "扫描期间登录账号发生变化",
-    STALE_SCAN: "扫描结果早于当前已保存快照",
-    LOGIN_REQUIRED: "登录已失效，请重新登录",
-    HTTP_ERROR: "接口返回 HTTP 错误",
-    CHALLENGE_OR_UNEXPECTED_RESPONSE: "收到验证页面或意外 HTML",
-    NON_JSON_RESPONSE: "接口未返回有效 JSON",
-    UNEXPECTED_CONTENT_TYPE: "接口响应类型异常",
-    UNEXPECTED_SCHEMA: "接口数据结构异常",
-    PAGINATION_FAILURE: "分页链不可信",
-    NETWORK_ERROR: "网络请求失败",
-    PERSISTENCE_ERROR: "本地保存失败",
+    UID_UNAVAILABLE: "无法可靠识别当前登录账号。",
+    ACCOUNT_CHANGED_DURING_SCAN: "扫描期间登录账号发生变化。",
+    STALE_SCAN: "扫描结果早于当前已保存快照。",
+    RADAR_SCAN_CANCELLED: "读取已取消。",
+    LOGIN_REQUIRED: "登录已失效，请重新登录。",
+    HTTP_ERROR: "接口返回 HTTP 错误。",
+    CHALLENGE_OR_UNEXPECTED_RESPONSE: "收到验证页面或意外 HTML。",
+    NON_JSON_RESPONSE: "接口未返回有效 JSON。",
+    UNEXPECTED_CONTENT_TYPE: "接口响应类型异常。",
+    UNEXPECTED_SCHEMA: "接口数据结构异常。",
+    PAGINATION_FAILURE: "分页链不可信。",
+    NETWORK_ERROR: "网络请求失败。",
+    PERSISTENCE_ERROR: "本地保存失败。",
     CONCURRENT_MODIFICATION:
       "检测到另一个微博标签页正在修改关系雷达数据，本次操作未保存。请在其中一个标签页重新操作。",
-    STORAGE_ERROR: "本地状态无法读取",
-    BACKUP_EXPORT_ERROR: "备份导出失败",
-    BACKUP_RESTORE_ERROR: "备份恢复失败",
-    EVENT_EXPORT_ERROR: "事件导出失败",
-    UPDATE_ALREADY_RUNNING: "更新正在进行",
+    STORAGE_ERROR: "本地状态无法读取。",
+    BACKUP_EXPORT_ERROR: "备份导出失败。",
+    BACKUP_RESTORE_ERROR: "备份恢复失败。",
+    EVENT_EXPORT_ERROR: "事件导出失败。",
+    UPDATE_ALREADY_RUNNING: "另一个关系扫描正在进行。",
     STATE_LOCK_UNAVAILABLE:
       "暂时无法安全地保存本地数据，本次操作未保存。请稍后重试。",
-    UNKNOWN_FAILURE: "未知失败",
+    UNKNOWN_FAILURE: "未知失败。",
   });
 
   const hasOwn = (value, key) =>
     Object.prototype.hasOwnProperty.call(value, key);
 
   let updateRunning = false;
+  let radarCancelRequested = false;
   let followerUpdateRunning = false;
   let followerCancelRequested = false;
+  let privateMessageExportInFlight = false;
+  let beforeUnloadGuardInstalled = false;
   // A manual scan in this tab, so its progress panel can be reopened after it
   // was closed, and the outcome of one that finished while the user was
   // elsewhere. Both live only as long as the page: they are a convenience for
@@ -457,6 +475,8 @@
   let usageListenersInstalled = false;
   let usageFeedRoot = null;
   let usageFeedObserver = null;
+  let usageFeedMutationsScheduled = false;
+  let usagePendingMutations = [];
   let usageIntersectionObserver = null;
   let usageFeedDiscoveryTimer = null;
   let usageFeedDiscoveryCount = 0;
@@ -502,6 +522,61 @@
 
   function delay(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  }
+
+  function cancellableDelay(milliseconds, cancelSignal) {
+    if (!cancelSignal) return delay(milliseconds);
+    if (cancelSignal.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        cancelSignal.removeEventListener("abort", onAbort);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        cancelSignal.removeEventListener("abort", onAbort);
+        resolve();
+      }, milliseconds);
+      cancelSignal.addEventListener("abort", onAbort);
+    });
+  }
+
+  function clearNode(node) {
+    if (!node) return;
+    while (node.childNodes.length > 0) node.removeChild(node.childNodes[0]);
+  }
+
+  function handleBeforeUnload(event) {
+    if (!shouldProtectPageUnload()) return;
+    event.preventDefault();
+    event.returnValue = "";
+  }
+
+  function shouldProtectPageUnload() {
+    return Boolean(
+      privateMessageExportInFlight ||
+        followerRemovalInFlight ||
+        anyFriendNoteEditorHasUnsavedChanges()
+    );
+  }
+
+  function syncBeforeUnloadGuard() {
+    if (
+      typeof window === "undefined" ||
+      !window ||
+      typeof window.addEventListener !== "function" ||
+      typeof window.removeEventListener !== "function"
+    ) {
+      return;
+    }
+    const needed = shouldProtectPageUnload();
+    if (needed && !beforeUnloadGuardInstalled) {
+      window.addEventListener("beforeunload", handleBeforeUnload);
+      beforeUnloadGuardInstalled = true;
+    } else if (!needed && beforeUnloadGuardInstalled) {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      beforeUnloadGuardInstalled = false;
+    }
   }
 
   const SCAN_REQUEST_TIMEOUT_MS = 30000;
@@ -583,9 +658,9 @@
     );
   }
 
-  async function requestFollowingPage(ownerUid, page) {
+  async function requestFollowingPage(ownerUid, page, cancelSignal) {
     const url = buildRequestUrl(ownerUid, page);
-    const fetched = await fetchScanPage(url.href);
+    const fetched = await fetchScanPage(url.href, cancelSignal);
     if (!fetched.ok) return fetched;
     const { response, body } = fetched;
     const contentType = response.headers.get("content-type") || "unavailable";
@@ -702,7 +777,13 @@
     }
   }
 
-  async function scanFollowing(ownerUid, onProgress, beforeFirstRequest) {
+  async function scanFollowing(
+    ownerUid,
+    onProgress,
+    beforeFirstRequest,
+    isCancelled,
+    options = {}
+  ) {
     const recordsByUid = new Map();
     const seenNextCursors = new Set();
     const seenPaginationStates = new Set();
@@ -711,16 +792,40 @@
     let requestsMade = 0;
 
     for (let page = 1; page <= MAX_REQUESTS; page += 1) {
+      if (typeof isCancelled === "function" && isCancelled()) {
+        return { ok: false, failureKind: "RADAR_SCAN_CANCELLED", requestsMade };
+      }
       if (requestsMade === 0 && typeof beforeFirstRequest === "function") {
         const permission = beforeFirstRequest();
         if (!permission.ok) {
           return { ...permission, requestsMade: 0, failedPage: page };
         }
       }
-      if (requestsMade > 0) await delay(REQUEST_DELAY_MS);
+      if (requestsMade > 0) {
+        await cancellableDelay(REQUEST_DELAY_MS, options.cancelSignal);
+      }
+      if (typeof isCancelled === "function" && isCancelled()) {
+        return { ok: false, failureKind: "RADAR_SCAN_CANCELLED", requestsMade };
+      }
+      const ownerBeforeRequest = determineCurrentUid();
+      if (!ownerBeforeRequest.ok || ownerBeforeRequest.uid !== ownerUid) {
+        return {
+          ok: false,
+          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+          requestsMade,
+          failedPage: page,
+        };
+      }
       requestsMade += 1;
 
-      const response = await requestFollowingPage(ownerUid, page);
+      const response = await requestFollowingPage(
+        ownerUid,
+        page,
+        options.cancelSignal
+      );
+      if (typeof isCancelled === "function" && isCancelled()) {
+        return { ok: false, failureKind: "RADAR_SCAN_CANCELLED", requestsMade };
+      }
       if (!response.ok) {
         return { ...response, requestsMade, failedPage: page };
       }
@@ -1010,7 +1115,7 @@
   // never across a scan, a delay, or a UI wait.
   const FRIEND_RADAR_STATE_LOCK_PREFIX = "weibo-toolkit-friend-radar-state-";
 
-  function friendRadarStateLockUnavailable(reason, error) {
+  function stateLockUnavailable(reason, error) {
     const result = {
       ok: false,
       failureKind: "STATE_LOCK_UNAVAILABLE",
@@ -1020,26 +1125,33 @@
     return result;
   }
 
-  async function withFriendRadarStateLock(ownerUid, transaction) {
+  async function withExclusiveStateLock(lockName, transaction) {
     const lockManager = pageLockManager();
     if (lockManager === null) {
-      return friendRadarStateLockUnavailable("LOCK_UNAVAILABLE");
+      return stateLockUnavailable("LOCK_UNAVAILABLE");
     }
     try {
       return await lockManager.request.call(
         lockManager,
-        FRIEND_RADAR_STATE_LOCK_PREFIX + ownerUid,
+        lockName,
         { mode: "exclusive" },
         async (lock) => {
           if (lock === null) {
-            return friendRadarStateLockUnavailable("LOCK_NOT_ACQUIRED");
+            return stateLockUnavailable("LOCK_NOT_ACQUIRED");
           }
           return await transaction();
         }
       );
     } catch (error) {
-      return friendRadarStateLockUnavailable("LOCK_REQUEST_FAILED", error);
+      return stateLockUnavailable("LOCK_REQUEST_FAILED", error);
     }
+  }
+
+  async function withFriendRadarStateLock(ownerUid, transaction) {
+    return await withExclusiveStateLock(
+      FRIEND_RADAR_STATE_LOCK_PREFIX + ownerUid,
+      transaction
+    );
   }
 
   // Unlocked helper: callers must already hold the Friend Radar state lock. It
@@ -1281,7 +1393,12 @@
     return { ok: true };
   }
 
-  async function performUpdate(onProgress, beforeFirstRequest) {
+  async function performUpdate(
+    onProgress,
+    beforeFirstRequest,
+    isCancelled,
+    options = {}
+  ) {
     const uidResult = determineCurrentUid();
     if (!uidResult.ok) return uidResult;
 
@@ -1297,7 +1414,9 @@
     const scan = await scanFollowing(
       uidResult.uid,
       onProgress,
-      beforeFirstRequest
+      beforeFirstRequest,
+      isCancelled,
+      options
     );
     if (!scan.ok) return scan;
 
@@ -1313,6 +1432,13 @@
     const committed = await withFriendRadarStateLock(
       uidResult.uid,
       async () => {
+        if (typeof isCancelled === "function" && isCancelled()) {
+          return {
+            ok: false,
+            failureKind: "RADAR_SCAN_CANCELLED",
+            requestsMade: scan.requestsMade,
+          };
+        }
         const loaded = loadState(uidResult.uid);
         if (!loaded.ok) return loaded;
         if (JSON.stringify(loaded.state.latestSnapshot) !== scanStartSnapshot) {

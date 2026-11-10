@@ -1,8 +1,48 @@
 
+  // The File System Access API lives on the page realm. Userscript sandboxes do
+  // not always mirror it, so the page window is preferred and the sandbox
+  // window is the fallback. No new @grant is required: unsafeWindow is already
+  // requested by this script.
+  function resolveSaveFilePickerWindow() {
+    try {
+      if (
+        typeof unsafeWindow !== "undefined" &&
+        unsafeWindow &&
+        typeof unsafeWindow.showSaveFilePicker === "function"
+      ) {
+        return unsafeWindow;
+      }
+    } catch (_) {
+      // A blocked page realm simply means the picker is unavailable.
+    }
+    try {
+      if (
+        typeof window !== "undefined" &&
+        window &&
+        typeof window.showSaveFilePicker === "function"
+      ) {
+        return window;
+      }
+    } catch (_) {
+      // Same: unavailable, never fatal.
+    }
+    return null;
+  }
+
+  async function abortWritableStreamQuietly(writable) {
+    if (!writable || typeof writable.abort !== "function") return;
+    try {
+      await writable.abort();
+    } catch (_) {
+      // The write already failed; cleanup errors add nothing.
+    }
+  }
+
   function installPrivateMessageExportModule() {
     const ENDPOINT = "/webim/2/direct_messages/conversation.json";
     const PAGE_SIZE = 100;
     const REQUEST_DELAY_MS = 750;
+    const REQUEST_TIMEOUT_MS = 30000;
     const AUTO_REST_PAGES = 100;
     const AUTO_REST_MS = 5000;
     // Final pathological-loop fuse: 5,000 proven 15-message pages is a
@@ -34,38 +74,11 @@
         checkpoint.hidden = mode !== "checkpoint";
       }
       if (status.textContent !== statusText) status.textContent = statusText;
+      if (status.title !== statusText) status.title = statusText;
       if (root.dataset.mode !== mode) root.dataset.mode = mode;
     }
 
-    // The File System Access API lives on the page realm. Userscript sandboxes do
-    // not always mirror it, so the page window is preferred and the sandbox
-    // window is the fallback. No new @grant is required: unsafeWindow is already
-    // requested by this script.
-    function privateMessagePickerWindow() {
-      try {
-        if (
-          typeof unsafeWindow !== "undefined" &&
-          unsafeWindow &&
-          typeof unsafeWindow.showSaveFilePicker === "function"
-        ) {
-          return unsafeWindow;
-        }
-      } catch (_) {
-        // A blocked page realm simply means the picker is unavailable.
-      }
-      try {
-        if (
-          typeof window !== "undefined" &&
-          window &&
-          typeof window.showSaveFilePicker === "function"
-        ) {
-          return window;
-        }
-      } catch (_) {
-        // Same: unavailable, never fatal.
-      }
-      return null;
-    }
+    const privateMessagePickerWindow = resolveSaveFilePickerWindow;
 
     function ensureControl() {
       scheduled = false;
@@ -83,11 +96,14 @@
         root = document.createElement("div");
         root.id = ROOT_ID;
         root.className = "wfr-pm-export-root";
+        applyThemeToRoot(root);
         const button = document.createElement("button");
         button.type = "button";
         button.className = "wfr-pm-export-button";
         const status = document.createElement("span");
         status.className = "wfr-pm-export-status";
+        status.setAttribute("role", "status");
+        status.setAttribute("aria-live", "polite");
         const checkpoint = document.createElement("div");
         checkpoint.className = "wfr-pm-export-checkpoint";
         checkpoint.hidden = true;
@@ -146,16 +162,30 @@
     }
 
     async function requestPage(session, cursor, controller) {
-      const response = await fetch(requestUrl(session.participantUid, cursor).href, {
-        method: "GET",
-        credentials: "same-origin",
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-        redirect: "follow",
-        signal: controller.signal,
-      });
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, REQUEST_TIMEOUT_MS);
+      let response;
+      let body;
+      try {
+        response = await fetch(requestUrl(session.participantUid, cursor).href, {
+          method: "GET",
+          credentials: "same-origin",
+          headers: { Accept: "application/json" },
+          cache: "no-store",
+          redirect: "follow",
+          signal: controller.signal,
+        });
+        body = await response.text();
+      } catch (error) {
+        if (timedOut && !task?.cancelled) throw new Error("REQUEST_TIMEOUT");
+        throw error;
+      } finally {
+        clearTimeout(timer);
+      }
       const contentType = response.headers.get("content-type") || "";
-      const body = await response.text();
       if (!response.ok) throw new Error(response.status === 401 ? "LOGIN_REQUIRED" : "HTTP_ERROR");
       if (!/(?:application|text)\/[^;]*json/i.test(contentType)) {
         throw new Error("UNEXPECTED_CONTENT_TYPE");
@@ -336,11 +366,7 @@
         await writable.write(markdown);
         await writable.close();
       } catch (_) {
-        try {
-          await writable.abort();
-        } catch (__) {
-          // The write already failed; cleanup errors add nothing.
-        }
+        await abortWritableStreamQuietly(writable);
         throw new Error("FILE_WRITE_FAILED");
       }
     }
@@ -391,6 +417,7 @@
       const messages = {
         LOGIN_REQUIRED: "登录状态异常",
         HTTP_ERROR: "读取失败，未生成文件",
+        REQUEST_TIMEOUT: "请求超时，未生成文件",
         UNEXPECTED_CONTENT_TYPE: "返回类型发生变化",
         NON_JSON_RESPONSE: "返回内容不是有效 JSON",
         UNEXPECTED_SCHEMA: "返回结构发生变化",
@@ -436,6 +463,8 @@
         recordsRead: 0,
         progress: "正在读取：0 条 · 0 页",
       };
+      privateMessageExportInFlight = true;
+      syncBeforeUnloadGuard();
       setUi("running", task.progress);
       try {
         const result = await collectHistory(session, token);
@@ -473,7 +502,11 @@
           setUi("idle", failureText(code));
         }
       } finally {
-        if (task?.token === token) task = null;
+        if (task?.token === token) {
+          task = null;
+          privateMessageExportInFlight = false;
+          syncBeforeUnloadGuard();
+        }
         scheduleEnsure();
       }
     }
@@ -495,6 +528,10 @@
     style.id = "wfr-pm-export-style";
     style.textContent = `
       .wfr-pm-export-root { color-scheme: light; --wfr-pm-bg: #faf9f6; --wfr-pm-text: #1f2328; --wfr-pm-border: #dcdad2; --wfr-pm-hover-bg: #f0eee8; --wfr-pm-accent: #3d6b5e; --wfr-pm-muted: #656963; position: absolute; top: 10px; right: 58px; z-index: 20; display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; max-width: min(520px, calc(100% - 68px)); font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", system-ui, sans-serif; }
+      .wfr-pm-export-root.wfr-theme-dark { color-scheme: dark; --wfr-pm-bg: #1e2022; --wfr-pm-text: #e6e8eb; --wfr-pm-border: #383c40; --wfr-pm-hover-bg: #292d30; --wfr-pm-accent: #68a694; --wfr-pm-muted: #9aa0a6; }
+      @media (prefers-color-scheme: dark) {
+        .wfr-pm-export-root.wfr-theme-system { color-scheme: dark; --wfr-pm-bg: #1e2022; --wfr-pm-text: #e6e8eb; --wfr-pm-border: #383c40; --wfr-pm-hover-bg: #292d30; --wfr-pm-accent: #68a694; --wfr-pm-muted: #9aa0a6; }
+      }
       .wfr-pm-export-button, .wfr-pm-export-choice { appearance: none; border: 1px solid var(--wfr-pm-border); border-radius: 8px; background: var(--wfr-pm-bg); color: var(--wfr-pm-text); font: inherit; font-weight: 500; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease; }
       .wfr-pm-export-button { padding: 5px 10px; }
       .wfr-pm-export-button:hover:not(:disabled), .wfr-pm-export-choice:hover:not(:disabled) { border-color: var(--wfr-pm-accent); background: var(--wfr-pm-hover-bg); color: var(--wfr-pm-accent); }

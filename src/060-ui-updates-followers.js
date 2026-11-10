@@ -14,6 +14,7 @@
     applyThemeToRoot(launcherButton);
     applyThemeToRoot(usageCornerButton);
     applyThemeToRoot(panelRoot);
+    applyThemeToRoot(document.getElementById("wfr-pm-export-root"));
     applyThemeToRoot(document.getElementById(PROFILE_EXTRAS_ID));
     applyThemeToRoot(
       profileFriendNotesContext === null ? null : profileFriendNotesContext.root
@@ -31,10 +32,12 @@
     panelReturnFocus = null;
     if (panelRoot && panelRoot.parentNode) panelRoot.parentNode.removeChild(panelRoot);
     panelRoot = null;
+    toolkitHomePanelRoot = null;
     friendNoteDetailView = null;
     panelSizeFixed = false;
     panelHeaderButtons = [];
     panelExitLocked = false;
+    syncBeforeUnloadGuard();
     // Scans, restores and event clearing all run from the panel, so the local
     // facts cached for the feed entries are re-read once it is really closed.
     markFeedFriendNotesStale();
@@ -115,25 +118,7 @@
       return;
     }
     if (event.key !== "Tab" || panelRoot === null) return;
-    const focusable = [
-      ...panelRoot.querySelectorAll(
-        'button, a[href], input, select, textarea, summary, [tabindex="0"]'
-      ),
-    ].filter((node) => !node.disabled && node.getClientRects().length > 0);
-    if (focusable.length === 0) {
-      event.preventDefault();
-      return;
-    }
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    const active = document.activeElement;
-    if (event.shiftKey && (active === first || !focusable.includes(active))) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && active === last) {
-      event.preventDefault();
-      first.focus();
-    }
+    trapDialogTabKey(event, panelRoot);
   }
 
   // Pages reached by navigating inside the Toolkit share one panel size, so the
@@ -157,6 +142,23 @@
     const root = createElement("div", null, "wfr-overlay wfr-root");
     applyThemeToRoot(root);
     root.addEventListener("keydown", handlePanelKeydown);
+    let backdropMouseDown = false;
+    root.addEventListener("mousedown", (event) => {
+      backdropMouseDown = Boolean(event && event.target === root);
+    });
+    root.addEventListener("click", (event) => {
+      const clickedBackdrop = backdropMouseDown && Boolean(event && event.target === root);
+      backdropMouseDown = false;
+      if (!clickedBackdrop) return;
+      if (
+        panelExitLocked ||
+        followerRemovalInFlight ||
+        panelHoldsUnsavedNote()
+      ) {
+        return;
+      }
+      closePanel();
+    });
     const panel = createElement(
       "section",
       null,
@@ -305,27 +307,51 @@
       "wfr-button wfr-danger"
     );
     clearButton.type = "button";
-    clearButton.addEventListener("click", async () => {
-      const confirmed = confirm(
-        "清空当前账号在本浏览器中的使用统计？\n此操作不会影响微博数据。"
+    const confirmSlot = createElement("div", null, "wfr-batch-panel");
+    clearButton.addEventListener("click", () => {
+      clearNode(confirmSlot);
+      const confirmation = createElement("div", null, "wfr-removal-confirm");
+      confirmation.append(
+        createElement("h3", "清空当前账号在本浏览器中的使用统计？"),
+        createElement("p", "此操作不会影响微博数据。", "wfr-muted")
       );
-      if (!confirmed) return;
-      const currentOwner = determineCurrentUid();
-      if (!currentOwner.ok || currentOwner.uid !== ownerUid) {
-        showFailure("微博计步器", {
-          failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
-        });
-        return;
-      }
-      const cleared = await clearUsageStatisticsForOwner(ownerUid);
-      if (!cleared.ok) {
-        showFailure("微博计步器", cleared);
-        return;
-      }
-      showUsageStatistics("使用统计已清空。追踪偏好保持不变。");
+      const confirmActions = createElement("div", null, "wfr-actions");
+      const cancel = createElement("button", "取消", "wfr-button");
+      const confirmClear = createElement(
+        "button",
+        "确认清空",
+        "wfr-button wfr-danger"
+      );
+      cancel.type = "button";
+      confirmClear.type = "button";
+      cancel.addEventListener("click", () => {
+        clearNode(confirmSlot);
+        if (typeof clearButton.focus === "function") clearButton.focus();
+      });
+      confirmClear.addEventListener("click", async () => {
+        cancel.disabled = true;
+        confirmClear.disabled = true;
+        const currentOwner = determineCurrentUid();
+        if (!currentOwner.ok || currentOwner.uid !== ownerUid) {
+          showFailure("微博计步器", {
+            failureKind: "ACCOUNT_CHANGED_DURING_SCAN",
+          });
+          return;
+        }
+        const cleared = await clearUsageStatisticsForOwner(ownerUid);
+        if (!cleared.ok) {
+          showFailure("微博计步器", cleared);
+          return;
+        }
+        showUsageStatistics("使用统计已清空。追踪偏好保持不变。");
+      });
+      confirmActions.append(cancel, confirmClear);
+      confirmation.append(confirmActions);
+      confirmSlot.append(confirmation);
+      if (typeof cancel.focus === "function") cancel.focus();
     });
     actions.append(clearButton);
-    body.append(actions);
+    body.append(actions, confirmSlot);
   }
 
   function showUsageStatistics(statusText = null) {
@@ -659,7 +685,7 @@
       ? "首次关注快照已保存，从下次更新开始记录变化。"
       : `更新完成，发现 ${result.newEvents.length} 个新事件。`;
     body.append(createElement("p", message, "wfr-success"));
-    addLine(body, "API可见关注", result.snapshot.visibleCount);
+    addLine(body, "API 可见关注", result.snapshot.visibleCount);
     addLine(body, "接口总数", result.snapshot.reportedTotal);
     addLine(
       body,
@@ -682,7 +708,7 @@
     ["reportedTotal", "接口报告总数"],
   ]);
 
-  function showScanProgress() {
+  function showScanProgress(onCancel) {
     const body = showPanel("关系雷达更新");
     body.append(
       createElement("p", "正在读取可见关注，请保持页面打开。"),
@@ -698,6 +724,23 @@
       values.set(key, value);
       rows.append(row);
     }
+    if (typeof onCancel === "function") {
+      const cancelButton = createElement("button", "取消", "wfr-button");
+      cancelButton.type = "button";
+      if (radarCancelRequested) {
+        cancelButton.disabled = true;
+        cancelButton.textContent = "正在取消…";
+      }
+      cancelButton.addEventListener("click", () => {
+        radarCancelRequested = true;
+        cancelButton.disabled = true;
+        cancelButton.textContent = "正在取消…";
+        onCancel();
+      });
+      const actions = createElement("div", null, "wfr-actions");
+      actions.append(cancelButton);
+      body.append(actions);
+    }
     return function reportProgress(progress) {
       for (const [key] of PROGRESS_FIELDS) {
         const value = values.get(key);
@@ -709,14 +752,32 @@
   }
 
   function showRadarUpdateResult(result) {
-    if (result.ok) showUpdateSuccess(result);
-    else showFailure("关系雷达更新失败", result);
+    if (result.ok) {
+      showUpdateSuccess(result);
+      return;
+    }
+    if (result.failureKind === "RADAR_SCAN_CANCELLED") {
+      const body = showPanel("关系雷达已取消", true);
+      body.append(
+        createElement("p", "读取已取消。", "wfr-muted"),
+        createElement(
+          "p",
+          "已保留上一次成功快照，未生成关系变化事件。",
+          "wfr-muted"
+        )
+      );
+      if (typeof result.requestsMade === "number") {
+        addLine(body, "已发请求", result.requestsMade);
+      }
+      return;
+    }
+    showFailure("关系雷达更新失败", result);
   }
 
   // Opens (or reopens) the progress panel of the manual scan that is running
   // and replays the latest numbers into it.
   function attachRadarProgress(run) {
-    run.render = showScanProgress();
+    run.render = showScanProgress(run.cancel);
     run.root = panelRoot;
     if (run.latest !== null) run.render(run.latest);
   }
@@ -762,11 +823,14 @@
       });
       return;
     }
+    radarCancelRequested = false;
+    const cancelController = new AbortController();
     const run = {
       ownerUid: startOwner.ok ? startOwner.uid : null,
       latest: null,
       render: null,
       root: null,
+      cancel: () => cancelController.abort(),
     };
     manualRadarRun = run;
     unseenManualRadarResult = null;
@@ -774,10 +838,15 @@
     updateRunning = true;
     let result;
     try {
-      result = await performUpdate((progress) => {
-        run.latest = progress;
-        run.render(progress);
-      });
+      result = await performUpdate(
+        (progress) => {
+          run.latest = progress;
+          run.render(progress);
+        },
+        null,
+        () => radarCancelRequested,
+        { cancelSignal: cancelController.signal }
+      );
     } catch (error) {
       result = {
         ok: false,
@@ -786,6 +855,7 @@
       };
     } finally {
       updateRunning = false;
+      radarCancelRequested = false;
       manualRadarRun = null;
     }
     refreshUnreadBadge();
@@ -793,11 +863,18 @@
     // possibly with typed input in it. That panel is theirs: the outcome is
     // announced on the launcher and kept for Home to show.
     if (panelRoot !== run.root) {
-      unseenManualRadarResult = { ownerUid: run.ownerUid, result };
+      if (result.failureKind !== "RADAR_SCAN_CANCELLED") {
+        unseenManualRadarResult = { ownerUid: run.ownerUid, result };
+      }
       setLauncherStatus(
-        result.ok ? "关系雷达更新完成" : "关系雷达更新失败",
+        result.ok
+          ? "关系雷达更新完成"
+          : result.failureKind === "RADAR_SCAN_CANCELLED"
+            ? "关系雷达已取消"
+            : "关系雷达更新失败",
         AUTO_STATUS_DURATION_MS
       );
+      refreshOpenToolkitHome();
       return;
     }
     showRadarUpdateResult(result);
@@ -951,7 +1028,7 @@
         counts[FOLLOWER_EVENT.VISIBLE_FOLLOWER_DISAPPEARED] || 0
       );
     }
-    addLine(body, "API可见粉丝", result.snapshot.uniqueRecordCount);
+    addLine(body, "API 可见粉丝", result.snapshot.uniqueRecordCount);
     addLine(body, "读取记录", result.snapshot.rawRecordCount);
     addLine(body, "跨页重复", result.snapshot.crossPageDuplicateCount);
     addLine(body, "请求数", result.requestsMade);
@@ -969,7 +1046,7 @@
   function showFollowerScanProgress(onCancel) {
     const body = showPanel("粉丝快照更新");
     body.append(
-      createElement("p", "正在读取API可见粉丝，请保持页面打开。"),
+      createElement("p", "正在读取 API 可见粉丝，请保持页面打开。"),
       createElement("div", null, "wfr-progress")
     );
     const values = new Map();
@@ -1080,6 +1157,7 @@
             : "粉丝快照更新失败",
         AUTO_STATUS_DURATION_MS
       );
+      refreshOpenToolkitHome();
       return;
     }
     showFollowerUpdateResult(result);
@@ -1138,18 +1216,45 @@
     );
   }
 
-  function renderFollowerEvents(ownerUid, state, initialQuery = "") {
+  function renderFollowerEvents(ownerUid, state, initialQueryOrView = "") {
+    const view =
+      typeof initialQueryOrView === "string"
+        ? {
+            query: initialQueryOrView,
+            shown: FRIEND_NOTES_PAGE_SIZE,
+            scrollTop: 0,
+          }
+        : {
+            query:
+              initialQueryOrView && typeof initialQueryOrView.query === "string"
+                ? initialQueryOrView.query
+                : "",
+            shown:
+              initialQueryOrView &&
+              typeof initialQueryOrView.shown === "number" &&
+              Number.isFinite(initialQueryOrView.shown) &&
+              initialQueryOrView.shown >= FRIEND_NOTES_PAGE_SIZE
+                ? initialQueryOrView.shown
+                : FRIEND_NOTES_PAGE_SIZE,
+            scrollTop:
+              initialQueryOrView &&
+              typeof initialQueryOrView.scrollTop === "number" &&
+              Number.isFinite(initialQueryOrView.scrollTop)
+                ? initialQueryOrView.scrollTop
+                : 0,
+          };
     const body = showPanel("粉丝变化", true);
     const snapshot = state.latestSnapshot;
     addLine(body, "已有快照", snapshot ? "是" : "否");
     if (snapshot) {
       addLine(body, "上次成功更新", formatTime(snapshot.capturedAt));
-      addLine(body, "API可见粉丝", snapshot.uniqueRecordCount);
+      addLine(body, "API 可见粉丝", snapshot.uniqueRecordCount);
     }
     const countValue = addLine(body, "变化事件", state.events.length);
     appendFollowerVisibilityNote(body, snapshot);
 
     let events = state.events;
+    let shownLimit = view.shown;
     const notesLoaded = loadFriendNotesState(ownerUid);
     const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
     const clearAllActions = createElement("div", null, "wfr-actions");
@@ -1165,15 +1270,29 @@
     search.type = "search";
     search.placeholder = "搜索昵称或 UID";
     search.setAttribute("aria-label", "搜索昵称或 UID");
-    search.value = initialQuery;
+    search.value = view.query;
+    const summary = createElement("p", "", "wfr-muted");
+    summary.setAttribute("role", "status");
+    summary.setAttribute("aria-live", "polite");
     const status = createElement("p", "", "wfr-muted");
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
     const emptyNote = createElement("p", "暂无粉丝变化事件。", "wfr-muted wfr-empty");
     const list = createElement("div", null, "wfr-event-list");
-    body.append(clearAllActions, clearAllPanel, search, status, emptyNote, list);
-
-    function clearNode(node) {
-      while (node.childNodes.length > 0) node.removeChild(node.childNodes[0]);
-    }
+    const moreActions = createElement("div", null, "wfr-actions");
+    const moreButton = createElement("button", "加载更多", "wfr-button");
+    moreButton.type = "button";
+    moreActions.append(moreButton);
+    body.append(
+      clearAllActions,
+      clearAllPanel,
+      search,
+      summary,
+      status,
+      emptyNote,
+      list,
+      moreActions
+    );
 
     const renderedCards = new Map();
 
@@ -1185,18 +1304,22 @@
       const desired = allSorted.filter((event) =>
         matchesFollowerEventQuery(event, search.value || "")
       );
-      const desiredIds = new Set(desired.map((event) => event.id));
+      const visibleDesired = desired.slice(0, shownLimit);
+      const visibleIds = new Set(visibleDesired.map((event) => event.id));
       for (const [id, node] of [...renderedCards]) {
-        if (desiredIds.has(id)) continue;
+        if (visibleIds.has(id)) continue;
         if (node.parentNode) node.parentNode.removeChild(node);
         renderedCards.delete(id);
       }
-      for (const event of desired) {
+      for (const event of visibleDesired) {
         if (preserveExistingOrder && renderedCards.has(event.id)) continue;
         const card = renderedCards.get(event.id) || buildEventCard(event);
         renderedCards.set(event.id, card);
         list.append(card);
       }
+      const remaining = desired.length - visibleDesired.length;
+      moreActions.hidden = remaining <= 0;
+      moreButton.textContent = `加载更多（还有 ${remaining} 条）`;
       renderCounts(desired.length);
     }
 
@@ -1205,6 +1328,12 @@
       const noEvents = events.length === 0;
       const noMatches = matchingCount === 0;
       search.hidden = noEvents;
+      summary.hidden = noEvents;
+      summary.textContent = noEvents
+        ? ""
+        : matchingCount === events.length
+          ? `共 ${events.length} 条变化事件`
+          : `共 ${events.length} 条变化事件，匹配 ${matchingCount} 条`;
       emptyNote.textContent = noEvents
         ? "暂无粉丝变化事件。"
         : "没有匹配的粉丝变化事件。";
@@ -1261,6 +1390,7 @@
         }
         // Targeted reconciliation: surviving cards keep their nodes and the
         // reading position stays where it is.
+        shownLimit = Math.max(FRIEND_NOTES_PAGE_SIZE, renderedCards.size);
         syncList(true);
       });
       actions.append(clearButton, createFriendNoteProfileLink(event.uid));
@@ -1271,23 +1401,35 @@
           "wfr-button"
         );
         noteButton.type = "button";
-        noteButton.addEventListener("click", () =>
+        noteButton.addEventListener("click", () => {
+          const savedView = {
+            query: String(search.value || ""),
+            shown: Math.max(FRIEND_NOTES_PAGE_SIZE, renderedCards.size),
+            scrollTop: Number(body.scrollTop) || 0,
+          };
           showFriendNoteDetail(ownerUid, event.uid, null, () => {
             const fresh = loadFollowerState(ownerUid);
             renderFollowerEvents(
               ownerUid,
               fresh.ok ? fresh.state : { ...state, events },
-              String(search.value || "")
+              savedView
             );
-          })
-        );
+          });
+        });
         actions.append(noteButton);
       }
       item.append(actions);
       return item;
     }
 
-    search.addEventListener("input", () => syncList(false));
+    search.addEventListener("input", () => {
+      shownLimit = FRIEND_NOTES_PAGE_SIZE;
+      syncList(false);
+    });
+    moreButton.addEventListener("click", () => {
+      shownLimit += FRIEND_NOTES_PAGE_SIZE;
+      syncList(false);
+    });
 
     clearAllButton.addEventListener("click", () => {
       clearNode(clearAllPanel);
@@ -1320,6 +1462,7 @@
         if (!applyLocalWrite(result, "未能清空变化记录，本地数据未改变。")) {
           return;
         }
+        shownLimit = FRIEND_NOTES_PAGE_SIZE;
         syncList();
       });
       confirmActions.append(cancel, confirm);
@@ -1328,6 +1471,7 @@
     });
 
     syncList();
+    if (view.scrollTop > 0) body.scrollTop = view.scrollTop;
   }
 
   function viewFollowerEvents() {

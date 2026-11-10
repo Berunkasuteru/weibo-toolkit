@@ -181,38 +181,13 @@
     return friendNotesStateFromRaw(raw, ownerUid);
   }
 
-  function friendNotesLockUnavailable(reason, error) {
-    const result = {
-      ok: false,
-      failureKind: "STATE_LOCK_UNAVAILABLE",
-      reason,
-    };
-    if (error) result.errorName = error.name ? String(error.name) : "Error";
-    return result;
-  }
-
   // Owner-scoped cross-tab serialization, mirroring the other durable modules.
   // The transaction must stay local and short: no fetch, no delay, no UI wait.
   async function withFriendNotesLock(ownerUid, transaction) {
-    const lockManager = pageLockManager();
-    if (lockManager === null) {
-      return friendNotesLockUnavailable("LOCK_UNAVAILABLE");
-    }
-    try {
-      return await lockManager.request.call(
-        lockManager,
-        FRIEND_NOTES_LOCK_PREFIX + ownerUid,
-        { mode: "exclusive" },
-        async (lock) => {
-          if (lock === null) {
-            return friendNotesLockUnavailable("LOCK_NOT_ACQUIRED");
-          }
-          return await transaction();
-        }
-      );
-    } catch (error) {
-      return friendNotesLockUnavailable("LOCK_REQUEST_FAILED", error);
-    }
+    return await withExclusiveStateLock(
+      FRIEND_NOTES_LOCK_PREFIX + ownerUid,
+      transaction
+    );
   }
 
   // Unlocked helper: callers must already hold the Friend Notes lock. It writes
@@ -395,9 +370,10 @@
   // derivation the profile page uses, read from the states as they are now, so
   // evidence that has been cleared or replaced stops matching immediately.
   function deriveFriendNoteEntries(notesState, friendState, followerState) {
+    const factsIndex = buildProfileLocalFactsIndex(friendState, followerState);
     return Object.keys(notesState.notes)
       .map((uid) => {
-        const facts = deriveProfileLocalFacts(uid, friendState, followerState);
+        const facts = factsIndex.get(uid);
         return {
           uid,
           record: notesState.notes[uid],
@@ -488,7 +464,7 @@
   }
 
   function clearFriendNoteNode(node) {
-    while (node.childNodes.length > 0) node.removeChild(node.childNodes[0]);
+    clearNode(node);
   }
 
   function focusFriendNoteControl(control) {
@@ -675,6 +651,7 @@
     function renderView(focusPrimary) {
       mode = "view";
       draftChanged = null;
+      syncBeforeUnloadGuard();
       clearFriendNoteNode(content);
       if (record === null) {
         content.append(
@@ -747,6 +724,7 @@
       const counter = createElement("p", "", "wfr-muted wfr-note-counter");
       const syncCounter = () => {
         counter.textContent = `${String(textarea.value).length} / ${FRIEND_NOTE_MAX_LENGTH}`;
+        syncBeforeUnloadGuard();
       };
       textarea.addEventListener("input", syncCounter);
       syncCounter();
@@ -761,6 +739,7 @@
       tagInput.id = `${fieldId}-tag`;
       tagInput.maxLength = FRIEND_NOTE_TAG_MAX_LENGTH;
       tagInput.placeholder = "输入标签后按回车";
+      tagInput.addEventListener("input", syncBeforeUnloadGuard);
       draftChanged = () =>
         String(textarea.value) !== draft.note ||
         String(tagInput.value) !== "" ||
@@ -795,6 +774,7 @@
           item.append(createElement("span", tag), removeButton);
           tagList.append(item);
         }
+        syncBeforeUnloadGuard();
       }
 
       // Returns false only when pending input was rejected, so a save never
@@ -912,10 +892,12 @@
           return;
         }
         busy = true;
+        syncBeforeUnloadGuard();
         setControlsDisabled(true);
         setStatus("正在保存…");
         const result = await attemptSave(draft);
         busy = false;
+        syncBeforeUnloadGuard();
         if (result.ok) {
           adopt(result.record);
           renderView(true);
@@ -1026,11 +1008,13 @@
           return;
         }
         busy = true;
+        syncBeforeUnloadGuard();
         cancelButton.disabled = true;
         confirmButton.disabled = true;
         setStatus("正在删除…");
         const result = await attemptSave({ note: "", tags: [] });
         busy = false;
+        syncBeforeUnloadGuard();
         if (result.ok) {
           adopt(null);
           renderView(true);
@@ -1099,8 +1083,21 @@
   }
 
   function showFriendNotesManager(viewState) {
-    // Search text and tag filter survive a round trip through a detail view.
+    // Search text, tag filter, loaded page count and scroll position survive a
+    // round trip through a detail view.
     const view = viewState || { query: "", tag: null };
+    if (typeof view.query !== "string") view.query = "";
+    if (typeof view.tag !== "string") view.tag = null;
+    if (
+      typeof view.shown !== "number" ||
+      !Number.isFinite(view.shown) ||
+      view.shown < FRIEND_NOTES_PAGE_SIZE
+    ) {
+      view.shown = FRIEND_NOTES_PAGE_SIZE;
+    }
+    if (typeof view.scrollTop !== "number" || !Number.isFinite(view.scrollTop)) {
+      view.scrollTop = 0;
+    }
     const owner = determineCurrentUid();
     if (!owner.ok) {
       showFailure("友人档案", owner);
@@ -1138,6 +1135,13 @@
       );
     }
 
+    let shown = 0;
+    const openSubjectFromManager = (subjectUid) => {
+      if (shown > 0) view.shown = Math.max(FRIEND_NOTES_PAGE_SIZE, shown);
+      view.scrollTop = Number(body.scrollTop) || 0;
+      showFriendNoteDetail(ownerUid, subjectUid, view);
+    };
+
     const routeSubject = friendNoteRouteSubject(ownerUid);
     if (routeSubject !== null) {
       const routeActions = createElement("div", null, "wfr-actions");
@@ -1148,7 +1152,7 @@
         "wfr-button wfr-primary"
       );
       routeButton.addEventListener("click", () =>
-        showFriendNoteDetail(ownerUid, routeSubject, view)
+        openSubjectFromManager(routeSubject)
       );
       routeActions.append(routeButton);
       body.append(routeActions);
@@ -1213,7 +1217,6 @@
     body.append(summary, list, moreActions);
 
     let matching = [];
-    let shown = 0;
 
     function buildCard(entry) {
       const item = createElement("article", null, "wfr-event");
@@ -1254,23 +1257,24 @@
       const actions = createElement("div", null, "wfr-actions");
       const openButton = createFriendNoteButton("查看与编辑");
       openButton.addEventListener("click", () =>
-        showFriendNoteDetail(ownerUid, entry.uid, view)
+        openSubjectFromManager(entry.uid)
       );
       actions.append(openButton, createFriendNoteProfileLink(entry.uid));
       item.append(actions);
       return item;
     }
 
-    function renderMore() {
-      const next = matching.slice(shown, shown + FRIEND_NOTES_PAGE_SIZE);
+    function renderMore(batchSize = FRIEND_NOTES_PAGE_SIZE) {
+      const next = matching.slice(shown, shown + batchSize);
       for (const entry of next) list.append(buildCard(entry));
       shown += next.length;
+      view.shown = Math.max(FRIEND_NOTES_PAGE_SIZE, shown);
       const remaining = matching.length - shown;
       moreActions.hidden = remaining <= 0;
       moreButton.textContent = `加载更多（还有 ${remaining} 条）`;
     }
 
-    function renderList() {
+    function renderList(initialLimit = FRIEND_NOTES_PAGE_SIZE) {
       clearFriendNoteNode(list);
       matching = filterFriendNoteEntries(entries, view.query, view.tag);
       shown = 0;
@@ -1279,21 +1283,26 @@
           ? `共 ${entries.length} 条档案`
           : `共 ${entries.length} 条档案，匹配 ${matching.length} 条`;
       if (matching.length === 0) {
-        list.append(createElement("p", "没有匹配的档案", "wfr-muted wfr-empty"));
+        list.append(createElement("p", "没有匹配的档案。", "wfr-muted wfr-empty"));
       }
-      renderMore();
+      renderMore(initialLimit);
     }
 
     search.addEventListener("input", () => {
       view.query = String(search.value || "");
+      view.shown = FRIEND_NOTES_PAGE_SIZE;
+      view.scrollTop = 0;
       renderList();
     });
     tagSelect.addEventListener("change", () => {
       view.tag = tagSelect.value === "" ? null : String(tagSelect.value);
+      view.shown = FRIEND_NOTES_PAGE_SIZE;
+      view.scrollTop = 0;
       renderList();
     });
-    moreButton.addEventListener("click", renderMore);
-    renderList();
+    moreButton.addEventListener("click", () => renderMore());
+    renderList(view.shown);
+    if (view.scrollTop > 0) body.scrollTop = view.scrollTop;
   }
 
   function showFriendNoteDetail(ownerUid, subjectUid, viewState, onBack) {
@@ -1357,7 +1366,7 @@
       ).length;
       const timelineActions = createElement("div", null, "wfr-actions");
       const timelineButton = createFriendNoteButton(
-        `查看关系时间线（${eventCount} 条本地事件）`
+        `关系时间线（${eventCount} 条事件）`
       );
       timelineButton.addEventListener("click", () =>
         showTimeline(ownerUid, subject.friend.state, subjectUid, () =>
@@ -1401,6 +1410,7 @@
     cancelProfileFriendNotesDiscovery();
     removeProfileFriendNotesNode();
     profileFriendNotesContext = null;
+    syncBeforeUnloadGuard();
   }
 
   function scheduleProfileFriendNotesEnsure() {
@@ -1539,7 +1549,7 @@
           "wfr-actions wfr-compact-actions"
         );
         const timelineButton = createFriendNoteButton(
-          `关系时间线（${eventCount} 条本地事件）`
+          `关系时间线（${eventCount} 条事件）`
         );
         timelineButton.addEventListener("click", () =>
           showTimeline(
