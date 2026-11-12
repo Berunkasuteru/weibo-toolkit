@@ -14,9 +14,14 @@ const NAMES = [
   "serializeBackup",
   "validateBackupText",
   "restoreValidatedBackup",
+  "readV4RestorePreviewTokens",
   "loadState",
   "loadFollowerState",
   "loadFriendNotesState",
+  "loadFollowerRemovalLogForBackup",
+  "loadFollowerHygienePresetsForBackup",
+  "loadUsageStateForBackup",
+  "loadProfileVisitsForBackup",
   "BACKUP_VERSION",
   "SUPPORTED_BACKUP_VERSIONS",
 ];
@@ -26,6 +31,11 @@ const OTHER_OWNER = "2002";
 const NOTES_LOCK = `weibo-toolkit-friend-notes-state-${OWNER}`;
 const FOLLOWER_LOCK = `weibo-toolkit-follower-state-${OWNER}`;
 const RADAR_LOCK = `weibo-toolkit-friend-radar-state-${OWNER}`;
+const USAGE_LOCK = `weibo-toolkit-usage-state-${OWNER}`;
+const REMOVAL_LOG_KEY = `weiboToolkit.followerRemovalLog.v1.${OWNER}`;
+const PRESETS_KEY = `weiboToolkit.followerHygienePresets.v1.${OWNER}`;
+const USAGE_KEY = `weiboToolkit.usage.v1.${OWNER}`;
+const VISITS_KEY = `weiboToolkit.profileVisits.v1.${OWNER}`;
 const T = "2026-09-01T08:00:00.000Z";
 
 const radarState = (label) => ({
@@ -84,12 +94,61 @@ const N_BACKUP = JSON.stringify(
 );
 const N_CURRENT = JSON.stringify(notesState([["3003", "恢复前才写的备注"]]));
 const N_NEWER = JSON.stringify(notesState([["3004", "另一个标签页刚保存的备注"]]));
+const LOG_BACKUP = {
+  schemaVersion: 1,
+  ownerUid: OWNER,
+  entries: [{ uid: "9101", screenName: "被移粉丝", removedAt: T }],
+};
+const PRESETS_BACKUP = {
+  schemaVersion: 1,
+  presets: [{ name: "低互动", filters: { ownerNotFollowing: true } }],
+};
+const USAGE_BACKUP = {
+  version: 1,
+  currentDay: { date: "2026-09-01", activeSeconds: 125, uniquePostIds: ["AbCd12"] },
+  days: { "2026-08-31": { activeSeconds: 60, uniquePosts: 3 } },
+};
+const VISITS_BACKUP = {
+  "3001": { count: 9, lastVisitedAt: T },
+};
+const V4_EMPTY_DOMAINS = {
+  followerRemovalLog: null,
+  followerHygienePresets: null,
+  usageState: null,
+  profileVisits: null,
+};
+const V4_FULL_DOMAINS = {
+  followerRemovalLog: LOG_BACKUP,
+  followerHygienePresets: PRESETS_BACKUP,
+  usageState: USAGE_BACKUP,
+  profileVisits: VISITS_BACKUP,
+};
 
-function setCurrent(browser, radar = R_CURRENT, follower = F_CURRENT, notes = N_CURRENT) {
+function setCurrent(
+  browser,
+  radar = R_CURRENT,
+  follower = F_CURRENT,
+  notes = N_CURRENT,
+  v4Domains = null
+) {
   browser.storage.clear();
   browser.storage.set(radarKey(OWNER), radar);
   if (follower !== null) browser.storage.set(followerKey(OWNER), follower);
   if (notes !== null) browser.storage.set(notesKey(OWNER), notes);
+  if (v4Domains !== null) {
+    if (v4Domains.followerRemovalLog !== null) {
+      browser.storage.set(REMOVAL_LOG_KEY, JSON.stringify(v4Domains.followerRemovalLog));
+    }
+    if (v4Domains.followerHygienePresets !== null) {
+      browser.storage.set(PRESETS_KEY, JSON.stringify(v4Domains.followerHygienePresets));
+    }
+    if (v4Domains.usageState !== null) {
+      browser.storage.set(USAGE_KEY, JSON.stringify(v4Domains.usageState));
+    }
+    if (v4Domains.profileVisits !== null) {
+      browser.storage.set(VISITS_KEY, JSON.parse(JSON.stringify(v4Domains.profileVisits)));
+    }
+  }
   browser.writes.length = 0;
   browser.lockNames.length = 0;
   browser.beforeGrant = null;
@@ -121,6 +180,13 @@ const v3File = (overrides = {}) =>
     friendNotes: JSON.parse(N_BACKUP),
     ...overrides,
   });
+const v4File = (overrides = {}) =>
+  fileV(4, {
+    followerState: JSON.parse(F_BACKUP),
+    friendNotes: JSON.parse(N_BACKUP),
+    ...V4_FULL_DOMAINS,
+    ...overrides,
+  });
 
 // Runs after the n-th grant of one lock has been reached, i.e. "another tab
 // committed this just before our transaction ran".
@@ -141,20 +207,31 @@ function onGrant(browser, lockName, occurrence, action) {
   const { validateBackupText: validate, restoreValidatedBackup: restore } = tab.product;
 
   // ---- Format contract ----------------------------------------------------
-  assert(tab.product.BACKUP_VERSION === 3, "new backups are v3");
+  assert(tab.product.BACKUP_VERSION === 4, "new backups are v4");
   assert(
-    JSON.stringify(tab.product.SUPPORTED_BACKUP_VERSIONS) === "[1,2,3]",
-    "v1 and v2 must remain restorable"
+    JSON.stringify(tab.product.SUPPORTED_BACKUP_VERSIONS) === "[1,2,3,4]",
+    "v1, v2, and v3 must remain restorable"
   );
-  setCurrent(browser, R_BACKUP, F_BACKUP, N_BACKUP);
-  // Environment data that must never ride along in a backup.
-  browser.storage.set(`weiboToolkit.profileVisits.v1.${OWNER}`, { 3001: { count: 9, lastVisitedAt: T } });
-  browser.storage.set(`weiboToolkit.usage.v1.${OWNER}`, "usage-bytes");
+  setCurrent(browser, R_BACKUP, F_BACKUP, N_BACKUP, V4_FULL_DOMAINS);
+  // Environment/UI preferences & credentials must never ride along in a backup.
   browser.storage.set("weiboToolkit.page.showProfileFriendNotes.v1", true);
   const radarLoaded = tab.product.loadState(OWNER);
   const followerLoaded = tab.product.loadFollowerState(OWNER);
   const notesLoaded = tab.product.loadFriendNotesState(OWNER);
-  assert(radarLoaded.ok && followerLoaded.ok && notesLoaded.ok, "fixtures must be valid states");
+  const logLoaded = tab.product.loadFollowerRemovalLogForBackup(OWNER);
+  const presetsLoaded = tab.product.loadFollowerHygienePresetsForBackup(OWNER);
+  const usageLoaded = tab.product.loadUsageStateForBackup(OWNER);
+  const visitsLoaded = tab.product.loadProfileVisitsForBackup(OWNER);
+  assert(
+    radarLoaded.ok &&
+      followerLoaded.ok &&
+      notesLoaded.ok &&
+      logLoaded.ok &&
+      presetsLoaded.ok &&
+      usageLoaded.ok &&
+      visitsLoaded.ok,
+    "fixtures must be valid states"
+  );
   const exportedAt = new Date(T);
   let threw = false;
   try {
@@ -165,7 +242,27 @@ function onGrant(browser, lockName, occurrence, action) {
   assert(threw, "a backup that does not state its friend-notes coverage must be refused");
   threw = false;
   try {
-    tab.product.createBackup(OWNER, radarLoaded.state, followerLoaded.state, exportedAt, notesState([], OTHER_OWNER));
+    tab.product.createBackup(
+      OWNER,
+      radarLoaded.state,
+      followerLoaded.state,
+      exportedAt,
+      notesLoaded.state
+    );
+  } catch (_) {
+    threw = true;
+  }
+  assert(threw, "a backup that omits v4 extra domain coverage must be refused");
+  threw = false;
+  try {
+    tab.product.createBackup(
+      OWNER,
+      radarLoaded.state,
+      followerLoaded.state,
+      exportedAt,
+      notesState([], OTHER_OWNER),
+      V4_EMPTY_DOMAINS
+    );
   } catch (_) {
     threw = true;
   }
@@ -175,7 +272,13 @@ function onGrant(browser, lockName, occurrence, action) {
     radarLoaded.state,
     followerLoaded.state,
     exportedAt,
-    notesLoaded.state
+    notesLoaded.state,
+    {
+      followerRemovalLog: logLoaded.state,
+      followerHygienePresets: presetsLoaded.state,
+      usageState: usageLoaded.state,
+      profileVisits: visitsLoaded.visits,
+    }
   );
   assert(
     JSON.stringify(Object.keys(backup).sort()) ===
@@ -184,37 +287,75 @@ function onGrant(browser, lockName, occurrence, action) {
         "backupFormat",
         "backupVersion",
         "exportedAt",
+        "followerHygienePresets",
+        "followerRemovalLog",
         "followerState",
         "friendNotes",
         "ownerUid",
+        "profileVisits",
         "state",
+        "usageState",
       ]),
     `backup carries exactly its declared fields: ${Object.keys(backup).join(",")}`
   );
   const backupText = tab.product.serializeBackup(backup);
-  for (const leaked of ["profileVisits", "usage", "showProfileFriendNotes", "cookie", "XSRF", "token"]) {
+  for (const leaked of ["showProfileFriendNotes", "cookie", "XSRF", "token"]) {
     assert(!backupText.includes(leaked), `backup must not contain ${leaked}`);
   }
-  const emptyBackup = tab.product.createBackup(OWNER, radarLoaded.state, null, exportedAt, null);
+  const emptyBackup = tab.product.createBackup(
+    OWNER,
+    radarLoaded.state,
+    null,
+    exportedAt,
+    null,
+    V4_EMPTY_DOMAINS
+  );
   assert(
-    Object.prototype.hasOwnProperty.call(emptyBackup, "friendNotes") && emptyBackup.friendNotes === null,
-    "the absence of friend notes is recorded explicitly"
+    Object.prototype.hasOwnProperty.call(emptyBackup, "friendNotes") &&
+      emptyBackup.friendNotes === null &&
+      emptyBackup.followerRemovalLog === null &&
+      emptyBackup.followerHygienePresets === null &&
+      emptyBackup.usageState === null &&
+      emptyBackup.profileVisits === null,
+    "the absence of optional backup domains is recorded explicitly"
   );
   assert(browser.writes.length === 0, "creating a backup writes nothing");
 
-  // ---- v3 round trip ------------------------------------------------------
+  // ---- v4 round trip ------------------------------------------------------
   setCurrent(browser);
+  const v4TokensEmpty = tab.product.readV4RestorePreviewTokens(OWNER);
+  assert(v4TokensEmpty.ok, "preview tokens read cleanly");
   const validated = validate(backupText, OWNER);
   assert(
-    validated.ok && validated.backupVersion === 3 && validated.followerCovered && validated.friendNotesCovered,
-    "an exported v3 backup must validate with full coverage"
+    validated.ok &&
+      validated.backupVersion === 4 &&
+      validated.followerCovered &&
+      validated.friendNotesCovered &&
+      validated.v4DomainsCovered,
+    "an exported v4 backup must validate with full coverage"
   );
-  const restored = await restore(validated, R_CURRENT, F_CURRENT, N_CURRENT);
+  const restored = await restore(
+    validated,
+    R_CURRENT,
+    F_CURRENT,
+    N_CURRENT,
+    v4TokensEmpty.tokens
+  );
   assert(
-    restored.ok && restored.followerRestored && restored.friendNotesRestored,
-    `v3 restore must succeed: ${JSON.stringify(restored)}`
+    restored.ok &&
+      restored.followerRestored &&
+      restored.friendNotesRestored &&
+      restored.v4DomainsRestored,
+    `v4 restore must succeed: ${JSON.stringify(restored)}`
   );
-  assertStored(browser, R_BACKUP, F_BACKUP, N_BACKUP, "v3 round trip");
+  assertStored(browser, R_BACKUP, F_BACKUP, N_BACKUP, "v4 round trip");
+  assert(
+    tab.product.loadFollowerRemovalLogForBackup(OWNER).state.entries[0].uid === "9101" &&
+      tab.product.loadFollowerHygienePresetsForBackup(OWNER).state.presets[0].name === "低互动" &&
+      tab.product.loadUsageStateForBackup(OWNER).state.currentDay.activeSeconds === 125 &&
+      tab.product.loadProfileVisitsForBackup(OWNER).visits["3001"].count === 9,
+    "all four v4 domains round-trip identically"
+  );
   const reloaded = tab.product.loadFriendNotesState(OWNER);
   assert(
     reloaded.ok && JSON.stringify(reloaded.state) === N_BACKUP,
@@ -226,7 +367,41 @@ function onGrant(browser, lockName, occurrence, action) {
   );
   assert(browser.fetchCalls === 0, "restore never uses the network");
 
-  // An explicit "no friend notes" backup reproduces that condition.
+  // Explicit null v4 domains erase pre-existing local values on v4 restore.
+  setCurrent(browser, R_CURRENT, F_CURRENT, N_CURRENT, V4_FULL_DOMAINS);
+  const tokensBeforeNull = tab.product.readV4RestorePreviewTokens(OWNER);
+  const v4NullValidated = validate(
+    tab.product.serializeBackup(emptyBackup),
+    OWNER
+  );
+  assert(
+    (await restore(v4NullValidated, R_CURRENT, F_CURRENT, N_CURRENT, tokensBeforeNull.tokens)).ok &&
+      stored(browser, REMOVAL_LOG_KEY) === null &&
+      stored(browser, PRESETS_KEY) === null &&
+      stored(browser, USAGE_KEY) === null &&
+      stored(browser, VISITS_KEY) === null,
+    "v4 backup with explicit nulls must clear pre-existing v4 domains"
+  );
+
+  // ---- v3 round trip kept intact (leaves v4 domains untouched) ------------
+  setCurrent(browser, R_CURRENT, F_CURRENT, N_CURRENT, V4_FULL_DOMAINS);
+  const v3Validated = validate(v3File(), OWNER);
+  assert(
+    v3Validated.ok && !v3Validated.v4DomainsCovered,
+    "v3 backup validates without v4 coverage"
+  );
+  const v3Restored = await restore(v3Validated, R_CURRENT, F_CURRENT, N_CURRENT);
+  assert(
+    v3Restored.ok &&
+      v3Restored.followerRestored &&
+      v3Restored.friendNotesRestored &&
+      v3Restored.v4DomainsRestored === false &&
+      tab.product.loadProfileVisitsForBackup(OWNER).visits["3001"].count === 9 &&
+      stored(browser, USAGE_KEY) !== null,
+    "v3 restore must succeed and leave v4 domains untouched"
+  );
+
+  // An explicit "no friend notes" v3 backup reproduces that condition.
   setCurrent(browser);
   const none = validate(v3File({ friendNotes: null }), OWNER);
   assert(none.ok && none.friendNotesCovered && none.friendNotesState === null, "explicit null coverage");
@@ -277,7 +452,13 @@ function onGrant(browser, lockName, occurrence, action) {
     [JSON.stringify(withoutNotes), OWNER, "MISSING_FRIEND_NOTES"],
     [JSON.stringify(withoutFollower), OWNER, "MISSING_FOLLOWER_STATE"],
     [v3File(), OTHER_OWNER, "OWNER_UID_MISMATCH"],
-    [v3File({ backupVersion: 4 }), OWNER, "UNSUPPORTED_BACKUP_VERSION"],
+    [v3File({ backupVersion: 5 }), OWNER, "UNSUPPORTED_BACKUP_VERSION"],
+    [v4File({ backupVersion: 5 }), OWNER, "UNSUPPORTED_BACKUP_VERSION"],
+    [v4File({ followerRemovalLog: { schemaVersion: 2, ownerUid: OWNER, entries: [] } }), OWNER, "INVALID_FOLLOWER_REMOVAL_LOG"],
+    [v4File({ followerRemovalLog: { schemaVersion: 1, ownerUid: OTHER_OWNER, entries: [] } }), OWNER, "INVALID_FOLLOWER_REMOVAL_LOG"],
+    [v4File({ followerHygienePresets: { schemaVersion: 2, presets: [] } }), OWNER, "INVALID_FOLLOWER_HYGIENE_PRESETS"],
+    [v4File({ usageState: { version: 2 } }), OWNER, "INVALID_USAGE_STATE"],
+    [v4File({ profileVisits: { badUid: { count: 1, lastVisitedAt: T } } }), OWNER, "INVALID_PROFILE_VISITS"],
     [v3File({ friendNotes: notesState([["3001", "x"]], OTHER_OWNER) }), OWNER, "INVALID_FRIEND_NOTES"],
     [v3File({ friendNotes: { schemaVersion: 2, ownerUid: OWNER, notes: {} } }), OWNER, "INVALID_FRIEND_NOTES"],
     [v3File({ friendNotes: { schemaVersion: 1, ownerUid: OWNER } }), OWNER, "INVALID_FRIEND_NOTES"],
@@ -444,7 +625,70 @@ function onGrant(browser, lockName, occurrence, action) {
     `an unreadable value must stop the restore: ${JSON.stringify(unreadable)}`
   );
 
-  console.log("friend notes backup v3 invariants passed");
+  // ---- v4 rollback / partial / uncertain invariants -----------------------
+  // Clean failure on usageState must roll back removalLog, presets, notes, follower, and radar.
+  setCurrent(browser);
+  const tokensCleanFail = tab.product.readV4RestorePreviewTokens(OWNER).tokens;
+  browser.writeBehavior = (key) => (key === USAGE_KEY ? "throw" : undefined);
+  const v4RolledBack = await restore(
+    validate(v4File(), OWNER),
+    R_CURRENT,
+    F_CURRENT,
+    N_CURRENT,
+    tokensCleanFail
+  );
+  browser.writeBehavior = null;
+  assert(
+    !v4RolledBack.ok &&
+      v4RolledBack.reason === "V4_DOMAIN_RESTORE_FAILED_ROLLED_BACK" &&
+      v4RolledBack.rollbackSucceeded === true &&
+      stored(browser, REMOVAL_LOG_KEY) === null &&
+      stored(browser, PRESETS_KEY) === null,
+    `v4 clean domain failure must roll back all prior domains: ${JSON.stringify(v4RolledBack)}`
+  );
+  assertStored(browser, R_CURRENT, F_CURRENT, N_CURRENT, "v4 clean failure rollback");
+
+  // Unknown usageState mutation must NOT roll back prior domains.
+  setCurrent(browser);
+  const tokensUncertain = tab.product.readV4RestorePreviewTokens(OWNER).tokens;
+  browser.writeBehavior = (key) => (key === USAGE_KEY ? "land-then-throw" : undefined);
+  const v4Uncertain = await restore(
+    validate(v4File(), OWNER),
+    R_CURRENT,
+    F_CURRENT,
+    N_CURRENT,
+    tokensUncertain
+  );
+  browser.writeBehavior = null;
+  assert(
+    !v4Uncertain.ok &&
+      v4Uncertain.reason === "RESTORE_STATE_UNCERTAIN" &&
+      v4Uncertain.rollbackSucceeded === false &&
+      stored(browser, radarKey(OWNER)) === R_BACKUP,
+    `v4 unknown mutation outcome must report uncertain without rollback: ${JSON.stringify(v4Uncertain)}`
+  );
+
+  // Partial rollback when another tab modified Friend Notes before rollback locked it.
+  setCurrent(browser);
+  const tokensPartial = tab.product.readV4RestorePreviewTokens(OWNER).tokens;
+  onGrant(browser, USAGE_LOCK, 1, () => browser.storage.set(USAGE_KEY, JSON.stringify(USAGE_BACKUP)));
+  onGrant(browser, NOTES_LOCK, 3, () => browser.storage.set(notesKey(OWNER), N_NEWER));
+  const v4Partial = await restore(
+    validate(v4File(), OWNER),
+    R_CURRENT,
+    F_CURRENT,
+    N_CURRENT,
+    tokensPartial
+  );
+  assert(
+    !v4Partial.ok &&
+      v4Partial.reason === "V4_DOMAIN_RESTORE_FAILED_PARTIAL" &&
+      v4Partial.rollbackSucceeded === false &&
+      stored(browser, notesKey(OWNER)) === N_NEWER,
+    `v4 rollback encountering newer notes must report partial and keep newer notes: ${JSON.stringify(v4Partial)}`
+  );
+
+  console.log("friend notes backup v4 invariants passed");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

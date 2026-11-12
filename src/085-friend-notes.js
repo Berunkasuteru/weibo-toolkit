@@ -388,15 +388,28 @@
       );
   }
 
+  function friendNoteMatchesSearchText(noteRecord, normalizedNeedle) {
+    if (!noteRecord || normalizedNeedle === "") return false;
+    if (
+      typeof noteRecord.note === "string" &&
+      noteRecord.note.toLowerCase().includes(normalizedNeedle)
+    ) {
+      return true;
+    }
+    return (
+      Array.isArray(noteRecord.tags) &&
+      noteRecord.tags.some(
+        (tag) =>
+          typeof tag === "string" && tag.toLowerCase().includes(normalizedNeedle)
+      )
+    );
+  }
+
   function matchesFriendNoteQuery(entry, query) {
     const needle = String(query).trim().toLowerCase();
     if (needle === "") return true;
-    const haystacks = [
-      entry.uid,
-      entry.record.note,
-      ...entry.record.tags,
-      ...entry.facts.historicalNames,
-    ];
+    if (friendNoteMatchesSearchText(entry.record, needle)) return true;
+    const haystacks = [entry.uid, ...entry.facts.historicalNames];
     if (entry.facts.currentName !== null) haystacks.push(entry.facts.currentName);
     return haystacks.some((text) => text.toLowerCase().includes(needle));
   }
@@ -419,6 +432,88 @@
     return [...counts.entries()].sort(
       (left, right) => right[1] - left[1] || left[0].localeCompare(right[0])
     );
+  }
+
+  function listFriendNoteTagsSorted(notesByUid) {
+    if (!isPlainObject(notesByUid)) return [];
+    const counts = new Map();
+    for (const uid of Object.keys(notesByUid)) {
+      const record = notesByUid[uid];
+      if (!record || !Array.isArray(record.tags)) continue;
+      for (const tag of record.tags) {
+        counts.set(tag, (counts.get(tag) || 0) + 1);
+      }
+    }
+    return [...counts.entries()]
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+      .map(([tag]) => tag);
+  }
+
+  const FRIEND_NOTES_EXPORT_COLUMNS = Object.freeze([
+    "UID",
+    "当前记录昵称",
+    "历史昵称",
+    "标签",
+    "备注",
+    "最近关系记录",
+    "更新时间",
+  ]);
+
+  function buildFriendNotesExportRows(entries) {
+    return entries.map((entry) => [
+      entry.uid,
+      entry.facts && entry.facts.currentName !== null
+        ? entry.facts.currentName
+        : "",
+      entry.facts && Array.isArray(entry.facts.historicalNames)
+        ? entry.facts.historicalNames.join("、")
+        : "",
+      entry.record && Array.isArray(entry.record.tags)
+        ? entry.record.tags.join("、")
+        : "",
+      entry.record && typeof entry.record.note === "string"
+        ? entry.record.note
+        : "",
+      entry.facts && entry.facts.recentRelationshipEvent
+        ? entry.facts.recentRelationshipEvent.label
+        : "",
+      entry.record && typeof entry.record.updatedAt === "string"
+        ? entry.record.updatedAt
+        : "",
+    ]);
+  }
+
+  function buildFriendNotesCsv(entries) {
+    return buildExportCsv(
+      FRIEND_NOTES_EXPORT_COLUMNS,
+      buildFriendNotesExportRows(entries)
+    );
+  }
+
+  function buildFriendNotesMarkdown(ownerUid, entries, exportedAt) {
+    const lines = [
+      "# Weibo Toolkit 友人档案导出",
+      "",
+      `- 账号 UID：${ownerUid}`,
+      `- 导出时间：${exportedAt.toISOString()}`,
+      `- 导出档案数：${entries.length}`,
+      `- Weibo Toolkit 版本：${APP_VERSION}`,
+      "",
+      "> 本文件仅包含你手写的友人档案备注与标签，以及当前浏览器中已有记录的昵称上下文；需要完整恢复请使用 JSON 备份。",
+      "",
+    ];
+    if (entries.length === 0) {
+      lines.push("暂无匹配的友人档案。", "");
+      return lines.join("\n");
+    }
+    lines.push(
+      ...buildExportMarkdownTable(
+        FRIEND_NOTES_EXPORT_COLUMNS,
+        buildFriendNotesExportRows(entries)
+      ),
+      ""
+    );
+    return lines.join("\n");
   }
 
   // Observed facts are worded as records with their own dates: a nickname seen
@@ -495,6 +590,26 @@
     list.setAttribute("aria-label", "标签");
     for (const tag of tags) list.append(createElement("li", tag, "wfr-note-tag"));
     return list;
+  }
+
+  function appendFriendNoteInlineSummary(container, noteRecord) {
+    if (!noteRecord) return;
+    const hasNoteText =
+      typeof noteRecord.note === "string" && noteRecord.note.trim() !== "";
+    const hasTags = Array.isArray(noteRecord.tags) && noteRecord.tags.length > 0;
+    if (!hasNoteText && !hasTags) return;
+    const box = createElement("div", null, "wfr-card-note-summary");
+    if (hasTags) box.append(buildFriendNoteTagList(noteRecord.tags));
+    if (hasNoteText) {
+      box.append(
+        createElement(
+          "p",
+          noteRecord.note,
+          "wfr-note-preview wfr-muted wfr-card-note-text"
+        )
+      );
+    }
+    container.append(box);
   }
 
   function appendFriendNoteRecord(container, record) {
@@ -1142,6 +1257,55 @@
       showFriendNoteDetail(ownerUid, subjectUid, view);
     };
 
+    const mountUidLookupControl = (triggerActions) => {
+      const triggerButton = createFriendNoteButton("按 UID 新建/查看档案");
+      triggerActions.append(triggerButton);
+      const box = createElement("div");
+      box.hidden = true;
+      let input = null;
+      let errorNode = null;
+      const closeBox = () => {
+        clearFriendNoteNode(box);
+        box.hidden = true;
+        triggerButton.hidden = false;
+        input = null;
+        errorNode = null;
+      };
+      const submit = () => {
+        if (!input) return;
+        const uid = normalizeStableUid(input.value);
+        if (uid === null) {
+          errorNode.textContent = "请输入有效的纯数字 UID（不能以 0 开头）。";
+          return;
+        }
+        openSubjectFromManager(uid);
+      };
+      triggerButton.addEventListener("click", () => {
+        if (!box.hidden) return;
+        triggerButton.hidden = true;
+        box.hidden = false;
+        input = createElement("input", null, "wfr-hygiene-input");
+        input.type = "text";
+        input.placeholder = "输入纯数字 UID，例如 123456789";
+        input.setAttribute("aria-label", "按 UID 打开友人档案");
+        input.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            submit();
+          }
+        });
+        errorNode = createElement("p", "", "wfr-error");
+        const actions = createElement("div", null, "wfr-actions");
+        const openButton = createFriendNoteButton("打开档案", "wfr-button wfr-primary");
+        const cancelButton = createFriendNoteButton("取消");
+        openButton.addEventListener("click", submit);
+        cancelButton.addEventListener("click", closeBox);
+        actions.append(openButton, cancelButton);
+        box.append(input, errorNode, actions);
+      });
+      return box;
+    };
+
     const routeSubject = friendNoteRouteSubject(ownerUid);
     if (routeSubject !== null) {
       const routeActions = createElement("div", null, "wfr-actions");
@@ -1163,7 +1327,7 @@
         createElement("h3", "还没有友人档案"),
         createElement(
           "p",
-          "打开某个人的微博主页（地址形如 weibo.com/u/数字 UID），再回到这里点“为当前主页写档案”，就可以写下备注并添加标签。不需要先更新关系雷达或粉丝快照。"
+          "打开某个人的微博主页（支持 weibo.com/u/数字 UID 及其常见标签页，以及已加载资料区的自定义域名主页），再回到这里点“为当前主页写档案”，或直接点击下方“按 UID 新建/查看档案”写下备注和标签。不需要先更新关系雷达或粉丝快照。"
         ),
         createElement(
           "p",
@@ -1172,10 +1336,11 @@
         )
       );
       const emptyActions = createElement("div", null, "wfr-actions");
+      const uidLookupBox = mountUidLookupControl(emptyActions);
       const settingsButton = createFriendNoteButton("打开浏览体验设置");
       settingsButton.addEventListener("click", showPageSettings);
       emptyActions.append(settingsButton);
-      body.append(emptyActions);
+      body.append(emptyActions, uidLookupBox);
       return;
     }
 
@@ -1206,6 +1371,13 @@
     tagSelect.value = view.tag === null ? "" : view.tag;
     filterRow.append(tagSelect);
     body.append(filterRow);
+
+    const managerActions = createElement("div", null, "wfr-actions");
+    const uidLookupBox = mountUidLookupControl(managerActions);
+    const exportCsvButton = createFriendNoteButton("导出当前档案 CSV");
+    const exportMdButton = createFriendNoteButton("导出当前档案 Markdown");
+    managerActions.append(exportCsvButton, exportMdButton);
+    body.append(managerActions, uidLookupBox);
 
     const summary = createElement("p", "", "wfr-muted");
     summary.setAttribute("role", "status");
@@ -1278,6 +1450,8 @@
       clearFriendNoteNode(list);
       matching = filterFriendNoteEntries(entries, view.query, view.tag);
       shown = 0;
+      exportCsvButton.disabled = matching.length === 0;
+      exportMdButton.disabled = matching.length === 0;
       summary.textContent =
         matching.length === entries.length
           ? `共 ${entries.length} 条档案`
@@ -1287,6 +1461,48 @@
       }
       renderMore(initialLimit);
     }
+
+    function exportFilteredNotes(format) {
+      const exportedAt = new Date();
+      const isCsv = format === "csv";
+      const extension = isCsv ? "csv" : "md";
+      const filename = namedExportFilename(
+        "weibo-toolkit-friend-notes",
+        ownerUid,
+        exportedAt,
+        extension
+      );
+      const savedView = {
+        query: String(search.value || ""),
+        tag: tagSelect.value === "" ? null : String(tagSelect.value),
+        shown: Math.max(FRIEND_NOTES_PAGE_SIZE, shown),
+        scrollTop: Number(body.scrollTop) || 0,
+      };
+      deliverTableExport({
+        panelTitle: "已请求浏览器下载友人档案",
+        failureTitle: "导出友人档案",
+        successText:
+          "友人档案文件已交给浏览器下载，保存位置及最终文件名由浏览器下载设置决定。",
+        formatLabel: isCsv ? "CSV" : "Markdown",
+        filename,
+        mimeType: isCsv
+          ? "text/csv;charset=utf-8"
+          : "text/markdown;charset=utf-8",
+        content: isCsv
+          ? buildFriendNotesCsv(matching)
+          : buildFriendNotesMarkdown(ownerUid, matching, exportedAt),
+        countLabel: "已导出档案数",
+        count: matching.length,
+        onBack: () => showFriendNotesManager(savedView),
+      });
+    }
+
+    exportCsvButton.addEventListener("click", () =>
+      exportFilteredNotes("csv")
+    );
+    exportMdButton.addEventListener("click", () =>
+      exportFilteredNotes("markdown")
+    );
 
     search.addEventListener("input", () => {
       view.query = String(search.value || "");
@@ -1578,6 +1794,17 @@
     const targetUid = resolveProfileRouteTargetUid();
     const owner = determineCurrentUid();
     if (targetUid === null || (owner.ok && owner.uid === targetUid)) {
+      if (
+        targetUid === null &&
+        typeof location !== "undefined" &&
+        location.origin === WEIBO_MAIN_ORIGIN &&
+        couldBeCustomProfilePathname(location.pathname) &&
+        !findProfileExtrasInsertionPoint()
+      ) {
+        disconnectProfileFriendNotesObserver();
+        scheduleProfileFriendNotesDiscovery();
+        return false;
+      }
       teardownProfileFriendNotes();
       return false;
     }

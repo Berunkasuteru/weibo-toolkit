@@ -2,8 +2,8 @@
   const ENDPOINT = "/ajax/friendships/friends";
   const REQUEST_DELAY_MS = 750;
   const OBJECT_URL_REVOKE_DELAY_MS = 1000;
-  const MAX_REQUESTS = 100;
-  const APP_VERSION = "0.12.1";
+  const MAX_REQUESTS = 500;
+  const APP_VERSION = "0.13.0";
   const SCHEMA_VERSION = 1;
   const STORAGE_PREFIX = "weiboToolkit.friendRadar.v1.";
   const FOLLOWER_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -11,7 +11,7 @@
     "weiboToolkit.followerSnapshot.v1.";
   const FOLLOWER_PAGE_SIZE = 20;
   const FOLLOWER_REQUEST_DELAY_MS = 500;
-  const FOLLOWER_MAX_DATA_PAGES = 100;
+  const FOLLOWER_MAX_DATA_PAGES = 500;
   const FOLLOWER_MAX_TERMINAL_VERIFICATION_REQUESTS = 1;
   const FOLLOWER_COMPLETION = "COMPLETE_API_VISIBLE";
   const FOLLOWER_REMOVE_ENDPOINT = "/ajax/profile/destroyFollowers";
@@ -42,8 +42,8 @@
   // durable state as a sibling field; v3 adds the user's hand-written Friend
   // Notes the same way. Each version covers exactly the modules it names, so v1
   // and v2 files stay restorable forever and never touch what they predate.
-  const BACKUP_VERSION = 3;
-  const SUPPORTED_BACKUP_VERSIONS = Object.freeze([1, 2, 3]);
+  const BACKUP_VERSION = 4;
+  const SUPPORTED_BACKUP_VERSIONS = Object.freeze([1, 2, 3, 4]);
   const BACKUP_MIME = "application/json;charset=utf-8";
   const AUTO_INTERVAL_PREFIX = "weiboToolkit.friendRadar.autoInterval.v1.";
   const AUTO_ATTEMPT_PREFIX = "weiboToolkit.friendRadar.autoAttempt.v1.";
@@ -118,6 +118,20 @@
     "相册",
   ]);
   const CHANGELOG_BY_VERSION = Object.freeze({
+    "0.13.0": Object.freeze({
+      added: Object.freeze([
+        "首页新增“一键全部更新”，按顺序执行关系雷达与粉丝快照更新，支持两步进度、分步取消与合并结果页",
+        "备份升级为 Backup v4，扩展覆盖移除记录、体检预设、使用统计与主页访问记录，兼容旧版 v1–v3 备份",
+        "友人档案支持按 UID 直接新建或查看，并支持按当前筛选导出友人档案、关系概览及粉丝变化的 CSV / Markdown",
+        "粉丝体检新增友人档案与标签筛选、粉丝数与微博数下限、注册时间截止及按粉丝数/微博数降序排序",
+        "关系事件新增事件类型与仅看未读筛选，支持在事件卡片和详情页直接标为已读",
+      ]),
+      improved: Object.freeze([
+        "关系事件、粉丝变化、关系概览及粉丝体检支持按友人档案内容与标签搜索，并在列表中展示档案摘要",
+        "私信导出文件名自动附带已清洗的聊天对象昵称或 UID",
+        "信息流友人档案入口固定为轻量图标按钮，消除行内重排抖动，同时保留已备注与历史昵称提示",
+      ]),
+    }),
     "0.12.1": Object.freeze({
       added: Object.freeze([
         "关系雷达手动更新支持中途取消，关系事件支持搜索改名事件的旧昵称",
@@ -416,6 +430,7 @@
   let radarCancelRequested = false;
   let followerUpdateRunning = false;
   let followerCancelRequested = false;
+  let allCancelRequested = false;
   let privateMessageExportInFlight = false;
   let beforeUnloadGuardInstalled = false;
   // A manual scan in this tab, so its progress panel can be reopened after it
@@ -424,9 +439,20 @@
   // this visit, not a record.
   let manualRadarRun = null;
   let manualFollowerRun = null;
+  let manualAllRun = null;
   let unseenManualRadarResult = null;
   let unseenManualFollowerResult = null;
+  let unseenManualAllResult = null;
   let followerRemovalInFlight = false;
+
+  function anyRelationshipTaskBusy() {
+    return (
+      updateRunning ||
+      followerUpdateRunning ||
+      followerRemovalInFlight ||
+      manualAllRun !== null
+    );
+  }
   let panelRoot = null;
   let panelSizeFixed = false;
   let panelReturnFocus = null;
@@ -787,7 +813,10 @@
     const recordsByUid = new Map();
     const seenNextCursors = new Set();
     const seenPaginationStates = new Set();
+    let initialReportedTotal = null;
     let reportedTotal = null;
+    let maxReportedTotal = 0;
+    let reportedTotalChanged = false;
     let previousPageNextCursor = null;
     let requestsMade = 0;
 
@@ -864,16 +893,10 @@
           failedPage: page,
         };
       }
-      if (reportedTotal === null) reportedTotal = pageTotal;
-      if (reportedTotal !== pageTotal) {
-        return {
-          ok: false,
-          failureKind: "PAGINATION_FAILURE",
-          reason: "TOTAL_NUMBER_CHANGED",
-          requestsMade,
-          failedPage: page,
-        };
-      }
+      if (initialReportedTotal === null) initialReportedTotal = pageTotal;
+      else if (pageTotal !== reportedTotal) reportedTotalChanged = true;
+      reportedTotal = pageTotal;
+      if (pageTotal > maxReportedTotal) maxReportedTotal = pageTotal;
       if (
         (page === 1 && previousCursor !== 0) ||
         (page > 1 && previousCursor !== previousPageNextCursor)
@@ -932,13 +955,17 @@
 
       if (nextCursor === 0) {
         if (recordsByUid.size > reportedTotal) {
-          return {
-            ok: false,
-            failureKind: "PAGINATION_FAILURE",
-            reason: "VISIBLE_COUNT_EXCEEDS_REPORTED_TOTAL",
-            requestsMade,
-            failedPage: page,
-          };
+          if (reportedTotalChanged && recordsByUid.size <= maxReportedTotal) {
+            reportedTotal = recordsByUid.size;
+          } else {
+            return {
+              ok: false,
+              failureKind: "PAGINATION_FAILURE",
+              reason: "VISIBLE_COUNT_EXCEEDS_REPORTED_TOTAL",
+              requestsMade,
+              failedPage: page,
+            };
+          }
         }
         const records = [...recordsByUid.values()].sort((a, b) =>
           a.uid.localeCompare(b.uid)
@@ -946,6 +973,7 @@
         return {
           ok: true,
           requestsMade,
+          reportedTotalChanged,
           snapshot: {
             capturedAt: new Date().toISOString(),
             reportedTotal,
@@ -1328,6 +1356,16 @@
     };
   }
 
+  function markEventsReadByIds(state, eventIds) {
+    if (!(eventIds instanceof Set) || eventIds.size === 0) return state;
+    return {
+      ...state,
+      events: state.events.map((event) =>
+        eventIds.has(event.id) && !event.read ? { ...event, read: true } : event
+      ),
+    };
+  }
+
   // Unread is derived from events[].read on demand. No unread counter is persisted,
   // and nothing here may change read state.
   function countUnreadEvents(events) {
@@ -1472,6 +1510,7 @@
       ownerUid: uidResult.uid,
       snapshot: scan.snapshot,
       requestsMade: scan.requestsMade,
+      reportedTotalChanged: scan.reportedTotalChanged === true,
       baselineCreated: prepared.baselineCreated,
       newEvents: prepared.newEvents,
       totalStoredEvents: prepared.state.events.length,

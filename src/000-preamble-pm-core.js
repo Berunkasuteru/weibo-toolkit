@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weibo Toolkit - Friend Radar
 // @namespace    local.weibo-toolkit
-// @version      0.12.1
+// @version      0.13.0
 // @description  Local-first Weibo toolkit with private friend notes, relationship tracking, follower tools, PM export, and optional page enhancements.
 // @match        https://weibo.com/*
 // @match        https://api.weibo.com/chat*
@@ -219,13 +219,34 @@
     };
   }
 
-  function privateMessageFilename(exportedAt) {
+  function sanitizeFilenameSegment(value, maxLength = 40) {
+    if (typeof value !== "string") return "";
+    const cleaned = value
+      .replace(/[\u0000-\u001f\u007f\\/:*?"<>|]+/g, "_")
+      .replace(/\s+/g, " ")
+      .replace(/_+/g, "_")
+      .replace(/^[\s._]+|[\s._]+$/g, "");
+    if (!cleaned) return "";
+    return Array.from(cleaned)
+      .slice(0, maxLength)
+      .join("")
+      .replace(/^[\s._]+|[\s._]+$/g, "");
+  }
+
+  function privateMessageFilename(
+    exportedAt,
+    participantName = "",
+    participantUid = ""
+  ) {
     const timestamp = exportedAt
       .toISOString()
       .replace(/[-:]/g, "")
       .replace("T", "-")
       .replace(/\.\d{3}Z$/, "");
-    return `微博私信_${timestamp}.md`;
+    const label =
+      sanitizeFilenameSegment(participantName) ||
+      sanitizeFilenameSegment(participantUid);
+    return label ? `微博私信_${label}_${timestamp}.md` : `微博私信_${timestamp}.md`;
   }
 
   function validatePrivateMessagePage(data, expectedCursor, seenIds) {

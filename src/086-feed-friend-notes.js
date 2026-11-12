@@ -68,9 +68,9 @@
     for (const link of header.querySelectorAll("a")) {
       const path = feedLinkPath(link);
       if (path === null) continue;
-      const profile = /^\/u\/([1-9]\d*)\/?$/.exec(path);
-      if (profile) {
-        profileLinks.push({ uid: profile[1], link });
+      const profileUid = parseProfileUidFromPath(path);
+      if (profileUid !== null) {
+        profileLinks.push({ uid: profileUid, link });
         continue;
       }
       const post = /^\/([1-9]\d*)\/[A-Za-z0-9]+\/?$/.exec(path);
@@ -182,7 +182,6 @@
     for (const entry of runtime.entries.values()) {
       renderFeedFriendNoteEntry(entry, entry.pageName);
     }
-    flushFeedFriendNoteFits();
   }
 
   // Relationship data can change while the Toolkit panel is open or when an
@@ -214,15 +213,8 @@
         ownerUid: owner.uid,
         data: loadFeedFriendNotesData(owner.uid),
         entries: new Map(),
-        pendingFit: new Set(),
         stale: false,
       };
-      if (
-        typeof window !== "undefined" &&
-        typeof window.addEventListener === "function"
-      ) {
-        window.addEventListener("resize", refitFeedFriendNoteEntries);
-      }
     } else if (feedFriendNotes.stale && panelRoot === null) {
       reloadFeedFriendNotesData();
     }
@@ -241,7 +233,6 @@
     entry.signature = signature;
     const who = pageName === null ? "这位作者" : pageName;
     entry.hasNote = hasNote;
-    entry.button.textContent = feedFriendNoteEntryText(entry);
     setToolkitClass(entry.button, FEED_FRIEND_NOTE_HAS_CLASS, hasNote);
     entry.button.setAttribute(
       "aria-label",
@@ -256,91 +247,8 @@
     );
     setToolkitClass(entry.button, "wfr-feed-note-has-hint", hint !== "");
     entry.hintText = hint;
-    entry.hint.textContent = hint;
-    entry.hint.hidden = hint === "";
-    feedFriendNotes.pendingFit.add(entry);
   }
 
-  // How much of the entry fits. room is the width left in the post header
-  // after everything before the entry and after Weibo's own content that
-  // follows it in the same row, so Toolkit's addition neither runs past the
-  // header nor pushes native text out. The hint gives way first; if even the
-  // button does not fit, it shrinks to a single character. Whatever is not
-  // shown inline stays in the entry's spoken label and in the card.
-  function feedEntryLayout(room, buttonWidth, hasHint) {
-    const compact = room < buttonWidth;
-    const hintRoom = Math.floor(room - buttonWidth - 6);
-    return {
-      compact,
-      hintWidth:
-        !hasHint || compact || hintRoom < 48 ? 0 : Math.min(hintRoom, 216),
-    };
-  }
-
-  function feedFriendNoteEntryText(entry) {
-    if (entry.compact) return entry.hasNote ? "备" : "写";
-    return entry.hasNote ? "有备注" : "写备注";
-  }
-
-  // Entries are measured only after their content changed or the window was
-  // resized, never on an unchanged pass, and all pending measurements are read
-  // before any of them is applied.
-  function flushFeedFriendNoteFits() {
-    const runtime = feedFriendNotes;
-    if (runtime === null || runtime.pendingFit.size === 0) return;
-    const pending = [...runtime.pendingFit].filter((entry) => entry.active);
-    runtime.pendingFit.clear();
-    const layouts = pending.map((entry) => {
-      const header = entry.header;
-      const parent = entry.wrapper.parentNode;
-      if (
-        !header ||
-        !parent ||
-        typeof header.getBoundingClientRect !== "function" ||
-        typeof entry.wrapper.getBoundingClientRect !== "function"
-      ) {
-        return null;
-      }
-      const bounds = header.getBoundingClientRect();
-      if (!(bounds.width > 0)) return null;
-      const own = entry.wrapper.getBoundingClientRect();
-      const siblings = elementChildren(parent);
-      const last = siblings[siblings.length - 1];
-      const trailing =
-        last && last !== entry.wrapper
-          ? Math.max(0, last.getBoundingClientRect().right - own.right)
-          : 0;
-      if (!entry.compact) {
-        entry.fullButtonWidth = entry.button.getBoundingClientRect().width;
-      }
-      return feedEntryLayout(
-        bounds.right - own.left - trailing,
-        entry.fullButtonWidth,
-        entry.hintText !== ""
-      );
-    });
-    pending.forEach((entry, index) => {
-      const layout = layouts[index];
-      if (layout === null) return;
-      if (entry.compact !== layout.compact) {
-        entry.compact = layout.compact;
-        entry.button.textContent = feedFriendNoteEntryText(entry);
-      }
-      const hidden = layout.hintWidth === 0;
-      const maxWidth = hidden ? "" : `${layout.hintWidth}px`;
-      if (entry.hint.hidden !== hidden) entry.hint.hidden = hidden;
-      if (entry.hint.style.maxWidth !== maxWidth) {
-        entry.hint.style.maxWidth = maxWidth;
-      }
-    });
-  }
-
-  function refitFeedFriendNoteEntries() {
-    const runtime = feedFriendNotes;
-    if (runtime === null) return;
-    for (const entry of runtime.entries.values()) runtime.pendingFit.add(entry);
-    flushFeedFriendNoteFits();
-  }
   // An entry belongs to one owner and one author for its whole life. When a
   // recycled node starts showing another author, the old entry is removed and
   // marked inactive, and a new one is created; nothing is ever re-pointed.
@@ -350,9 +258,7 @@
     const button = createFriendNoteButton("", "wfr-feed-note-entry");
     button.setAttribute("aria-haspopup", "dialog");
     button.setAttribute("aria-expanded", "false");
-    const hint = createElement("span", "", "wfr-feed-note-hint");
-    hint.hidden = true;
-    wrapper.append(button, hint);
+    wrapper.append(button);
     const entry = {
       ownerUid,
       uid,
@@ -360,12 +266,8 @@
       header: null,
       wrapper,
       button,
-      hint,
       hintText: "",
-      rowText: null,
       hasNote: false,
-      compact: false,
-      fullButtonWidth: 0,
       pageName: null,
       signature: null,
       active: true,
@@ -455,7 +357,6 @@
     // Both are insertion points only; the permalink still proves the UID.
     const anchor = identity.entryAnchor;
     const parent = anchor.parentNode;
-    let remeasure = false;
     if (
       entry.wrapper.parentNode !== parent ||
       anchor.nextSibling !== entry.wrapper
@@ -463,36 +364,14 @@
       const next = anchor.nextSibling;
       if (next) parent.insertBefore(entry.wrapper, next);
       else parent.append(entry.wrapper);
-      remeasure = true;
     }
-    // The room left for the entry depends on Weibo's own content in the same
-    // row (time, source). When that text changes, or the entry was mounted
-    // somewhere else, the entry is queued for one new measurement. Toolkit's
-    // own node is left out of the comparison, so its text and style changes
-    // can never queue it again.
-    const rowText = feedFriendNoteRowText(parent, entry.wrapper);
-    if (entry.rowText !== rowText) {
-      entry.rowText = rowText;
-      remeasure = true;
-    }
-    if (remeasure) runtime.pendingFit.add(entry);
     renderFeedFriendNoteEntry(entry, identity.pageName);
-  }
-
-  // Reads text only; no layout is measured here.
-  function feedFriendNoteRowText(row, wrapper) {
-    let text = "";
-    for (const node of Array.from(row.childNodes)) {
-      if (node !== wrapper) text += `${node.textContent}\u0000`;
-    }
-    return text;
   }
 
   function pruneFeedFriendNoteEntries(root) {
     for (const [card, entry] of [...feedFriendNotes.entries]) {
       if (!root.contains(card)) removeFeedFriendNoteEntry(card, entry);
     }
-    flushFeedFriendNoteFits();
   }
 
   function clearFeedFriendNoteEntries() {
@@ -507,13 +386,6 @@
   function teardownFeedFriendNotes() {
     clearFeedFriendNoteEntries();
     closeFeedFriendNoteCard(false);
-    if (
-      feedFriendNotes !== null &&
-      typeof window !== "undefined" &&
-      typeof window.removeEventListener === "function"
-    ) {
-      window.removeEventListener("resize", refitFeedFriendNoteEntries);
-    }
     feedFriendNotes = null;
   }
 
@@ -546,7 +418,6 @@
         renderFeedFriendNoteEntry(entry, entry.pageName);
       }
     }
-    flushFeedFriendNoteFits();
   }
 
   function setFeedFriendNoteCardNotice(card, text) {

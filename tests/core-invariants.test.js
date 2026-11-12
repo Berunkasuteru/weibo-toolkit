@@ -18,10 +18,14 @@ const product = loadProductFunctions(
     "diffSnapshots",
     "diffFollowerSnapshots",
     "filterFollowerSnapshot",
+    "normalizeHygieneFilters",
+    "sortHygieneMatches",
     "deriveUsageHistorySummary",
     "filterOverviewFollowingRecords",
     "matchesFollowerEventQuery",
     "matchesEventQuery",
+    "filterEvents",
+    "markEventsReadByIds",
     "deriveProfileLocalFacts",
     "buildProfileLocalFactsIndex",
     "profileVisitStorageKey",
@@ -246,6 +250,137 @@ assert(
       String(10000 + product.MAX_PROFILE_VISIT_ENTRIES + 5)
     ),
   "recordProfileVisit must cap stored profile visit entries by evicting oldest visits"
+);
+
+// Batch C: Friend Notes search, event type/unread filters, markEventsReadByIds,
+// and expanded follower hygiene filter/sort invariants.
+const sampleNotesByUid = {
+  "100": { note: "合作摄影师", tags: ["熟人", "商业"], createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
+  "300": { note: "老同学", tags: ["高校"], createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
+};
+const radarEvent100 = radarTypes.get("FOLLOW_ME_GAINED:100");
+assert(
+  product.matchesEventQuery(radarEvent100, "摄影", sampleNotesByUid) &&
+    product.matchesEventQuery(radarEvent100, "商业", sampleNotesByUid) &&
+    !product.matchesEventQuery(radarEvent100, "高校", sampleNotesByUid),
+  "matchesEventQuery must match saved Friend Notes text and tags"
+);
+const filteredRadar = product.filterEvents(
+  radarEvents.map((ev) => ({ ...ev, read: ev.id === radarEvent100.id ? false : true })),
+  "商业",
+  sampleNotesByUid,
+  "FOLLOW_ME_GAINED",
+  true
+);
+assert(
+  filteredRadar.length === 1 && filteredRadar[0].type === "FOLLOW_ME_GAINED" && filteredRadar[0].subjectUid === "100",
+  "filterEvents must combine query, typeFilter, unreadOnly, and notesByUid"
+);
+const markedState = product.markEventsReadByIds(
+  {
+    ownerUid: "1",
+    events: [
+      { id: "a", read: false },
+      { id: "b", read: false },
+    ],
+  },
+  new Set(["a"])
+);
+assert(
+  markedState.events[0].read === true && markedState.events[1].read === false,
+  "markEventsReadByIds must mark only the targeted event IDs as read"
+);
+const overviewMatches = product.filterOverviewFollowingRecords(
+  current.records,
+  "ALL",
+  "摄影",
+  sampleNotesByUid
+);
+assert(
+  overviewMatches.length === 1 && overviewMatches[0].uid === "100",
+  "filterOverviewFollowingRecords must match saved Friend Notes"
+);
+assert(
+  product.matchesFollowerEventQuery(
+    { type: "VISIBLE_FOLLOWER_ADDED", uid: "100", screenName: "路人" },
+    "熟人",
+    sampleNotesByUid
+  ),
+  "matchesFollowerEventQuery must match saved Friend Notes"
+);
+
+const compatPreset = product.normalizeHygieneFilters({ ownerNotFollowing: true });
+assert(
+  compatPreset.activeCount === 1 &&
+    compatPreset.query === "" &&
+    compatPreset.noteMode === "ALL" &&
+    compatPreset.noteTag === "" &&
+    compatPreset.followersMin === null &&
+    compatPreset.statusesMin === null &&
+    compatPreset.createdBefore === null,
+  "normalizeHygieneFilters must preserve backward compatibility with old presets"
+);
+const extendedHygieneSnapshot = {
+  records: [
+    {
+      uid: "100",
+      screenName: "甲",
+      ownerFollowing: false,
+      followersCount: 1200,
+      friendsCount: 20,
+      statusesCount: 80,
+      createdAt: "2018-05-01T00:00:00.000Z",
+      verified: false,
+      sourceText: "搜索",
+    },
+    {
+      uid: "200",
+      screenName: "乙",
+      ownerFollowing: false,
+      followersCount: 10,
+      friendsCount: 5,
+      statusesCount: 2,
+      createdAt: "2024-05-01T00:00:00.000Z",
+      verified: false,
+      sourceText: "微博推荐",
+    },
+    {
+      uid: "300",
+      screenName: "丙",
+      ownerFollowing: false,
+      followersCount: null,
+      friendsCount: 1,
+      statusesCount: null,
+      createdAt: "2020-01-01T00:00:00.000Z",
+      verified: true,
+      sourceText: null,
+    },
+  ],
+};
+assert(
+  product.filterFollowerSnapshot(
+    extendedHygieneSnapshot,
+    { followersMin: 500, statusesMin: 50, createdBefore: "2020-01-01" },
+    sampleNotesByUid
+  ).matches.map((entry) => entry.record.uid).join(",") === "100",
+  "hygiene filters must apply followersMin, statusesMin, and createdBefore accurately"
+);
+assert(
+  product.filterFollowerSnapshot(extendedHygieneSnapshot, { noteMode: "WITHOUT_NOTE" }, null).matches.length === 0 &&
+    product.filterFollowerSnapshot(extendedHygieneSnapshot, { noteMode: "WITH_NOTE" }, null).matches.length === 0 &&
+    product.filterFollowerSnapshot(extendedHygieneSnapshot, { noteTag: "商业" }, null).matches.length === 0,
+  "hygiene note filters must fail closed when Friend Notes are unreadable (null)"
+);
+assert(
+  product.filterFollowerSnapshot(extendedHygieneSnapshot, { noteMode: "WITHOUT_NOTE" }, sampleNotesByUid).matches.map((entry) => entry.record.uid).join(",") === "200" &&
+    product.filterFollowerSnapshot(extendedHygieneSnapshot, { noteTag: "商业" }, sampleNotesByUid).matches.map((entry) => entry.record.uid).join(",") === "100" &&
+    product.filterFollowerSnapshot(extendedHygieneSnapshot, { query: "商业" }, sampleNotesByUid).matches.map((entry) => entry.record.uid).join(",") === "100",
+  "hygiene filters must support noteMode, noteTag, and keyword query over Friend Notes"
+);
+assert(
+  product.sortHygieneMatches(extendedHygieneSnapshot.records.map((r) => ({ record: r, reasons: [] })), "FOLLOWERS_DESC").map((m) => m.record.uid).join(",") === "100,200,300" &&
+    product.sortHygieneMatches(extendedHygieneSnapshot.records.map((r) => ({ record: r, reasons: [] })), "STATUSES_DESC").map((m) => m.record.uid).join(",") === "100,200,300",
+  "FOLLOWERS_DESC and STATUSES_DESC must sort descending and keep null values last"
 );
 
 console.log("core product invariants passed");

@@ -55,4 +55,48 @@ assert(
   "backup owner mismatch must reject"
 );
 
+const missingFriendNotes = validateBackupText(
+  JSON.stringify(backup(3, { followerState: null })),
+  ownerUid
+);
+assert(
+  !missingFriendNotes.ok && missingFriendNotes.reason === "MISSING_FRIEND_NOTES",
+  "v3 missing friendNotes coverage must reject the whole file"
+);
+
+const v4Base = {
+  followerState: null,
+  friendNotes: null,
+  followerRemovalLog: null,
+  followerHygienePresets: null,
+  usageState: null,
+  profileVisits: null,
+};
+const v4Null = validateBackupText(JSON.stringify(backup(4, v4Base)), ownerUid);
+assert(
+  v4Null.ok && v4Null.v4DomainsCovered === true,
+  "v4 with explicit null coverage across all domains must validate"
+);
+
+for (const [field, expectedReason] of [
+  ["followerRemovalLog", "MISSING_FOLLOWER_REMOVAL_LOG"],
+  ["followerHygienePresets", "MISSING_FOLLOWER_HYGIENE_PRESETS"],
+  ["usageState", "MISSING_USAGE_STATE"],
+  ["profileVisits", "MISSING_PROFILE_VISITS"],
+]) {
+  const incomplete = { ...v4Base };
+  delete incomplete[field];
+  const rejected = validateBackupText(JSON.stringify(backup(4, incomplete)), ownerUid);
+  assert(
+    !rejected.ok && rejected.reason === expectedReason,
+    `v4 missing ${field} must return ${expectedReason}, got ${JSON.stringify(rejected)}`
+  );
+}
+
+const unsupportedV5 = validateBackupText(JSON.stringify(backup(5, v4Base)), ownerUid);
+assert(
+  !unsupportedV5.ok && unsupportedV5.reason === "UNSUPPORTED_BACKUP_VERSION",
+  "unsupported v5 backup must be rejected"
+);
+
 console.log("backup compatibility invariants passed");

@@ -418,9 +418,65 @@ function sortPutsUnknownValuesLast() {
   const matches = [match("a", 5, "2020-01-01T00:00:00.000Z"), match("b", null, null), match("c", 0, "2024-01-01T00:00:00.000Z"), match("d", 5, "2022-01-01T00:00:00.000Z")];
   const order = (sort) => sortHygieneMatches(matches, sort).map((entry) => entry.record.uid).join("");
   assert(order("FOLLOWERS_ASC") === "cadb", `fewest followers first, ties in snapshot order, unknown last: ${order("FOLLOWERS_ASC")}`);
+  assert(order("FOLLOWERS_DESC") === "adcb", `most followers first, ties in snapshot order, unknown last: ${order("FOLLOWERS_DESC")}`);
   assert(order("CREATED_DESC") === "cdab", `newest registration first, unknown last: ${order("CREATED_DESC")}`);
   assert(order("CREATED_ASC") === "adcb", `oldest registration first, unknown last: ${order("CREATED_ASC")}`);
   assert(order("SNAPSHOT") === "abcd" && order("nonsense") === "abcd", "the default keeps the snapshot order");
+}
+
+async function newHygieneFiltersNotePreviewAndPresetCompat() {
+  const view = openHygiene();
+  const T = "2026-10-06T00:00:00.000Z";
+  view.browser.storage.set(notesKey(OWNER), JSON.stringify({
+    schemaVersion: 1,
+    ownerUid: OWNER,
+    notes: {
+      "2001": { note: "摄影同好", tags: ["熟人"], createdAt: T, updatedAt: T },
+    },
+  }));
+  // Pre-seed a legacy preset lacking the new Batch C fields, reopen hygiene, and apply it.
+  const presetKey = "weiboToolkit.followerHygienePresets.v1." + OWNER;
+  view.browser.storage.set(presetKey, JSON.stringify({
+    schemaVersion: 1,
+    presets: [{ name: "老方案", filters: { ownerNotFollowing: true } }],
+  }));
+  view.tab.product.showFollowerHygiene();
+
+  const noteSummaryCards = findAll(view.document.body, (node) => node.classList.contains("wfr-card-note-summary"));
+  assert(noteSummaryCards.length === 0, "no cards until a filter is active");
+
+  const presetSelect = findAll(view.document.body, (node) => node.tagName === "SELECT" && node.getAttribute("aria-label") === "已保存的筛选方案")[0];
+  presetSelect.value = "老方案";
+  presetSelect.dispatch("change");
+  assert(
+    view.cards().length === 50 &&
+      findAll(view.document.body, (node) => node.classList.contains("wfr-card-note-summary")).length === 1,
+    "legacy preset works cleanly and cards show inline Friend Note summary"
+  );
+
+  // Filter by Friend Note tag "#熟人".
+  await findButton(view.document.body, "重置筛选").click();
+  const noteTagSelect = findAll(view.document.body, (node) => node.tagName === "SELECT")
+    .find((node) => Array.from(node.childNodes).some((opt) => opt.value === "熟人"));
+  assert(noteTagSelect, "noteTag select must populate saved Friend Note tags");
+  noteTagSelect.value = "熟人";
+  noteTagSelect.dispatch("change");
+  assert(
+    view.cards().length === 1 && view.cards()[0].textContent.includes("粉丝2001") && view.cards()[0].textContent.includes("摄影同好"),
+    "noteTag filter narrows to matching Follower with Friend Note summary"
+  );
+
+  // Corrupt Friend Notes while noteMode WITHOUT_NOTE is selected -> must fail closed!
+  await findButton(view.document.body, "重置筛选").click();
+  view.browser.storage.set(notesKey(OWNER), "{broken");
+  const noteModeSelect = findAll(view.document.body, (node) => node.tagName === "SELECT")
+    .find((node) => Array.from(node.childNodes).some((opt) => opt.value === "WITHOUT_NOTE"));
+  noteModeSelect.value = "WITHOUT_NOTE";
+  noteModeSelect.dispatch("change");
+  assert(
+    view.cards().length === 0 && view.document.body.textContent.includes("友人档案现在无法读取"),
+    "WITHOUT_NOTE must fail closed when Friend Notes storage is unreadable"
+  );
 }
 
 (async () => {
@@ -433,6 +489,7 @@ function sortPutsUnknownValuesLast() {
   await uncertainSingleInvalidatesBatch();
   await uncertainRemovalSurvivesChildViews();
   await finalConfirmationRechecksState();
+  await newHygieneFiltersNotePreviewAndPresetCompat();
   console.log("follower removal UI safety invariants passed");
 })().catch((error) => {
   console.error(error);

@@ -118,6 +118,90 @@
       friendNotesState = backup.friendNotes;
     }
 
+    let v4DomainsCovered = false;
+    let followerRemovalLog = null;
+    let followerHygienePresets = null;
+    let usageState = null;
+    let profileVisits = null;
+    if (backup.backupVersion >= 4) {
+      if (!hasOwn(backup, "followerRemovalLog")) {
+        return {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "MISSING_FOLLOWER_REMOVAL_LOG",
+        };
+      }
+      if (
+        backup.followerRemovalLog !== null &&
+        !isValidFollowerRemovalLogState(
+          backup.followerRemovalLog,
+          backup.ownerUid
+        )
+      ) {
+        return {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "INVALID_FOLLOWER_REMOVAL_LOG",
+        };
+      }
+      if (!hasOwn(backup, "followerHygienePresets")) {
+        return {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "MISSING_FOLLOWER_HYGIENE_PRESETS",
+        };
+      }
+      if (
+        backup.followerHygienePresets !== null &&
+        !isValidFollowerHygienePresetsState(backup.followerHygienePresets)
+      ) {
+        return {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "INVALID_FOLLOWER_HYGIENE_PRESETS",
+        };
+      }
+      if (!hasOwn(backup, "usageState")) {
+        return {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "MISSING_USAGE_STATE",
+        };
+      }
+      if (backup.usageState !== null && !isValidUsageState(backup.usageState)) {
+        return {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "INVALID_USAGE_STATE",
+        };
+      }
+      if (!hasOwn(backup, "profileVisits")) {
+        return {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "MISSING_PROFILE_VISITS",
+        };
+      }
+      if (
+        backup.profileVisits !== null &&
+        !isValidProfileVisitBackupState(backup.profileVisits)
+      ) {
+        return {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "INVALID_PROFILE_VISITS",
+        };
+      }
+      v4DomainsCovered = true;
+      followerRemovalLog = backup.followerRemovalLog;
+      followerHygienePresets =
+        backup.followerHygienePresets === null
+          ? null
+          : normalizeFollowerHygienePresetsState(backup.followerHygienePresets);
+      usageState = backup.usageState;
+      profileVisits = backup.profileVisits;
+    }
+
     return {
       ok: true,
       backupVersion: backup.backupVersion,
@@ -133,6 +217,11 @@
       friendNotesState,
       friendNotesSerialized:
         friendNotesState === null ? null : JSON.stringify(friendNotesState),
+      v4DomainsCovered,
+      followerRemovalLog,
+      followerHygienePresets,
+      usageState,
+      profileVisits,
     };
   }
 
@@ -389,6 +478,330 @@
     return outcome;
   }
 
+  const V4_RESTORE_DOMAIN_SPECS = Object.freeze([
+    Object.freeze({
+      key: "followerRemovalLog",
+      label: "粉丝移除记录",
+      storageKey: followerRemovalLogStorageKey,
+      withLock: withFollowerRemovalLogLock,
+      isRawObject: false,
+      unreadableReason: "FOLLOWER_REMOVAL_LOG_UNREADABLE",
+    }),
+    Object.freeze({
+      key: "followerHygienePresets",
+      label: "粉丝筛选方案",
+      storageKey: followerHygienePresetsStorageKey,
+      withLock: (ownerUid, transaction) =>
+        withExclusiveStateLock(
+          "weibo-toolkit-follower-hygiene-presets-" + ownerUid,
+          transaction
+        ),
+      isRawObject: false,
+      unreadableReason: "FOLLOWER_HYGIENE_PRESETS_UNREADABLE",
+    }),
+    Object.freeze({
+      key: "usageState",
+      label: "微博使用统计",
+      storageKey: usageStorageKey,
+      withLock: withUsageStateLock,
+      isRawObject: false,
+      unreadableReason: "USAGE_STATE_UNREADABLE",
+    }),
+    Object.freeze({
+      key: "profileVisits",
+      label: "主页访问记录",
+      storageKey: profileVisitStorageKey,
+      withLock: withProfileVisitsLock,
+      isRawObject: true,
+      unreadableReason: "PROFILE_VISITS_UNREADABLE",
+    }),
+  ]);
+
+  function v4TokenFromRawValue(spec, rawValue) {
+    if (rawValue === null || typeof rawValue === "undefined") {
+      return null;
+    }
+    if (spec.isRawObject) {
+      return typeof rawValue === "string"
+        ? "raw:" + rawValue
+        : "json:" + JSON.stringify(rawValue);
+    }
+    return typeof rawValue === "string"
+      ? "str:" + rawValue
+      : "bad:" + typeof rawValue + ":" + JSON.stringify(rawValue);
+  }
+
+  function encodeV4BackupTarget(spec, backupValue) {
+    if (backupValue === null) {
+      return { isDelete: true, storedValue: null, token: null };
+    }
+    if (spec.isRawObject) {
+      const cloned = JSON.parse(JSON.stringify(backupValue));
+      return {
+        isDelete: false,
+        storedValue: cloned,
+        token: "json:" + JSON.stringify(cloned),
+      };
+    }
+    const serialized = JSON.stringify(backupValue);
+    return {
+      isDelete: false,
+      storedValue: serialized,
+      token: "str:" + serialized,
+    };
+  }
+
+  function readV4DomainToken(spec, ownerUid) {
+    try {
+      const rawValue = GM_getValue(spec.storageKey(ownerUid), null);
+      return {
+        ok: true,
+        rawValue:
+          rawValue === null || typeof rawValue === "undefined" ? null : rawValue,
+        token: v4TokenFromRawValue(spec, rawValue),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: spec.unreadableReason,
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function readV4RestorePreviewTokens(ownerUid) {
+    const tokens = {};
+    for (const spec of V4_RESTORE_DOMAIN_SPECS) {
+      const read = readV4DomainToken(spec, ownerUid);
+      if (!read.ok) return read;
+      tokens[spec.key] = read.token;
+    }
+    return { ok: true, tokens };
+  }
+
+  function classifyAttemptedV4Mutation(spec, ownerUid, expectedToken, failure) {
+    const observed = readV4DomainToken(spec, ownerUid);
+    if (!observed.ok) {
+      return {
+        ...failure,
+        ok: false,
+        mutationAttempted: true,
+        outcomeUnknown: true,
+      };
+    }
+    if (observed.token === expectedToken) {
+      return {
+        ...failure,
+        ok: false,
+        mutationAttempted: true,
+        outcomeUnknown: false,
+      };
+    }
+    return {
+      ...failure,
+      ok: false,
+      mutationAttempted: true,
+      outcomeUnknown: true,
+    };
+  }
+
+  async function restoreSingleV4Domain(
+    ownerUid,
+    spec,
+    backupValue,
+    expectedToken
+  ) {
+    const target = encodeV4BackupTarget(spec, backupValue);
+    const result = await spec.withLock(ownerUid, async () => {
+      const current = readV4DomainToken(spec, ownerUid);
+      if (!current.ok) {
+        return { ...current, mutationAttempted: false, outcomeUnknown: false };
+      }
+      if (current.token !== expectedToken) {
+        return {
+          ok: false,
+          mutationAttempted: false,
+          outcomeUnknown: false,
+          failureKind: "CONCURRENT_MODIFICATION",
+        };
+      }
+      const key = spec.storageKey(ownerUid);
+      try {
+        if (target.isDelete) GM_deleteValue(key);
+        else GM_setValue(key, target.storedValue);
+        const after = readV4DomainToken(spec, ownerUid);
+        if (!after.ok || after.token !== target.token) {
+          return classifyAttemptedV4Mutation(spec, ownerUid, expectedToken, {
+            failureKind: after.ok ? "CONCURRENT_MODIFICATION" : after.failureKind,
+          });
+        }
+        return {
+          ok: true,
+          preRawValue: current.rawValue,
+          preToken: current.token,
+          restoredToken: target.token,
+        };
+      } catch (error) {
+        return classifyAttemptedV4Mutation(spec, ownerUid, expectedToken, {
+          failureKind: "PERSISTENCE_ERROR",
+          errorName: error && error.name ? String(error.name) : "Error",
+        });
+      }
+    });
+    return result;
+  }
+
+  async function rollbackSingleV4Domain(ownerUid, committed) {
+    const { spec, preRawValue, preToken, restoredToken } = committed;
+    const outcome = await spec.withLock(ownerUid, async () => {
+      const key = spec.storageKey(ownerUid);
+      const current = readV4DomainToken(spec, ownerUid);
+      if (!current.ok) return { reason: "RESTORE_STATE_UNCERTAIN" };
+      if (current.token !== restoredToken) {
+        return { reason: "RESTORE_CONCURRENT_STATE_CHANGED" };
+      }
+      try {
+        if (preRawValue === null) GM_deleteValue(key);
+        else GM_setValue(key, preRawValue);
+        const after = readV4DomainToken(spec, ownerUid);
+        return after.ok && after.token === preToken
+          ? { reason: "ROLLED_BACK" }
+          : { reason: "RESTORE_STATE_UNCERTAIN" };
+      } catch (_) {
+        return { reason: "RESTORE_STATE_UNCERTAIN" };
+      }
+    });
+    if (outcome && outcome.failureKind === "STATE_LOCK_UNAVAILABLE") {
+      return { reason: "RESTORE_STATE_UNCERTAIN" };
+    }
+    return outcome;
+  }
+
+  async function rollbackFriendNotesRestore(
+    ownerUid,
+    restoredRaw,
+    preRestoreRaw
+  ) {
+    const outcome = await withFriendNotesLock(ownerUid, async () => {
+      const token = currentFriendNotesRestoreToken(ownerUid);
+      if (!token.ok) return { reason: "RESTORE_STATE_UNCERTAIN" };
+      if (token.raw !== restoredRaw) {
+        return { reason: "RESTORE_CONCURRENT_STATE_CHANGED" };
+      }
+      const written = writeFriendNotesRaw(ownerUid, preRestoreRaw, restoredRaw);
+      return written.ok
+        ? { reason: "ROLLED_BACK" }
+        : { reason: "RESTORE_STATE_UNCERTAIN" };
+    });
+    if (outcome && outcome.failureKind === "STATE_LOCK_UNAVAILABLE") {
+      return { reason: "RESTORE_STATE_UNCERTAIN" };
+    }
+    return outcome;
+  }
+
+  async function finishV4DomainsRestore(
+    validated,
+    initial,
+    expectedFollowerRaw,
+    expectedFriendNotesRaw,
+    expectedV4Tokens
+  ) {
+    const committedV4 = [];
+    let failedSpec = null;
+    let domainFailure = null;
+    for (const spec of V4_RESTORE_DOMAIN_SPECS) {
+      const expectedToken = hasOwn(expectedV4Tokens, spec.key)
+        ? expectedV4Tokens[spec.key]
+        : undefined;
+      if (expectedToken === undefined) {
+        failedSpec = spec;
+        domainFailure = {
+          ok: false,
+          failureKind: "BACKUP_RESTORE_ERROR",
+          reason: "V4_PREVIEW_TOKENS_MISSING",
+          outcomeUnknown: false,
+        };
+        break;
+      }
+      const write = await restoreSingleV4Domain(
+        validated.ownerUid,
+        spec,
+        validated[spec.key],
+        expectedToken
+      );
+      if (!write.ok) {
+        failedSpec = spec;
+        domainFailure = write;
+        break;
+      }
+      committedV4.push({ spec, ...write });
+    }
+    if (domainFailure === null) {
+      reloadUsageStateAfterRestore(validated.ownerUid);
+      return {
+        ok: true,
+        state: initial.state,
+        followerRestored: true,
+        friendNotesRestored: true,
+        v4DomainsRestored: true,
+      };
+    }
+    const v4FailureKind =
+      domainFailure.failureKind || domainFailure.reason || "UNKNOWN_FAILURE";
+    if (domainFailure.outcomeUnknown === true) {
+      return {
+        ...restoreStateUncertain(null),
+        v4Domain: failedSpec ? failedSpec.key : null,
+        v4FailureKind,
+      };
+    }
+
+    const rollbackResults = [];
+    for (let index = committedV4.length - 1; index >= 0; index -= 1) {
+      rollbackResults.push(
+        await rollbackSingleV4Domain(validated.ownerUid, committedV4[index])
+      );
+    }
+    rollbackResults.push(
+      await rollbackFriendNotesRestore(
+        validated.ownerUid,
+        validated.friendNotesSerialized,
+        expectedFriendNotesRaw
+      )
+    );
+    rollbackResults.push(
+      await rollbackFollowerRestore(
+        validated.ownerUid,
+        validated.followerStateSerialized,
+        expectedFollowerRaw
+      )
+    );
+    const radarRollback = await rollbackFriendRadarRestore(
+      validated.ownerUid,
+      initial.restoredRaw,
+      initial.preRestoreRaw
+    );
+    const allRolledBack =
+      rollbackResults.every((entry) => entry.reason === "ROLLED_BACK") &&
+      radarRollback.reason === "FOLLOWER_RESTORE_FAILED_ROLLED_BACK";
+    const anyUncertain =
+      rollbackResults.some(
+        (entry) => entry.reason === "RESTORE_STATE_UNCERTAIN"
+      ) || radarRollback.reason === "RESTORE_STATE_UNCERTAIN";
+    let reason = "V4_DOMAIN_RESTORE_FAILED_PARTIAL";
+    if (allRolledBack) reason = "V4_DOMAIN_RESTORE_FAILED_ROLLED_BACK";
+    else if (anyUncertain) reason = "RESTORE_STATE_UNCERTAIN";
+    return {
+      ok: false,
+      failureKind: "BACKUP_RESTORE_ERROR",
+      reason,
+      rollbackSucceeded: allRolledBack,
+      v4Domain: failedSpec ? failedSpec.key : null,
+      v4FailureKind,
+    };
+  }
+
   // The last third of a v3 restore. By now Friend Radar and the follower state
   // hold the backup's values. If the notes cannot be written and are known to
   // be untouched, both earlier writes are undone, each only while its bytes are
@@ -398,7 +811,8 @@
     validated,
     initial,
     expectedFollowerRaw,
-    expectedFriendNotesRaw
+    expectedFriendNotesRaw,
+    expectedV4Tokens
   ) {
     const notesWrite = await restoreFriendNotesFromBackup(
       validated.ownerUid,
@@ -406,12 +820,22 @@
       expectedFriendNotesRaw
     );
     if (notesWrite.ok) {
-      return {
-        ok: true,
-        state: initial.state,
-        followerRestored: true,
-        friendNotesRestored: true,
-      };
+      if (!validated.v4DomainsCovered) {
+        return {
+          ok: true,
+          state: initial.state,
+          followerRestored: true,
+          friendNotesRestored: true,
+          v4DomainsRestored: false,
+        };
+      }
+      return await finishV4DomainsRestore(
+        validated,
+        initial,
+        expectedFollowerRaw,
+        expectedFriendNotesRaw,
+        expectedV4Tokens
+      );
     }
     const friendNotesFailureKind = notesWrite.failureKind || "UNKNOWN_FAILURE";
     if (notesWrite.outcomeUnknown === true) {
@@ -453,7 +877,8 @@
     validated,
     expectedCurrentRaw,
     expectedFollowerRaw,
-    expectedFriendNotesRaw
+    expectedFriendNotesRaw,
+    expectedV4Tokens = null
   ) {
     const currentUid = determineCurrentUid();
     if (!currentUid.ok || currentUid.uid !== validated.ownerUid) {
@@ -461,6 +886,14 @@
         ok: false,
         failureKind: "BACKUP_RESTORE_ERROR",
         reason: "OWNER_UID_MISMATCH",
+      };
+    }
+
+    if (validated.v4DomainsCovered && !isPlainObject(expectedV4Tokens)) {
+      return {
+        ok: false,
+        failureKind: "BACKUP_RESTORE_ERROR",
+        reason: "V4_PREVIEW_TOKENS_MISSING",
       };
     }
 
@@ -522,6 +955,7 @@
         state: initial.state,
         followerRestored: false,
         friendNotesRestored: false,
+        v4DomainsRestored: false,
       };
     }
 
@@ -541,6 +975,7 @@
           state: initial.state,
           followerRestored: true,
           friendNotesRestored: false,
+          v4DomainsRestored: false,
         };
       }
       // The follower lock is released before the notes lock is taken: no two
@@ -549,7 +984,8 @@
         validated,
         initial,
         expectedFollowerRaw,
-        expectedFriendNotesRaw
+        expectedFriendNotesRaw,
+        expectedV4Tokens
       );
     }
 
@@ -622,9 +1058,7 @@
   // flight. Restore writes both module states, so it must obey the same gate at
   // entry and again at the confirmation click, after the user wait.
   function restoreBlockedByRunningOperation() {
-    return Boolean(
-      updateRunning || followerUpdateRunning || followerRemovalInFlight
-    );
+    return anyRelationshipTaskBusy();
   }
 
   function friendNoteCount(state) {
@@ -638,15 +1072,18 @@
     validated,
     currentLoaded,
     expectedFollowerRaw,
-    friendNotesPreview
+    friendNotesPreview,
+    expectedV4Tokens = null
   ) {
     const body = showPanel("恢复备份", true);
     body.append(
       createElement(
         "p",
-        validated.followerCovered
-          ? "恢复后，当前账号的关系雷达数据、粉丝快照和粉丝变化记录将被此备份完整替换。"
-          : "恢复后，当前账号的关系雷达数据将被此备份完整替换；此备份不包含粉丝快照和粉丝变化记录，它们将保持不变。",
+        validated.v4DomainsCovered
+          ? "恢复后，当前账号的关系雷达数据、粉丝快照、粉丝变化记录、友人档案及移除记录/筛选方案/使用统计/主页访问记录将被此备份完整替换。"
+          : validated.followerCovered
+            ? "恢复后，当前账号的关系雷达数据、粉丝快照和粉丝变化记录将被此备份完整替换。"
+            : "恢复后，当前账号的关系雷达数据将被此备份完整替换；此备份不包含粉丝快照和粉丝变化记录，它们将保持不变。",
         "wfr-error"
       )
     );
@@ -742,6 +1179,44 @@
         );
       }
     }
+    if (validated.v4DomainsCovered) {
+      addLine(
+        body,
+        "备份粉丝移除记录数",
+        validated.followerRemovalLog === null
+          ? "无移除记录"
+          : validated.followerRemovalLog.entries.length
+      );
+      addLine(
+        body,
+        "备份粉丝筛选方案数",
+        validated.followerHygienePresets === null
+          ? "无筛选方案"
+          : validated.followerHygienePresets.presets.length
+      );
+      addLine(
+        body,
+        "备份使用统计",
+        validated.usageState === null
+          ? "无使用统计"
+          : `已包含（最近日期 ${validated.usageState.currentDay.date}）`
+      );
+      addLine(
+        body,
+        "备份主页访问记录数",
+        validated.profileVisits === null
+          ? "无主页访问记录"
+          : Object.keys(validated.profileVisits).length
+      );
+    } else {
+      body.append(
+        createElement(
+          "p",
+          "此备份不包含粉丝移除记录、筛选方案、使用统计和主页访问记录，这些本地数据将保持不变。",
+          "wfr-muted"
+        )
+      );
+    }
 
     const actions = createElement("div", null, "wfr-actions");
     const exportButton = createElement("button", "先备份当前数据", "wfr-button");
@@ -773,7 +1248,8 @@
           validated,
           currentLoaded.raw,
           expectedFollowerRaw,
-          friendNotesPreview.expectedRaw
+          friendNotesPreview.expectedRaw,
+          expectedV4Tokens
         );
       } catch (error) {
         restored = {
@@ -807,6 +1283,11 @@
         restored.friendNotesRestored
           ? `已一并恢复（${friendNoteCount(validated.friendNotesState)} 条）`
           : "未包含在此备份中，保持不变"
+      );
+      addLine(
+        success,
+        "移除记录、筛选方案、使用统计与主页访问记录",
+        restored.v4DomainsRestored ? "已一并恢复" : "未包含在此备份中，保持不变"
       );
     });
     actions.append(exportButton, confirmButton);
@@ -890,12 +1371,27 @@
       showFailure("恢复备份", friendNotesToken);
       return;
     }
-    showRestorePreview(validated, currentLoaded, expectedFollowerRaw, {
-      expectedRaw: friendNotesToken.ok ? friendNotesToken.raw : null,
-      current: friendNotesToken.ok
-        ? friendNotesStateFromRaw(friendNotesToken.raw, uidResult.uid)
-        : friendNotesToken,
-    });
+    let expectedV4Tokens = null;
+    if (validated.v4DomainsCovered) {
+      const v4Preview = readV4RestorePreviewTokens(uidResult.uid);
+      if (!v4Preview.ok) {
+        showFailure("恢复备份", v4Preview);
+        return;
+      }
+      expectedV4Tokens = v4Preview.tokens;
+    }
+    showRestorePreview(
+      validated,
+      currentLoaded,
+      expectedFollowerRaw,
+      {
+        expectedRaw: friendNotesToken.ok ? friendNotesToken.raw : null,
+        current: friendNotesToken.ok
+          ? friendNotesStateFromRaw(friendNotesToken.raw, uidResult.uid)
+          : friendNotesToken,
+      },
+      expectedV4Tokens
+    );
   }
 
   function backupExportError(backupStage, error) {
@@ -1047,6 +1543,32 @@
     }
     const friendNotesForBackup =
       friendNotesLoaded.raw === null ? null : friendNotesLoaded.state;
+    const removalLogLoaded = loadFollowerRemovalLogForBackup(uidResult.uid);
+    if (!removalLogLoaded.ok) {
+      showFailure("导出备份", removalLogLoaded);
+      return;
+    }
+    const presetsLoaded = loadFollowerHygienePresetsForBackup(uidResult.uid);
+    if (!presetsLoaded.ok) {
+      showFailure("导出备份", presetsLoaded);
+      return;
+    }
+    const usageLoaded = loadUsageStateForBackup(uidResult.uid);
+    if (!usageLoaded.ok) {
+      showFailure("导出备份", usageLoaded);
+      return;
+    }
+    const profileVisitsLoaded = loadProfileVisitsForBackup(uidResult.uid);
+    if (!profileVisitsLoaded.ok) {
+      showFailure("导出备份", profileVisitsLoaded);
+      return;
+    }
+    const v4DomainsForBackup = {
+      followerRemovalLog: removalLogLoaded.state,
+      followerHygienePresets: presetsLoaded.state,
+      usageState: usageLoaded.state,
+      profileVisits: profileVisitsLoaded.visits,
+    };
 
     const exportedAt = new Date();
     const filename = backupFilename(uidResult.uid, exportedAt);
@@ -1057,7 +1579,8 @@
         loaded.state,
         followerStateForBackup,
         exportedAt,
-        friendNotesForBackup
+        friendNotesForBackup,
+        v4DomainsForBackup
       );
       const json = serializeBackup(backup);
       saveResult = await saveBackup(json, filename);
@@ -1110,7 +1633,71 @@
         ? "无友人档案"
         : friendNoteCount(friendNotesForBackup)
     );
+    addLine(
+      body,
+      "粉丝移除记录数",
+      v4DomainsForBackup.followerRemovalLog === null
+        ? "无移除记录"
+        : v4DomainsForBackup.followerRemovalLog.entries.length
+    );
+    addLine(
+      body,
+      "粉丝筛选方案数",
+      v4DomainsForBackup.followerHygienePresets === null
+        ? "无筛选方案"
+        : v4DomainsForBackup.followerHygienePresets.presets.length
+    );
+    addLine(
+      body,
+      "使用统计",
+      v4DomainsForBackup.usageState === null
+        ? "无使用统计"
+        : `已包含（最近日期 ${v4DomainsForBackup.usageState.currentDay.date}）`
+    );
+    addLine(
+      body,
+      "主页访问记录数",
+      v4DomainsForBackup.profileVisits === null
+        ? "无主页访问记录"
+        : Object.keys(v4DomainsForBackup.profileVisits).length
+    );
     addLine(body, nativeSave ? "文件名" : "建议文件名", saveResult.filename);
+  }
+
+  function deliverTableExport({
+    panelTitle = "已请求浏览器下载导出文件",
+    failureTitle,
+    successText,
+    formatLabel,
+    filename,
+    mimeType,
+    content,
+    countLabel,
+    count,
+    onBack,
+  }) {
+    try {
+      downloadFile(content, filename, mimeType);
+    } catch (error) {
+      showFailure(
+        failureTitle || panelTitle,
+        {
+          failureKind: "EVENT_EXPORT_ERROR",
+          exportStage:
+            error && error.backupStage ? String(error.backupStage) : "PREPARE_EXPORT",
+          errorName: error && error.name ? String(error.name) : "Error",
+        },
+        onBack
+      );
+      return false;
+    }
+
+    const body = showPanel(panelTitle, onBack);
+    body.append(createElement("p", successText, "wfr-success"));
+    addLine(body, "格式", formatLabel);
+    addLine(body, "建议文件名", filename);
+    addLine(body, countLabel, count);
+    return true;
   }
 
   // Read-only: builds a document from the already loaded state and hands it to the
@@ -1120,34 +1707,17 @@
     const exportedAt = new Date();
     const filename = eventExportFilename(ownerUid, exportedAt, spec.extension);
     const backToEvents = () => renderEvents(ownerUid, state, null);
-    try {
-      downloadFile(
-        spec.build(ownerUid, state.events, exportedAt),
-        filename,
-        spec.mimeType
-      );
-    } catch (error) {
-      showFailure(
-        "导出事件",
-        {
-          failureKind: "EVENT_EXPORT_ERROR",
-          exportStage: error && error.backupStage ? String(error.backupStage) : "PREPARE_EXPORT",
-          errorName: error && error.name ? String(error.name) : "Error",
-        },
-        backToEvents
-      );
-      return;
-    }
-
-    const body = showPanel("已请求浏览器下载事件", backToEvents);
-    body.append(
-      createElement(
-        "p",
+    deliverTableExport({
+      panelTitle: "已请求浏览器下载事件",
+      failureTitle: "导出事件",
+      successText:
         "事件文件已交给浏览器下载，保存位置及最终文件名由浏览器下载设置决定。",
-        "wfr-success"
-      )
-    );
-    addLine(body, "格式", spec.label);
-    addLine(body, "建议文件名", filename);
-    addLine(body, "已导出事件数", state.events.length);
+      formatLabel: spec.label,
+      filename,
+      mimeType: spec.mimeType,
+      content: spec.build(ownerUid, state.events, exportedAt),
+      countLabel: "已导出事件数",
+      count: state.events.length,
+      onBack: backToEvents,
+    });
   }

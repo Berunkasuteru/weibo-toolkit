@@ -210,6 +210,48 @@
     return await withExclusiveStateLock(USAGE_LOCK_PREFIX + ownerUid, transaction);
   }
 
+  function loadUsageStateForBackup(ownerUid) {
+    try {
+      const raw = GM_getValue(usageStorageKey(ownerUid), null);
+      if (raw === null || typeof raw === "undefined") {
+        return { ok: true, state: null, raw: null };
+      }
+      if (typeof raw !== "string") {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "USAGE_STATE_UNREADABLE",
+        };
+      }
+      const parsed = JSON.parse(raw);
+      if (!isValidUsageState(parsed)) {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "USAGE_STATE_UNREADABLE",
+        };
+      }
+      return { ok: true, state: parsed, raw };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "USAGE_STATE_UNREADABLE",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
+  function reloadUsageStateAfterRestore(ownerUid) {
+    if (usageRuntimeOwnerUid !== ownerUid) return;
+    const loaded = loadUsageState(ownerUid);
+    if (!loaded.ok) return;
+    usageState = loaded.state;
+    usagePendingActiveSeconds = 0;
+    usagePendingPostIds.clear();
+    syncUsageCorner();
+  }
+
   function usageMonotonicNow() {
     try {
       if (typeof performance !== "undefined" && performance.now) {

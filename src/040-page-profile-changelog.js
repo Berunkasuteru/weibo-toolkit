@@ -249,14 +249,27 @@
     return !configured.ok || configured.uid === routeUid;
   }
 
+  const PROFILE_ROUTE_TABS = "home|feed|weibo|profile|album|article|video|super";
+  const PROFILE_UID_PATH_PATTERN = new RegExp(
+    `^/u/([1-9]\\d*)(?:/(?:${PROFILE_ROUTE_TABS}))?/?$`
+  );
+  const PROFILE_CUSTOM_PATH_PATTERN = new RegExp(
+    `^/(?:n/[^/]+|(?!u(?:/|$)|set(?:/|$)|fav(?:/|$)|mygroups(?:/|$)|tv(?:/|$)|ttarticle(?:/|$)|search(?:/|$)|hot(?:/|$)|login(?:/|$)|logout(?:/|$))[^/]+)(?:/(?:${PROFILE_ROUTE_TABS}))?/?$`
+  );
+
+  function parseProfileUidFromPath(pathname) {
+    if (typeof pathname !== "string") return null;
+    const match = PROFILE_UID_PATH_PATTERN.exec(pathname);
+    return match ? normalizeStableUid(match[1]) : null;
+  }
+
+  function couldBeCustomProfilePathname(pathname) {
+    return typeof pathname === "string" && PROFILE_CUSTOM_PATH_PATTERN.test(pathname);
+  }
+
   function isAutoExpandLongPostRoute() {
     if (isPageEnhancementFeedRoute()) return true;
-    return Boolean(
-      typeof location !== "undefined" &&
-        location.origin === WEIBO_MAIN_ORIGIN &&
-        typeof location.pathname === "string" &&
-        /^\/u\/[1-9]\d*\/?$/.test(location.pathname)
-    );
+    return resolveProfileRouteTargetUid() !== null;
   }
 
   function promotionFilterIsActiveForRoute() {
@@ -1482,6 +1495,68 @@
     return true;
   }
 
+  function extractProfileHeaderAnchorUid(anchor) {
+    if (!anchor || anchor.tagName !== "A" || hasClass(anchor, "wfr-root")) {
+      return null;
+    }
+    const rawHref =
+      typeof anchor.getAttribute === "function"
+        ? anchor.getAttribute("href")
+        : anchor.href;
+    if (typeof rawHref !== "string" || rawHref.trim() === "") return null;
+    try {
+      const url = new URL(rawHref, WEIBO_MAIN_ORIGIN);
+      if (url.origin !== WEIBO_MAIN_ORIGIN) return null;
+      const match =
+        /^\/u\/([1-9]\d*)(?:\/|$)/.exec(url.pathname) ||
+        /^\/u\/page\/(?:follow|fans)\/([1-9]\d*)(?:\/|$)/.exec(url.pathname);
+      return match ? normalizeStableUid(match[1]) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function resolveProfileTargetUidFromDom() {
+    if (
+      typeof location === "undefined" ||
+      location.origin !== WEIBO_MAIN_ORIGIN ||
+      !couldBeCustomProfilePathname(location.pathname)
+    ) {
+      return null;
+    }
+    const point = findProfileExtrasInsertionPoint();
+    if (!point) return null;
+    const uids = new Set();
+    let cursor = point.before;
+    while (cursor && cursor !== point.main) {
+      const parent = cursor.parentElement || cursor.parentNode;
+      if (!parent) break;
+      for (const sibling of elementChildren(parent)) {
+        if (sibling === cursor) break;
+        if (
+          hasClass(sibling, "wfr-root") ||
+          sibling.id === PROFILE_EXTRAS_ID ||
+          sibling.id === PROFILE_FRIEND_NOTES_ID
+        ) {
+          continue;
+        }
+        const anchors = [];
+        if (sibling.tagName === "A") anchors.push(sibling);
+        if (typeof sibling.querySelectorAll === "function") {
+          anchors.push(...sibling.querySelectorAll("a"));
+        }
+        for (const anchor of anchors) {
+          const uid = extractProfileHeaderAnchorUid(anchor);
+          if (uid === null) continue;
+          uids.add(uid);
+          if (uids.size > 1) return null;
+        }
+      }
+      cursor = parent;
+    }
+    return uids.size === 1 ? [...uids][0] : null;
+  }
+
   function resolveProfileRouteTargetUid() {
     if (
       typeof location === "undefined" ||
@@ -1490,8 +1565,9 @@
     ) {
       return null;
     }
-    const match = /^\/u\/([1-9]\d*)\/?$/.exec(location.pathname);
-    return match ? normalizeStableUid(match[1]) : null;
+    const pathUid = parseProfileUidFromPath(location.pathname);
+    if (pathUid !== null) return pathUid;
+    return resolveProfileTargetUidFromDom();
   }
 
   function profileVisitStorageKey(ownerUid) {
@@ -1535,6 +1611,43 @@
 
   const MAX_PROFILE_VISIT_ENTRIES = 2000;
   const PROFILE_VISIT_LOCK_PREFIX = "weibo-toolkit-profile-visits-";
+
+  async function withProfileVisitsLock(ownerUid, transaction) {
+    return await withExclusiveStateLock(
+      PROFILE_VISIT_LOCK_PREFIX + ownerUid,
+      transaction
+    );
+  }
+
+  function isValidProfileVisitBackupState(value) {
+    return (
+      isValidProfileVisitMap(value) &&
+      Object.keys(value).length <= MAX_PROFILE_VISIT_ENTRIES
+    );
+  }
+
+  function loadProfileVisitsForBackup(ownerUid) {
+    try {
+      const stored = GM_getValue(profileVisitStorageKey(ownerUid), null);
+      if (stored === null || typeof stored === "undefined") {
+        return { ok: true, visits: null };
+      }
+      return isValidProfileVisitBackupState(stored)
+        ? { ok: true, visits: stored }
+        : {
+            ok: false,
+            failureKind: "STORAGE_ERROR",
+            reason: "PROFILE_VISITS_UNREADABLE",
+          };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "PROFILE_VISITS_UNREADABLE",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
 
   function trimProfileVisitEntries(visits, protectedUid) {
     const uids = Object.keys(visits);
@@ -2247,6 +2360,19 @@
     const targetUid = resolveProfileRouteTargetUid();
     const owner = determineCurrentUid();
     if (!owner.ok || targetUid === null || targetUid === owner.uid) {
+      if (
+        owner.ok &&
+        targetUid === null &&
+        typeof location !== "undefined" &&
+        location.origin === WEIBO_MAIN_ORIGIN &&
+        couldBeCustomProfilePathname(location.pathname) &&
+        !findProfileExtrasInsertionPoint()
+      ) {
+        removeProfileExtrasNode();
+        disconnectProfileExtrasObserver();
+        scheduleProfileExtrasDiscovery();
+        return false;
+      }
       teardownProfileExtras();
       return false;
     }

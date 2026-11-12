@@ -101,9 +101,16 @@
     return history.length > 0 ? history[0].displayName : subjectUid;
   }
 
-  function matchesEventQuery(event, query) {
+  function matchesEventQuery(event, query, notesByUid = null) {
     const needle = String(query).trim().toLowerCase();
     if (needle === "") return true;
+    if (
+      notesByUid !== null &&
+      hasOwn(notesByUid, event.subjectUid) &&
+      friendNoteMatchesSearchText(notesByUid[event.subjectUid], needle)
+    ) {
+      return true;
+    }
     return (
       event.subjectUid.includes(needle) ||
       event.displayName.toLowerCase().includes(needle) ||
@@ -113,35 +120,68 @@
     );
   }
 
-  function filterEvents(events, query) {
-    return events.filter((event) => matchesEventQuery(event, query));
+  function filterEvents(
+    events,
+    query,
+    notesByUid = null,
+    typeFilter = "ALL",
+    unreadOnly = false
+  ) {
+    const allowedType =
+      typeof typeFilter === "string" && hasOwn(EVENT_LABELS, typeFilter)
+        ? typeFilter
+        : "ALL";
+    return events.filter(
+      (event) =>
+        (allowedType === "ALL" || event.type === allowedType) &&
+        (!unreadOnly || !event.read) &&
+        matchesEventQuery(event, query, notesByUid)
+    );
+  }
+
+  async function persistEventsReadByIds(ownerUid, eventIds) {
+    const currentUid = determineCurrentUid();
+    if (!currentUid.ok || currentUid.uid !== ownerUid) {
+      return { ok: false, failureKind: "UID_UNAVAILABLE" };
+    }
+    return withFriendRadarStateLock(ownerUid, async () => {
+      const fresh = loadState(ownerUid);
+      if (!fresh.ok) return fresh;
+      const nextState = markEventsReadByIds(fresh.state, eventIds);
+      const written = persistState(ownerUid, nextState);
+      if (!written.ok) return written;
+      return { ok: true, state: nextState };
+    });
   }
 
   function renderEvents(ownerUid, state, notice, initialQueryOrView = "") {
+    const rawView = isPlainObject(initialQueryOrView) ? initialQueryOrView : {};
     const view =
       typeof initialQueryOrView === "string"
         ? {
             query: initialQueryOrView,
+            type: "ALL",
+            unreadOnly: false,
             shown: FRIEND_NOTES_PAGE_SIZE,
             scrollTop: 0,
           }
         : {
-            query:
-              initialQueryOrView && typeof initialQueryOrView.query === "string"
-                ? initialQueryOrView.query
-                : "",
+            query: typeof rawView.query === "string" ? rawView.query : "",
+            type:
+              typeof rawView.type === "string" && hasOwn(EVENT_LABELS, rawView.type)
+                ? rawView.type
+                : "ALL",
+            unreadOnly: rawView.unreadOnly === true,
             shown:
-              initialQueryOrView &&
-              typeof initialQueryOrView.shown === "number" &&
-              Number.isFinite(initialQueryOrView.shown) &&
-              initialQueryOrView.shown >= FRIEND_NOTES_PAGE_SIZE
-                ? initialQueryOrView.shown
+              typeof rawView.shown === "number" &&
+              Number.isFinite(rawView.shown) &&
+              rawView.shown >= FRIEND_NOTES_PAGE_SIZE
+                ? rawView.shown
                 : FRIEND_NOTES_PAGE_SIZE,
             scrollTop:
-              initialQueryOrView &&
-              typeof initialQueryOrView.scrollTop === "number" &&
-              Number.isFinite(initialQueryOrView.scrollTop)
-                ? initialQueryOrView.scrollTop
+              typeof rawView.scrollTop === "number" &&
+              Number.isFinite(rawView.scrollTop)
+                ? rawView.scrollTop
                 : 0,
           };
     const body = showPanel("关系事件", true);
@@ -153,7 +193,16 @@
     addLine(body, "未读", unread);
 
     let search = null;
+    let typeSelect = null;
+    let unreadInput = null;
     let shown = 0;
+    const captureSavedView = () => ({
+      query: String(search ? search.value || "" : view.query),
+      type: typeSelect ? typeSelect.value : view.type,
+      unreadOnly: unreadInput ? unreadInput.checked : view.unreadOnly,
+      shown: Math.max(FRIEND_NOTES_PAGE_SIZE, shown || view.shown),
+      scrollTop: Number(body.scrollTop) || 0,
+    });
 
     if (unread > 0) {
       const markButton = createElement("button", "全部标为已读", "wfr-button wfr-primary");
@@ -179,11 +228,7 @@
           showFailure("标记失败", saved);
           return;
         }
-        renderEvents(ownerUid, saved.state, "全部事件已标为已读。", {
-          query: String(search ? search.value || "" : view.query),
-          shown: Math.max(FRIEND_NOTES_PAGE_SIZE, shown || view.shown),
-          scrollTop: Number(body.scrollTop) || 0,
-        });
+        renderEvents(ownerUid, saved.state, "全部事件已标为已读。", captureSavedView());
       });
       body.append(markButton);
     }
@@ -214,10 +259,30 @@
 
     search = createElement("input", null, "wfr-search");
     search.type = "search";
-    search.placeholder = "搜索昵称、旧昵称或 UID";
-    search.setAttribute("aria-label", "搜索昵称、旧昵称或 UID");
+    search.placeholder = "搜索昵称、旧昵称、UID 或友人备注/标签";
+    search.setAttribute("aria-label", "搜索昵称、旧昵称、UID 或友人备注/标签");
     search.value = view.query;
     body.append(search);
+
+    const filterRow = createElement("div", null, "wfr-filter-row");
+    typeSelect = createElement("select", null, "wfr-select");
+    typeSelect.setAttribute("aria-label", "按事件类型筛选");
+    for (const [value, label] of [
+      ["ALL", "全部事件类型"],
+      ...Object.entries(EVENT_LABELS),
+    ]) {
+      const option = createElement("option", label);
+      option.value = value;
+      typeSelect.append(option);
+    }
+    typeSelect.value = view.type;
+    const unreadLabel = createElement("label", null, "wfr-hygiene-check");
+    unreadInput = createElement("input");
+    unreadInput.type = "checkbox";
+    unreadInput.checked = view.unreadOnly;
+    unreadLabel.append(unreadInput, createElement("span", "仅看未读"));
+    filterRow.append(typeSelect, unreadLabel);
+    body.append(filterRow);
 
     const summary = createElement("p", "", "wfr-muted");
     summary.setAttribute("role", "status");
@@ -236,11 +301,7 @@
     const notesLoaded = loadFriendNotesState(ownerUid);
     const notedUids = notesLoaded.ok ? notesLoaded.state.notes : null;
     const captureReturnToEvents = () => {
-      const savedView = {
-        query: String(search.value || ""),
-        shown: Math.max(FRIEND_NOTES_PAGE_SIZE, shown),
-        scrollTop: Number(body.scrollTop) || 0,
-      };
+      const savedView = captureSavedView();
       return () => {
         const fresh = loadState(ownerUid);
         renderEvents(ownerUid, fresh.ok ? fresh.state : state, null, savedView);
@@ -253,7 +314,22 @@
       const next = groupList.slice(shown, shown + batchSize);
       for (const group of next) {
         list.append(
-          buildEventCard(ownerUid, state, group, notedUids, captureReturnToEvents)
+          buildEventCard(
+            ownerUid,
+            state,
+            group,
+            notedUids,
+            captureReturnToEvents,
+            async (cardEventIds) => {
+              const savedView = captureSavedView();
+              const saved = await persistEventsReadByIds(ownerUid, cardEventIds);
+              if (!saved.ok) {
+                showFailure("标记失败", saved);
+                return;
+              }
+              renderEvents(ownerUid, saved.state, null, savedView);
+            }
+          )
         );
       }
       shown += next.length;
@@ -262,10 +338,16 @@
       moreButton.textContent = `加载更多（还有 ${remaining} 条）`;
     }
 
-    function renderList(query, initialLimit = FRIEND_NOTES_PAGE_SIZE) {
+    function renderList(initialLimit = FRIEND_NOTES_PAGE_SIZE) {
       clearNode(list);
       shown = 0;
-      const matching = filterEvents(newestFirst, query);
+      const matching = filterEvents(
+        newestFirst,
+        search.value || "",
+        notedUids,
+        typeSelect.value,
+        unreadInput.checked
+      );
       // One card per account, placed where its newest matching event falls.
       // The card shows that newest event; the rest are one click away in the
       // account's timeline, so an account that changed often no longer fills
@@ -287,14 +369,23 @@
       renderMore(initialLimit);
     }
 
-    search.addEventListener("input", () => renderList(search.value || ""));
+    search.addEventListener("input", () => renderList());
+    typeSelect.addEventListener("change", () => renderList());
+    unreadInput.addEventListener("change", () => renderList());
     moreButton.addEventListener("click", () => renderMore());
-    renderList(view.query, view.shown);
+    renderList(view.shown);
     if (view.scrollTop > 0) body.scrollTop = view.scrollTop;
   }
 
   // group: the matching events of one account, newest first.
-  function buildEventCard(ownerUid, state, group, notedUids, captureReturn) {
+  function buildEventCard(
+    ownerUid,
+    state,
+    group,
+    notedUids,
+    captureReturn,
+    onMarkRead
+  ) {
     const captureReturnToEvents =
       typeof captureReturn === "function"
         ? captureReturn
@@ -318,6 +409,9 @@
     if (event.type === EVENT.SCREEN_NAME_CHANGED) {
       addLine(item, "变化", describeEvent(event));
     }
+    if (notedUids !== null && hasOwn(notedUids, event.subjectUid)) {
+      appendFriendNoteInlineSummary(item, notedUids[event.subjectUid]);
+    }
     const actions = createElement("div", null, "wfr-actions");
     const detailButton = createElement("button", "详情", "wfr-button");
     detailButton.type = "button";
@@ -325,6 +419,18 @@
       showEventDetail(ownerUid, state, event, captureReturnToEvents())
     );
     actions.append(detailButton);
+    if (!read && typeof onMarkRead === "function") {
+      const readButton = createElement("button", "标为已读", "wfr-button");
+      readButton.type = "button";
+      const unreadIds = new Set(
+        group.filter((entry) => !entry.read).map((entry) => entry.id)
+      );
+      readButton.addEventListener("click", async () => {
+        readButton.disabled = true;
+        await onMarkRead(unreadIds);
+      });
+      actions.append(readButton);
+    }
     // The whole stored history of the account, not just what the search
     // matched: that is what the timeline behind the button shows.
     const historyCount = eventsForSubject(state.events, event.subjectUid).length;
@@ -396,12 +502,37 @@
       "wfr-button wfr-primary"
     );
     timelineButton.type = "button";
-    const reopenDetail = () =>
-      showEventDetail(ownerUid, state, event, backToEvents);
+    const reopenDetail = () => {
+      const fresh = loadState(ownerUid);
+      const latestState = fresh.ok ? fresh.state : state;
+      const latestEvent =
+        latestState.events.find((entry) => entry.id === event.id) || event;
+      showEventDetail(ownerUid, latestState, latestEvent, backToEvents);
+    };
     timelineButton.addEventListener("click", () =>
       showTimeline(ownerUid, state, event.subjectUid, reopenDetail)
     );
-    actions.append(timelineButton, createFriendNoteProfileLink(event.subjectUid));
+    actions.append(timelineButton);
+    if (!event.read) {
+      const readButton = createElement("button", "标为已读", "wfr-button");
+      readButton.type = "button";
+      readButton.addEventListener("click", async () => {
+        readButton.disabled = true;
+        const saved = await persistEventsReadByIds(ownerUid, new Set([event.id]));
+        if (!saved.ok) {
+          showFailure("标记失败", saved);
+          return;
+        }
+        const updated =
+          saved.state.events.find((entry) => entry.id === event.id) || {
+            ...event,
+            read: true,
+          };
+        showEventDetail(ownerUid, saved.state, updated, backToEvents);
+      });
+      actions.append(readButton);
+    }
+    actions.append(createFriendNoteProfileLink(event.subjectUid));
     const notesLoaded = loadFriendNotesState(ownerUid);
     if (notesLoaded.ok) {
       const noteButton = createElement(

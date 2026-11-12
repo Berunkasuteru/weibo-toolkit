@@ -4,6 +4,7 @@ const {
   assert,
   notesKey,
   radarKey,
+  followerKey,
   createSharedBrowser,
   openTab,
   createFakeDocument,
@@ -238,6 +239,35 @@ async function profilePanel() {
     assert(tab.panels().length === 0, `panel removed on ${pathname}`);
     assert(tab.connectedObservers() === 0, `observer released on ${pathname}`);
   }
+  // Known profile tab subpaths stay supported.
+  for (const subpath of ["weibo", "album/", "article", "video", "super"]) {
+    assert(
+      tab.visit(`/u/${OTHER}/${subpath}`) === true && tab.panels().length === 1,
+      `known profile subpath /u/${OTHER}/${subpath} resolves the target UID`
+    );
+  }
+  // Custom-domain routes resolve ONLY when header links before the tab strip
+  // unambiguously prove one UID, and fail closed on conflicting UIDs.
+  const customAnchor = tab.document.createElement("a");
+  customAnchor.setAttribute("href", `/u/${OTHER}?tabtype=follow`);
+  customAnchor.textContent = "关注";
+  tab.skeleton.header.append(customAnchor);
+  assert(
+    tab.visit("/n/other-domain") === true &&
+      tab.visit("/custom-slug/weibo") === true &&
+      tab.panels().length === 1,
+    "custom-domain routes resolve when header links unambiguously identify one UID"
+  );
+  const conflictAnchor = tab.document.createElement("a");
+  conflictAnchor.setAttribute("href", `/u/${LAN}`);
+  conflictAnchor.textContent = "提及";
+  tab.skeleton.header.append(conflictAnchor);
+  assert(
+    tab.visit("/n/other-domain") === false && tab.panels().length === 0,
+    "conflicting UID links in the profile header fail closed"
+  );
+  tab.skeleton.header.removeChild(customAnchor);
+  tab.skeleton.header.removeChild(conflictAnchor);
   tab.visit(`/u/${OTHER}`);
   tab.product.setPagePreferences({ showProfileExtras: false, showProfileFriendNotes: false });
   tab.product.ensureProfileFriendNotes();
@@ -333,12 +363,27 @@ async function manager() {
   });
   const cards = () => findAll(dom.document.body, (node) => node.tagName === "ARTICLE");
 
-  // First use: guidance, not an empty list.
+  // First use: guidance, not an empty list, plus direct UID lookup.
   tab.product.showFriendNotesManager();
   assert(
     dom.document.body.textContent.includes("还没有友人档案") && cards().length === 0,
     "the empty state explains how to add the first profile"
   );
+  await findButton(dom.document.body, "按 UID 新建/查看档案").click();
+  const emptyUidInput = findAll(dom.document.body, (node) => node.tagName === "INPUT")[0];
+  emptyUidInput.value = "00123";
+  await findButton(dom.document.body, "打开档案").click();
+  assert(
+    dom.document.body.textContent.includes("请输入有效的纯数字 UID"),
+    "invalid UID is rejected before opening detail view"
+  );
+  emptyUidInput.value = LAN;
+  await findButton(dom.document.body, "打开档案").click();
+  assert(
+    dom.document.body.textContent.includes(`${LAN} · 友人档案`),
+    "valid UID opens Friend Note detail directly from empty manager"
+  );
+  tab.product.showFriendNotesManager();
 
   // On someone's profile the manager offers a note for that UID directly,
   // with no relationship baseline and with the profile-page option off.
@@ -743,10 +788,249 @@ async function listsRestorePositionAfterChildViews() {
   assert(browser.fetchCalls === 0, "restoring a local list sends no requests");
 }
 
+async function listViewsShowNotesFilterReadAndExport() {
+  const browser = createSharedBrowser();
+  const dom = createFakeDocument();
+  const downloads = [];
+  class MockBlob {
+    constructor(parts, options) {
+      this.parts = parts;
+      this.type = options && options.type;
+    }
+  }
+  let blobId = 0;
+  const blobContents = new Map();
+  const mockUrl = {
+    createObjectURL(blob) {
+      blobId += 1;
+      const url = `blob:mock/${blobId}`;
+      blobContents.set(url, { content: blob.parts.join(""), type: blob.type });
+      return url;
+    },
+    revokeObjectURL() {},
+  };
+  const createElement = dom.document.createElement.bind(dom.document);
+  dom.document.createElement = (tag) => {
+    const node = createElement(tag);
+    if (tag === "a") {
+      node.click = () => {
+        downloads.push({
+          download: node.download,
+          ...(blobContents.get(node.href) || {}),
+        });
+      };
+    }
+    return node;
+  };
+  browser.storage.set(
+    notesKey(OWNER),
+    JSON.stringify(
+      notesState([
+        [LAN, "合作摄影师，经常接商单", ["摄影", "熟人"]],
+        [OTHER, "=危险备注", ["待观察"]],
+      ])
+    )
+  );
+  const radarState = {
+    schemaVersion: 1,
+    ownerUid: OWNER,
+    latestSnapshot: {
+      capturedAt: T,
+      reportedTotal: 2,
+      visibleCount: 2,
+      unresolvedRelationCount: 0,
+      records: [
+        { uid: LAN, screenName: "阿岚Lan", following: true, followsMe: false, remark: "" },
+        { uid: OTHER, screenName: "路人乙", following: true, followsMe: true, remark: "" },
+      ],
+    },
+    events: [
+      {
+        id: "ev-lost",
+        type: "FOLLOW_ME_LOST",
+        detectedAt: "2026-09-02T08:00:00.000Z",
+        subjectUid: LAN,
+        displayName: "阿岚Lan",
+        read: false,
+        previous: { followsMe: true },
+        current: { followsMe: false },
+      },
+      {
+        id: "ev-name",
+        type: "SCREEN_NAME_CHANGED",
+        detectedAt: "2026-09-01T08:00:00.000Z",
+        subjectUid: OTHER,
+        displayName: "路人乙",
+        read: false,
+        previous: { screenName: "旧名" },
+        current: { screenName: "路人乙" },
+      },
+    ],
+  };
+  const followerState = {
+    schemaVersion: 1,
+    ownerUid: OWNER,
+    latestSnapshot: null,
+    events: [
+      {
+        id: "fe-add",
+        type: "VISIBLE_FOLLOWER_ADDED",
+        observedAt: "2026-09-02T08:00:00.000Z",
+        uid: LAN,
+        displayName: "阿岚Lan",
+      },
+      {
+        id: "fe-drop",
+        type: "VISIBLE_FOLLOWER_DISAPPEARED",
+        observedAt: "2026-09-01T08:00:00.000Z",
+        uid: OTHER,
+        displayName: "路人乙",
+      },
+    ],
+  };
+  browser.storage.set(radarKey(OWNER), JSON.stringify(radarState));
+  browser.storage.set(followerKey(OWNER), JSON.stringify(followerState));
+  const tab = openTab(browser, NAMES, {
+    ownerUid: OWNER,
+    context: {
+      document: dom.document,
+      MutationObserver: dom.MutationObserver,
+      Blob: MockBlob,
+      URL: mockUrl,
+      setTimeout: (fn) => {
+        fn();
+        return 1;
+      },
+      clearTimeout() {},
+    },
+  });
+
+  // 1) Events view: inline Friend Note summary, Note search, type/unread filter, card + detail mark-read.
+  tab.product.renderEvents(OWNER, radarState);
+  let summaries = findAll(dom.document.body, (node) => node.classList.contains("wfr-card-note-summary"));
+  assert(
+    summaries.length === 2 && summaries[0].textContent.includes("合作摄影师"),
+    "renderEvents cards display inline Friend Notes summary"
+  );
+  const evSearch = findAll(dom.document.body, (node) => node.tagName === "INPUT")[0];
+  evSearch.value = "接商单";
+  evSearch.dispatch("input");
+  await new Promise((resolve) => setImmediate(resolve));
+  let evCards = findAll(dom.document.body, (node) => node.tagName === "ARTICLE");
+  assert(evCards.length === 1 && evCards[0].textContent.includes("阿岚Lan"), "events search matches Friend Notes");
+  await findButton(evCards[0], "标为已读").click();
+  let persistedRadar = JSON.parse(browser.storage.get(radarKey(OWNER)));
+  assert(
+    persistedRadar.events.find((e) => e.id === "ev-lost").read === true &&
+      persistedRadar.events.find((e) => e.id === "ev-name").read === false,
+    "single-card mark-read persists only that event under lock"
+  );
+  // Filter by unreadOnly + type: ev-lost is read now, so unreadOnly shows only ev-name; switching type to FOLLOW_ME_LOST clears list.
+  const evSearchAfter = findAll(dom.document.body, (node) => node.tagName === "INPUT")[0];
+  const unreadCheckbox = findAll(dom.document.body, (node) => node.tagName === "INPUT" && node.type === "checkbox")[0];
+  const evTypeSelect = findAll(dom.document.body, (node) => node.tagName === "SELECT")[0];
+  evSearchAfter.value = "";
+  evSearchAfter.dispatch("input");
+  unreadCheckbox.checked = true;
+  unreadCheckbox.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  evCards = findAll(dom.document.body, (node) => node.tagName === "ARTICLE");
+  assert(evCards.length === 1 && evCards[0].textContent.includes("路人乙"), "unread filter hides already-read event");
+  evTypeSelect.value = "FOLLOW_ME_LOST";
+  evTypeSelect.dispatch("change");
+  assert(
+    findAll(dom.document.body, (node) => node.tagName === "ARTICLE").length === 0,
+    "type filter narrows events to FOLLOW_ME_LOST"
+  );
+  evTypeSelect.value = "ALL";
+  evTypeSelect.dispatch("change");
+  evCards = findAll(dom.document.body, (node) => node.tagName === "ARTICLE");
+  await findButton(evCards[0], "详情").click();
+  await findButton(dom.document.body, "标为已读").click();
+  persistedRadar = JSON.parse(browser.storage.get(radarKey(OWNER)));
+  assert(
+    persistedRadar.events.every((e) => e.read === true),
+    "detail modal mark-read updates storage cleanly"
+  );
+
+  // 2) Follower events view: type filter, Friend Note inline summary, and filtered CSV export.
+  tab.product.renderFollowerEvents(OWNER, followerState);
+  summaries = findAll(dom.document.body, (node) => node.classList.contains("wfr-card-note-summary"));
+  assert(summaries.length === 2, "renderFollowerEvents cards show inline Friend Note summary");
+  const followerTypeSelect = findAll(dom.document.body, (node) => node.tagName === "SELECT")[0];
+  followerTypeSelect.value = "VISIBLE_FOLLOWER_ADDED";
+  followerTypeSelect.dispatch("change");
+  const followerCards = findAll(dom.document.body, (node) => node.tagName === "ARTICLE");
+  assert(followerCards.length === 1 && followerCards[0].textContent.includes("阿岚Lan"), "follower event type filter narrows cards");
+  await findButton(dom.document.body, "导出 CSV").click();
+  assert(
+    downloads.length === 1 &&
+      downloads[0].download.includes("follower-events") &&
+      downloads[0].content.includes("阿岚Lan") &&
+      !downloads[0].content.includes("路人乙"),
+    "follower CSV export exports only currently filtered events"
+  );
+
+  // 3) Overview: inline Friend Note summary, Note search, and filtered Markdown export.
+  tab.product.showRelationshipOverview();
+  const ovSearch = findAll(dom.document.body, (node) => node.tagName === "INPUT")[0];
+  ovSearch.value = "待观察";
+  ovSearch.dispatch("input");
+  await new Promise((resolve) => setImmediate(resolve));
+  const ovCards = findAll(dom.document.body, (node) => node.tagName === "ARTICLE");
+  assert(ovCards.length === 1 && ovCards[0].textContent.includes("路人乙"), "overview search matches Friend Note tags");
+  await findButton(dom.document.body, "导出当前名单 Markdown").click();
+  assert(
+    downloads.length === 2 &&
+      downloads[1].download.includes("weibo-toolkit-following") &&
+      downloads[1].content.includes("路人乙") &&
+      !downloads[1].content.includes("阿岚Lan"),
+    "overview Markdown export exports filtered overview records"
+  );
+
+  // 4) Friend Notes Manager: direct UID open, filtered CSV & Markdown export with BOM/formula neutralization.
+  tab.product.showFriendNotesManager();
+  const fnSearch = findAll(dom.document.body, (node) => node.tagName === "INPUT")[0];
+  fnSearch.value = "=危险";
+  fnSearch.dispatch("input");
+  await findButton(dom.document.body, "导出当前档案 CSV").click();
+  assert(
+    downloads.length === 3 &&
+      downloads[2].download.includes("weibo-toolkit-friend-notes") &&
+      downloads[2].content.charCodeAt(0) === 0xfeff &&
+      downloads[2].content.includes("'=危险备注") &&
+      !downloads[2].content.includes("合作摄影师"),
+    "friend notes CSV export neutralizes formulas and exports filtered notes with UTF-8 BOM"
+  );
+  await findButton(dom.document.body, "← 返回").click();
+  assert(
+    findAll(dom.document.body, (node) => node.tagName === "INPUT")[0].value === "=危险",
+    "returning from friend notes export restores the previous search filter"
+  );
+  await findButton(dom.document.body, "导出当前档案 Markdown").click();
+  assert(
+    downloads.length === 4 &&
+      downloads[3].download.endsWith(".md") &&
+      downloads[3].content.includes("=危险备注") &&
+      !downloads[3].content.includes("合作摄影师"),
+    "friend notes Markdown export exports only filtered notes"
+  );
+  await findButton(dom.document.body, "← 返回").click();
+  await findButton(dom.document.body, "按 UID 新建/查看档案").click();
+  const nonEmptyUidInput = findAll(dom.document.body, (node) => node.tagName === "INPUT")[1];
+  nonEmptyUidInput.value = "999999";
+  await findButton(dom.document.body, "打开档案").click();
+  assert(
+    dom.document.body.textContent.includes("999999 · 友人档案"),
+    "manager opens a brand-new UID note editor directly"
+  );
+}
+
 (async () => {
   await lockedPanelIsNotReplaced();
   await unsavedNoteGuardAndCallerReturn();
   await listsRestorePositionAfterChildViews();
+  await listViewsShowNotesFilterReadAndExport();
   await profilePanel();
   await observedFactsAreNotDuplicated();
   await manager();

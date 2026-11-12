@@ -106,17 +106,32 @@
   }
 
   function normalizeHygieneFilters(raw) {
+    const query = typeof raw.query === "string" ? raw.query.trim() : "";
+    const noteMode =
+      raw.noteMode === "WITH_NOTE" || raw.noteMode === "WITHOUT_NOTE"
+        ? raw.noteMode
+        : "ALL";
+    const noteTag = typeof raw.noteTag === "string" ? raw.noteTag.trim() : "";
     const statusesMax = normalizeHygieneThreshold(raw.statusesMax);
+    const statusesMin = normalizeHygieneThreshold(raw.statusesMin);
     const followersMax = normalizeHygieneThreshold(raw.followersMax);
+    const followersMin = normalizeHygieneThreshold(raw.followersMin);
     const friendsMax = normalizeHygieneThreshold(raw.friendsMax);
     const createdAfter = normalizeHygieneDate(raw.createdAfter);
+    const createdBefore = normalizeHygieneDate(raw.createdBefore);
     const filters = {
       mode: raw.mode === "ANY" ? "ANY" : "ALL",
+      query,
+      noteMode,
+      noteTag,
       ownerNotFollowing: raw.ownerNotFollowing === true,
       statusesMax,
+      statusesMin,
       followersMax,
+      followersMin,
       friendsMax,
       createdAfter,
+      createdBefore,
       unverified: raw.unverified === true,
       // The whole source group is one criterion: the selected categories are
       // OR-ed with each other, and that single outcome then takes part in the
@@ -124,11 +139,17 @@
       sourceCategories: normalizeHygieneSourceCategories(raw.sourceCategories),
     };
     filters.activeCount =
+      Number(filters.query !== "") +
+      Number(filters.noteMode !== "ALL") +
+      Number(filters.noteTag !== "") +
       Number(filters.ownerNotFollowing) +
       Number(filters.statusesMax !== null) +
+      Number(filters.statusesMin !== null) +
       Number(filters.followersMax !== null) +
+      Number(filters.followersMin !== null) +
       Number(filters.friendsMax !== null) +
       Number(filters.createdAfter !== null) +
+      Number(filters.createdBefore !== null) +
       Number(filters.unverified) +
       Number(filters.sourceCategories.length > 0);
     return filters;
@@ -141,8 +162,46 @@
     return new Date(timestamp).toISOString().slice(0, 10);
   }
 
-  function getHygieneMatchReasons(record, filters) {
+  function getHygieneMatchReasons(record, filters, notesByUid = null) {
     const reasons = [];
+    const noteRecord =
+      notesByUid !== null && hasOwn(notesByUid, record.uid)
+        ? notesByUid[record.uid]
+        : null;
+    if (filters.query !== "") {
+      const needle = filters.query.toLowerCase();
+      const category = classifyFollowerSource(record.sourceText);
+      const haystack = [
+        record.screenName || "",
+        record.uid || "",
+        record.sourceText || "",
+        followerSourceCategoryLabel(category),
+      ]
+        .join("\n")
+        .toLowerCase();
+      const noteMatched =
+        noteRecord !== null && friendNoteMatchesSearchText(noteRecord, needle);
+      if (haystack.includes(needle) || noteMatched) {
+        reasons.push("关键词匹配 " + filters.query);
+      }
+    }
+    if (filters.noteMode === "WITH_NOTE" && noteRecord !== null) {
+      reasons.push("有友人档案");
+    } else if (
+      filters.noteMode === "WITHOUT_NOTE" &&
+      notesByUid !== null &&
+      noteRecord === null
+    ) {
+      reasons.push("无友人档案");
+    }
+    if (
+      filters.noteTag !== "" &&
+      noteRecord !== null &&
+      Array.isArray(noteRecord.tags) &&
+      noteRecord.tags.includes(filters.noteTag)
+    ) {
+      reasons.push("友人标签 " + filters.noteTag);
+    }
     if (filters.ownerNotFollowing && record.ownerFollowing === false) {
       reasons.push("未关注 TA");
     }
@@ -154,11 +213,25 @@
       reasons.push("API显示公开微博数 ≤ " + String(filters.statusesMax));
     }
     if (
+      filters.statusesMin !== null &&
+      record.statusesCount !== null &&
+      record.statusesCount >= filters.statusesMin
+    ) {
+      reasons.push("API显示公开微博数 ≥ " + String(filters.statusesMin));
+    }
+    if (
       filters.followersMax !== null &&
       record.followersCount !== null &&
       record.followersCount <= filters.followersMax
     ) {
       reasons.push("API显示粉丝数 ≤ " + String(filters.followersMax));
+    }
+    if (
+      filters.followersMin !== null &&
+      record.followersCount !== null &&
+      record.followersCount >= filters.followersMin
+    ) {
+      reasons.push("API显示粉丝数 ≥ " + String(filters.followersMin));
     }
     if (
       filters.friendsMax !== null &&
@@ -174,6 +247,13 @@
       createdDate > filters.createdAfter
     ) {
       reasons.push("注册时间晚于 " + filters.createdAfter);
+    }
+    if (
+      filters.createdBefore !== null &&
+      createdDate !== null &&
+      createdDate < filters.createdBefore
+    ) {
+      reasons.push("注册时间早于 " + filters.createdBefore);
     }
     if (filters.unverified && record.verified === false) {
       reasons.push("API显示为未认证");
@@ -193,22 +273,22 @@
     return reasons;
   }
 
-  function recordMatchesHygieneFilters(record, filters) {
+  function recordMatchesHygieneFilters(record, filters, notesByUid = null) {
     if (filters.activeCount === 0) return false;
-    const reasons = getHygieneMatchReasons(record, filters);
+    const reasons = getHygieneMatchReasons(record, filters, notesByUid);
     return filters.mode === "ANY"
       ? reasons.length > 0
       : reasons.length === filters.activeCount;
   }
 
-  function filterFollowerSnapshot(snapshot, rawFilters) {
+  function filterFollowerSnapshot(snapshot, rawFilters, notesByUid = null) {
     const filters = normalizeHygieneFilters(rawFilters);
     if (filters.activeCount === 0) {
       return { filters, matches: [] };
     }
     const matches = [];
     for (const record of snapshot.records) {
-      const reasons = getHygieneMatchReasons(record, filters);
+      const reasons = getHygieneMatchReasons(record, filters, notesByUid);
       const matched =
         filters.mode === "ANY"
           ? reasons.length > 0
@@ -473,7 +553,9 @@
   const FOLLOWER_HYGIENE_SORTS = Object.freeze([
     ["SNAPSHOT", "快照顺序"],
     ["FOLLOWERS_ASC", "粉丝数从少到多"],
+    ["FOLLOWERS_DESC", "粉丝数从多到少"],
     ["STATUSES_ASC", "公开微博数从少到多"],
+    ["STATUSES_DESC", "公开微博数从多到少"],
     ["CREATED_DESC", "注册时间从新到旧"],
     ["CREATED_ASC", "注册时间从旧到新"],
   ]);
@@ -481,8 +563,14 @@
   function sortHygieneMatches(matches, sort) {
     let key = null;
     if (sort === "FOLLOWERS_ASC") key = (record) => record.followersCount;
-    else if (sort === "STATUSES_ASC") key = (record) => record.statusesCount;
-    else if (sort === "CREATED_ASC" || sort === "CREATED_DESC") {
+    else if (sort === "FOLLOWERS_DESC") {
+      key = (record) =>
+        record.followersCount === null ? null : -record.followersCount;
+    } else if (sort === "STATUSES_ASC") key = (record) => record.statusesCount;
+    else if (sort === "STATUSES_DESC") {
+      key = (record) =>
+        record.statusesCount === null ? null : -record.statusesCount;
+    } else if (sort === "CREATED_ASC" || sort === "CREATED_DESC") {
       const sign = sort === "CREATED_ASC" ? 1 : -1;
       key = (record) =>
         record.createdAt === null ? null : sign * Date.parse(record.createdAt);
@@ -507,6 +595,17 @@
   const FOLLOWER_REMOVAL_LOG_PREFIX = "weiboToolkit.followerRemovalLog.v1.";
   const FOLLOWER_REMOVAL_LOG_LIMIT = 5000;
 
+  function followerRemovalLogStorageKey(ownerUid) {
+    return FOLLOWER_REMOVAL_LOG_PREFIX + ownerUid;
+  }
+
+  async function withFollowerRemovalLogLock(ownerUid, transaction) {
+    return await withExclusiveStateLock(
+      "weibo-toolkit-follower-removal-log-" + ownerUid,
+      transaction
+    );
+  }
+
   function isValidFollowerRemovalLogEntry(entry) {
     return Boolean(
       isPlainObject(entry) &&
@@ -518,11 +617,54 @@
     );
   }
 
+  function isValidFollowerRemovalLogState(value, expectedOwnerUid) {
+    return Boolean(
+      isPlainObject(value) &&
+        value.schemaVersion === 1 &&
+        value.ownerUid === expectedOwnerUid &&
+        Array.isArray(value.entries) &&
+        value.entries.length <= FOLLOWER_REMOVAL_LOG_LIMIT &&
+        value.entries.every(isValidFollowerRemovalLogEntry)
+    );
+  }
+
+  function loadFollowerRemovalLogForBackup(ownerUid) {
+    try {
+      const raw = GM_getValue(followerRemovalLogStorageKey(ownerUid), null);
+      if (raw === null || typeof raw === "undefined") {
+        return { ok: true, state: null, raw: null };
+      }
+      if (typeof raw !== "string") {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "FOLLOWER_REMOVAL_LOG_UNREADABLE",
+        };
+      }
+      const parsed = JSON.parse(raw);
+      if (!isValidFollowerRemovalLogState(parsed, ownerUid)) {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "FOLLOWER_REMOVAL_LOG_UNREADABLE",
+        };
+      }
+      return { ok: true, state: parsed, raw };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "FOLLOWER_REMOVAL_LOG_UNREADABLE",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
+    }
+  }
+
   // An unreadable log is reported as such. It is never treated as empty: the
   // next removal would then replace whatever is stored with a one-line log.
   function loadFollowerRemovalLog(ownerUid) {
     try {
-      const raw = GM_getValue(FOLLOWER_REMOVAL_LOG_PREFIX + ownerUid, null);
+      const raw = GM_getValue(followerRemovalLogStorageKey(ownerUid), null);
       if (raw === null || typeof raw === "undefined") return { ok: true, entries: [] };
       if (typeof raw !== "string") return { ok: false };
       const parsed = JSON.parse(raw);
@@ -814,6 +956,82 @@
       return GM_getValue(key, null) === serialized;
     } catch (_) {
       return false;
+    }
+  }
+
+  function followerHygienePresetsStorageKey(ownerUid) {
+    return FOLLOWER_HYGIENE_PRESETS_PREFIX + ownerUid;
+  }
+
+  function isValidFollowerHygienePresetsState(value) {
+    if (
+      !isPlainObject(value) ||
+      value.schemaVersion !== 1 ||
+      !Array.isArray(value.presets) ||
+      value.presets.length > FOLLOWER_HYGIENE_PRESET_LIMIT
+    ) {
+      return false;
+    }
+    const seenNames = new Set();
+    for (const entry of value.presets) {
+      if (
+        !isPlainObject(entry) ||
+        typeof entry.name !== "string" ||
+        entry.name.trim() === "" ||
+        entry.name.length > FOLLOWER_HYGIENE_PRESET_NAME_MAX ||
+        seenNames.has(entry.name) ||
+        !isPlainObject(entry.filters)
+      ) {
+        return false;
+      }
+      seenNames.add(entry.name);
+    }
+    return true;
+  }
+
+  function normalizeFollowerHygienePresetsState(value) {
+    return {
+      schemaVersion: 1,
+      presets: value.presets.map((entry) => ({
+        name: entry.name,
+        filters: hygienePresetFilters(entry.filters),
+      })),
+    };
+  }
+
+  function loadFollowerHygienePresetsForBackup(ownerUid) {
+    try {
+      const raw = GM_getValue(followerHygienePresetsStorageKey(ownerUid), null);
+      if (raw === null || typeof raw === "undefined") {
+        return { ok: true, state: null, raw: null };
+      }
+      if (typeof raw !== "string") {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "FOLLOWER_HYGIENE_PRESETS_UNREADABLE",
+        };
+      }
+      const parsed = JSON.parse(raw);
+      if (!isValidFollowerHygienePresetsState(parsed)) {
+        return {
+          ok: false,
+          failureKind: "STORAGE_ERROR",
+          reason: "FOLLOWER_HYGIENE_PRESETS_UNREADABLE",
+        };
+      }
+      return {
+        ok: true,
+        state: normalizeFollowerHygienePresetsState(parsed),
+        raw,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        failureKind: "STORAGE_ERROR",
+        reason: "FOLLOWER_HYGIENE_PRESETS_UNREADABLE",
+        errorName: error && error.name ? String(error.name) : "Error",
+      };
     }
   }
 
@@ -1247,6 +1465,13 @@
         "wfr-hygiene-line wfr-hygiene-facts wfr-muted"
       )
     );
+    const noteRecord =
+      typeof removalState.noteRecord === "function"
+        ? removalState.noteRecord(record.uid)
+        : null;
+    if (noteRecord !== null) {
+      appendFriendNoteInlineSummary(item, noteRecord);
+    }
     item.append(actions);
     if (record.optionalMetadataConflict) {
       item.append(
@@ -1341,6 +1566,8 @@
     let notedUidsSnapshot = null;
     let protectionNotice = "";
 
+    let syncNoteTagOptions = () => {};
+
     // Recomputed whenever it is about to be relied on, because notes can be
     // added, removed or become unreadable in another tab while this panel is
     // open. What the page says is brought in line every time: the warning
@@ -1350,6 +1577,7 @@
       const notes = loadFriendNotesState(owner.uid);
       const noted = notes.ok ? notes.state.notes : null;
       notedUidsSnapshot = noted;
+      syncNoteTagOptions();
       protectionNotice = notes.ok
         ? ""
         : "友人档案现在无法读取：批量选择只会跳过快照中你也关注的账号，不再跳过有友人档案的账号。";
@@ -1370,7 +1598,25 @@
 
     function visibleProtectionSignature() {
       return [...cardNodes.keys()]
-        .map((uid) => uid + ":" + (protectedReasons.get(uid) || ""))
+        .map((uid) => {
+          const note =
+            notedUidsSnapshot !== null && hasOwn(notedUidsSnapshot, uid)
+              ? notedUidsSnapshot[uid]
+              : null;
+          return (
+            uid +
+            ":" +
+            (protectedReasons.get(uid) || "") +
+            ":" +
+            (note
+              ? String(note.updatedAt || "") +
+                ":" +
+                (Array.isArray(note.tags) ? note.tags.join(",") : "") +
+                ":" +
+                String(note.note || "")
+              : "")
+          );
+        })
         .join("|");
     }
 
@@ -1442,6 +1688,10 @@
           : hasOwn(notedUidsSnapshot, uid)
             ? "友人档案"
             : "写档案",
+      noteRecord: (uid) =>
+        notedUidsSnapshot !== null && hasOwn(notedUidsSnapshot, uid)
+          ? notedUidsSnapshot[uid]
+          : null,
       openFriendNote(uid) {
         dismissSingleConfirmation();
         invalidateBatchConfirmation();
@@ -1587,13 +1837,19 @@
     // through the same normalisation as typed input when they are read again.
     function applyFilters(filters) {
       mode.value = filters.mode;
+      queryInput.input.value = filters.query;
+      noteMode.value = filters.noteMode;
+      renderNoteTagOptions(filters.noteTag);
       ownerNotFollowing.input.checked = filters.ownerNotFollowing;
       unverified.input.checked = filters.unverified;
       for (const [field, value] of [
         [statusesMax, filters.statusesMax],
+        [statusesMin, filters.statusesMin],
         [followersMax, filters.followersMax],
+        [followersMin, filters.followersMin],
         [friendsMax, filters.friendsMax],
         [createdAfter, filters.createdAfter],
+        [createdBefore, filters.createdBefore],
       ]) {
         field.input.value = value === null ? "" : String(value);
       }
@@ -1668,31 +1924,75 @@
         presetSelect.value === "" || Boolean(batchStatus && batchStatus.active);
     }
 
-    const modeLabel = createElement("label", null, "wfr-hygiene-control");
-    modeLabel.append(createElement("span", "匹配方式"));
-    const mode = createElement("select", null, "wfr-select");
-    for (const [value, text] of [
+    function buildHygieneSelect(labelText, options) {
+      const label = createElement("label", null, "wfr-hygiene-control");
+      label.append(createElement("span", labelText));
+      const select = createElement("select", null, "wfr-select");
+      for (const [value, text] of options) {
+        const option = createElement("option", text);
+        option.value = value;
+        select.append(option);
+      }
+      label.append(select);
+      return { label, select };
+    }
+
+    const modeControl = buildHygieneSelect("匹配方式", [
       ["ALL", "匹配全部条件"],
       ["ANY", "匹配任一条件"],
-    ]) {
-      const option = createElement("option", text);
-      option.value = value;
-      mode.append(option);
-    }
+    ]);
+    const mode = modeControl.select;
     mode.value = "ALL";
-    modeLabel.append(mode);
-    controls.append(modeLabel);
-    const sortLabel = createElement("label", null, "wfr-hygiene-control");
-    sortLabel.append(createElement("span", "排序"));
-    const sortSelect = createElement("select", null, "wfr-select");
-    for (const [value, text] of FOLLOWER_HYGIENE_SORTS) {
-      const option = createElement("option", text);
-      option.value = value;
-      sortSelect.append(option);
-    }
+    const sortControl = buildHygieneSelect("排序", FOLLOWER_HYGIENE_SORTS);
+    const sortSelect = sortControl.select;
     sortSelect.value = "SNAPSHOT";
-    sortLabel.append(sortSelect);
-    controls.append(sortLabel);
+    const queryInput = buildHygieneValueInput(
+      "关键词",
+      "search",
+      "昵称、UID、来源、备注或标签"
+    );
+    const noteModeControl = buildHygieneSelect("友人档案", [
+      ["ALL", "不限"],
+      ["WITH_NOTE", "仅看有档案"],
+      ["WITHOUT_NOTE", "仅看无档案"],
+    ]);
+    const noteMode = noteModeControl.select;
+    noteMode.value = "ALL";
+    const noteTagControl = buildHygieneSelect("友人标签", [["", "全部标签"]]);
+    const noteTag = noteTagControl.select;
+    noteTag.value = "";
+    function renderNoteTagOptions(selectedTag) {
+      const current = typeof selectedTag === "string" ? selectedTag.trim() : "";
+      clearNode(noteTag);
+      const allOption = createElement("option", "全部标签");
+      allOption.value = "";
+      noteTag.append(allOption);
+      const tags = listFriendNoteTagsSorted(notedUidsSnapshot);
+      for (const tag of tags) {
+        const option = createElement("option", "#" + tag);
+        option.value = tag;
+        noteTag.append(option);
+      }
+      if (current !== "" && !tags.includes(current)) {
+        const missingOption = createElement(
+          "option",
+          "#" + current + "（当前无记录）"
+        );
+        missingOption.value = current;
+        noteTag.append(missingOption);
+      }
+      noteTag.value = current;
+    }
+    syncNoteTagOptions = () => {
+      renderNoteTagOptions(noteTag.value);
+    };
+    controls.append(
+      modeControl.label,
+      sortControl.label,
+      queryInput.label,
+      noteModeControl.label,
+      noteTagControl.label
+    );
 
     const ownerNotFollowing = buildHygieneCheckbox("未关注 TA");
     const unverified = buildHygieneCheckbox("未认证");
@@ -1703,8 +2003,18 @@
       "number",
       "未启用"
     );
+    const statusesMin = buildHygieneValueInput(
+      "公开微博数下限",
+      "number",
+      "未启用"
+    );
     const followersMax = buildHygieneValueInput(
       "粉丝数上限",
+      "number",
+      "未启用"
+    );
+    const followersMin = buildHygieneValueInput(
+      "粉丝数下限",
       "number",
       "未启用"
     );
@@ -1717,11 +2027,18 @@
       "注册日期晚于",
       "date"
     );
+    const createdBefore = buildHygieneValueInput(
+      "注册日期早于",
+      "date"
+    );
     controls.append(
       statusesMax.label,
+      statusesMin.label,
       followersMax.label,
+      followersMin.label,
       friendsMax.label,
-      createdAfter.label
+      createdAfter.label,
+      createdBefore.label
     );
 
     // Common source categories instead of a keyword the user would have to
@@ -1845,11 +2162,17 @@
     function readFilters() {
       return {
         mode: mode.value,
+        query: queryInput.input.value,
+        noteMode: noteMode.value,
+        noteTag: noteTag.value,
         ownerNotFollowing: ownerNotFollowing.input.checked,
         statusesMax: statusesMax.input.value,
+        statusesMin: statusesMin.input.value,
         followersMax: followersMax.input.value,
+        followersMin: followersMin.input.value,
         friendsMax: friendsMax.input.value,
         createdAfter: createdAfter.input.value,
+        createdBefore: createdBefore.input.value,
         unverified: unverified.input.checked,
         sourceCategories: sourceInputs
           .filter((entry) => entry.input.checked)
@@ -1861,18 +2184,35 @@
     // filter state; nothing internal leaks and nothing is persisted.
     function describeActiveFilters(filters) {
       const parts = [];
+      if (filters.query !== "") {
+        parts.push("关键词=" + filters.query);
+      }
+      if (filters.noteMode === "WITH_NOTE") parts.push("仅看有档案");
+      else if (filters.noteMode === "WITHOUT_NOTE") parts.push("仅看无档案");
+      if (filters.noteTag !== "") {
+        parts.push("标签=#" + filters.noteTag);
+      }
       if (filters.ownerNotFollowing) parts.push("未关注 TA");
       if (filters.statusesMax !== null) {
         parts.push("公开微博≤" + String(filters.statusesMax));
       }
+      if (filters.statusesMin !== null) {
+        parts.push("公开微博≥" + String(filters.statusesMin));
+      }
       if (filters.followersMax !== null) {
         parts.push("粉丝≤" + String(filters.followersMax));
+      }
+      if (filters.followersMin !== null) {
+        parts.push("粉丝≥" + String(filters.followersMin));
       }
       if (filters.friendsMax !== null) {
         parts.push("关注≤" + String(filters.friendsMax));
       }
       if (filters.createdAfter !== null) {
         parts.push("注册晚于 " + filters.createdAfter);
+      }
+      if (filters.createdBefore !== null) {
+        parts.push("注册早于 " + filters.createdBefore);
       }
       if (filters.unverified) parts.push("未认证");
       if (filters.sourceCategories.length > 0) {
@@ -2452,11 +2792,15 @@
       cardNodes.clear();
       cardMatches.clear();
       cardSelectionInputs.clear();
-      const result = filterFollowerSnapshot(snapshot, readFilters());
       // A card that was just removed keeps saying so until the list is next
       // redrawn; from then on it is one of the hidden ones.
       for (const uid of successfullyRemovedUids) hiddenRemovedUids.add(uid);
       refreshProtection();
+      const result = filterFollowerSnapshot(
+        snapshot,
+        readFilters(),
+        notedUidsSnapshot
+      );
       const matches = sortHygieneMatches(
         result.matches.filter((match) => !hiddenRemovedUids.has(match.record.uid)),
         sortSelect.value
@@ -2489,9 +2833,12 @@
       }
       if (matches.length === 0) {
         paginationSummary.textContent =
-          hiddenCount > 0
-            ? "符合筛选条件的粉丝都已移除。"
-            : "当前快照中没有符合筛选条件的 API 可见粉丝。";
+          notedUidsSnapshot === null &&
+          (result.filters.noteMode !== "ALL" || result.filters.noteTag !== "")
+            ? "友人档案现在无法读取，暂无法按友人档案或标签筛选。"
+            : hiddenCount > 0
+              ? "符合筛选条件的粉丝都已移除。"
+              : "当前快照中没有符合筛选条件的 API 可见粉丝。";
         paginationActions.hidden = true;
         paginationBar.hidden = false;
         currentPageMatches = [];
@@ -2665,12 +3012,18 @@
       // Not a filter, but it changes which accounts "fill" would take, so it
       // resets the selection exactly as a filter change does.
       sortSelect,
+      queryInput.input,
+      noteMode,
+      noteTag,
       ownerNotFollowing.input,
       unverified.input,
       statusesMax.input,
+      statusesMin.input,
       followersMax.input,
+      followersMin.input,
       friendsMax.input,
       createdAfter.input,
+      createdBefore.input,
       ...sourceInputs.map((entry) => entry.input),
     ];
     const prevDismissHandler = panelDismissHandler;

@@ -1,5 +1,62 @@
 
-  function filterOverviewFollowingRecords(records, filter, query) {
+  const OVERVIEW_EXPORT_COLUMNS = Object.freeze([
+    "UID",
+    "昵称",
+    "关系状态",
+    "微博备注",
+    "友人标签",
+    "友人备注",
+  ]);
+
+  function buildOverviewExportRows(records, notesByUid) {
+    return records.map((record) => {
+      const note =
+        notesByUid !== null && hasOwn(notesByUid, record.uid)
+          ? notesByUid[record.uid]
+          : null;
+      return [
+        record.uid,
+        record.screenName,
+        record.followsMe ? "互相关注" : "单向关注",
+        record.remark || "",
+        note && Array.isArray(note.tags) ? note.tags.join("、") : "",
+        note && typeof note.note === "string" ? note.note : "",
+      ];
+    });
+  }
+
+  function buildOverviewExportMarkdown(ownerUid, records, notesByUid, exportedAt) {
+    const lines = [
+      "# Weibo Toolkit 关注关系名单导出",
+      "",
+      `- 账号 UID：${ownerUid}`,
+      `- 导出时间：${exportedAt.toISOString()}`,
+      `- 当前筛选账号数：${records.length}`,
+      `- Weibo Toolkit 版本：${APP_VERSION}`,
+      "",
+      "> 本文件仅导出当前筛选条件下的 API 可见关注名单，不代表全部关注关系。",
+      "",
+    ];
+    if (records.length === 0) {
+      lines.push("暂无匹配的关注账号。", "");
+      return lines.join("\n");
+    }
+    lines.push(
+      ...buildExportMarkdownTable(
+        OVERVIEW_EXPORT_COLUMNS,
+        buildOverviewExportRows(records, notesByUid)
+      ),
+      ""
+    );
+    return lines.join("\n");
+  }
+
+  function filterOverviewFollowingRecords(
+    records,
+    filter,
+    query,
+    notesByUid = null
+  ) {
     const mode =
       filter === "MUTUAL" || filter === "ONE_WAY" ? filter : "ALL";
     const needle = String(query || "").trim().toLowerCase();
@@ -7,6 +64,13 @@
       if (mode === "MUTUAL" && !record.followsMe) return false;
       if (mode === "ONE_WAY" && record.followsMe) return false;
       if (needle === "") return true;
+      if (
+        notesByUid !== null &&
+        hasOwn(notesByUid, record.uid) &&
+        friendNoteMatchesSearchText(notesByUid[record.uid], needle)
+      ) {
+        return true;
+      }
       return [record.screenName, record.remark, record.uid].some(
         (value) =>
           typeof value === "string" && value.toLowerCase().includes(needle)
@@ -118,10 +182,22 @@
 
       const search = createElement("input", null, "wfr-search");
       search.type = "search";
-      search.placeholder = "搜索昵称、微博备注或 UID";
+      search.placeholder = "搜索昵称、微博备注、UID 或友人备注/标签";
       search.setAttribute("aria-label", "搜索当前关注名单");
       search.value = view.query;
       body.append(search);
+
+      const exportActions = createElement("div", null, "wfr-actions");
+      const exportCsvButton = createElement("button", "导出当前名单 CSV", "wfr-button");
+      const exportMdButton = createElement(
+        "button",
+        "导出当前名单 Markdown",
+        "wfr-button"
+      );
+      exportCsvButton.type = "button";
+      exportMdButton.type = "button";
+      exportActions.append(exportCsvButton, exportMdButton);
+      body.append(exportActions);
 
       const summary = createElement("p", "", "wfr-muted");
       summary.setAttribute("role", "status");
@@ -158,6 +234,9 @@
         addLine(item, "UID", record.uid);
         if (typeof record.remark === "string" && record.remark.trim() !== "") {
           addLine(item, "微博备注", record.remark);
+        }
+        if (notedUids !== null && hasOwn(notedUids, record.uid)) {
+          appendFriendNoteInlineSummary(item, notedUids[record.uid]);
         }
         const actions = createElement("div", null, "wfr-actions");
         actions.append(createFriendNoteProfileLink(record.uid));
@@ -210,9 +289,12 @@
         matching = filterOverviewFollowingRecords(
           records,
           view.filter,
-          view.query
+          view.query,
+          notedUids
         );
         shown = 0;
+        exportCsvButton.disabled = matching.length === 0;
+        exportMdButton.disabled = matching.length === 0;
         summary.textContent =
           matching.length === records.length
             ? `共 ${records.length} 个关注账号`
@@ -225,6 +307,56 @@
         renderMore(Math.max(FRIEND_NOTES_PAGE_SIZE, initialShown));
         if (initialScrollTop > 0) body.scrollTop = initialScrollTop;
       }
+
+      function exportFilteredOverview(format) {
+        const exportedAt = new Date();
+        const isCsv = format === "csv";
+        const extension = isCsv ? "csv" : "md";
+        const filename = namedExportFilename(
+          "weibo-toolkit-following",
+          ownerUid,
+          exportedAt,
+          extension
+        );
+        const savedView = {
+          filter: filterSelect.value,
+          query: String(search.value || ""),
+          shown: Math.max(FRIEND_NOTES_PAGE_SIZE, shown),
+          scrollTop: Number(body.scrollTop) || 0,
+        };
+        deliverTableExport({
+          panelTitle: "已请求浏览器下载关注名单",
+          failureTitle: "导出关注名单",
+          successText:
+            "关注名单文件已交给浏览器下载，保存位置及最终文件名由浏览器下载设置决定。",
+          formatLabel: isCsv ? "CSV" : "Markdown",
+          filename,
+          mimeType: isCsv
+            ? "text/csv;charset=utf-8"
+            : "text/markdown;charset=utf-8",
+          content: isCsv
+            ? buildExportCsv(
+                OVERVIEW_EXPORT_COLUMNS,
+                buildOverviewExportRows(matching, notedUids)
+              )
+            : buildOverviewExportMarkdown(
+                ownerUid,
+                matching,
+                notedUids,
+                exportedAt
+              ),
+          countLabel: "已导出账号数",
+          count: matching.length,
+          onBack: () => showRelationshipOverview(savedView),
+        });
+      }
+
+      exportCsvButton.addEventListener("click", () =>
+        exportFilteredOverview("csv")
+      );
+      exportMdButton.addEventListener("click", () =>
+        exportFilteredOverview("markdown")
+      );
 
       filterSelect.addEventListener("change", () => {
         view.filter = filterSelect.value;
@@ -347,11 +479,7 @@
           if (!lockedEligibility.ok || !lockedEligibility.eligible) {
             return lockedEligibility;
           }
-          if (
-            updateRunning ||
-            followerUpdateRunning ||
-            followerRemovalInFlight
-          ) {
+          if (anyRelationshipTaskBusy()) {
             return { ok: true, eligible: false, reason: "UPDATE_ALREADY_RUNNING" };
           }
           const currentUid = determineCurrentUid();
@@ -457,11 +585,7 @@
           if (!lockedEligibility.ok || !lockedEligibility.eligible) {
             return lockedEligibility;
           }
-          if (
-            updateRunning ||
-            followerUpdateRunning ||
-            followerRemovalInFlight
-          ) {
+          if (anyRelationshipTaskBusy()) {
             return {
               ok: true,
               eligible: false,

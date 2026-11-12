@@ -464,6 +464,15 @@
     "INVALID_FOLLOWER_STATE",
     "MISSING_FRIEND_NOTES",
     "INVALID_FRIEND_NOTES",
+    "MISSING_FOLLOWER_REMOVAL_LOG",
+    "INVALID_FOLLOWER_REMOVAL_LOG",
+    "MISSING_FOLLOWER_HYGIENE_PRESETS",
+    "INVALID_FOLLOWER_HYGIENE_PRESETS",
+    "MISSING_USAGE_STATE",
+    "INVALID_USAGE_STATE",
+    "MISSING_PROFILE_VISITS",
+    "INVALID_PROFILE_VISITS",
+    "V4_PREVIEW_TOKENS_MISSING",
     "FRIEND_NOTES_CHANGED_SINCE_PREVIEW",
     "UNSUPPORTED_BACKUP_VERSION",
     "INVALID_OWNER_UID",
@@ -484,17 +493,22 @@
       "友人档案确认未被修改，关系雷达数据、粉丝快照和粉丝变化记录已还原为恢复前的内容。",
     FRIEND_NOTES_RESTORE_FAILED_PARTIAL:
       "友人档案确认未被修改。其他标签页在恢复过程中写入的较新数据已被保留，因此已恢复的部分没有全部回退：当前本地数据处于部分恢复状态。请先导出并检查当前数据，再决定是否重试。",
+    V4_DOMAIN_RESTORE_FAILED_ROLLED_BACK:
+      "附加配置或统计数据写入未完成，本次恢复已取消，此前写入的全部数据均已回退到恢复前的内容。",
+    V4_DOMAIN_RESTORE_FAILED_PARTIAL:
+      "附加配置或统计数据未能完整恢复，且部分先前已恢复的数据在恢复过程中已被其他操作更新而未能全部回退：当前本地数据处于部分恢复状态。请先导出并检查当前数据，再决定是否重试。",
   });
 
   const RESTORE_UNSETTLED_REASONS = Object.freeze([
     "RESTORE_STATE_UNCERTAIN",
     "FRIEND_NOTES_RESTORE_FAILED_PARTIAL",
+    "V4_DOMAIN_RESTORE_FAILED_PARTIAL",
   ]);
 
   function restoreStateMessage(reason) {
     if (RESTORE_PRE_WRITE_REASONS.includes(reason)) {
       return {
-        text: "本次失败发生在写入之前，关系雷达数据、粉丝快照、粉丝变化记录和友人档案均未被更改。",
+        text: "本次失败发生在写入之前，本地关系雷达、粉丝数据、友人档案及附加统计配置均未被更改。",
         className: "wfr-muted",
       };
     }
@@ -523,12 +537,25 @@
         INVALID_FOLLOWER_STATE: "备份中的粉丝快照或粉丝变化记录无效，未恢复。",
         MISSING_FRIEND_NOTES: "备份缺少友人档案部分，未恢复。",
         INVALID_FRIEND_NOTES: "备份中的友人档案无效，未恢复。",
+        MISSING_FOLLOWER_REMOVAL_LOG: "备份缺少粉丝移除记录部分，未恢复。",
+        INVALID_FOLLOWER_REMOVAL_LOG: "备份中的粉丝移除记录无效，未恢复。",
+        MISSING_FOLLOWER_HYGIENE_PRESETS: "备份缺少粉丝清理筛选方案部分，未恢复。",
+        INVALID_FOLLOWER_HYGIENE_PRESETS: "备份中的粉丝清理筛选方案无效，未恢复。",
+        MISSING_USAGE_STATE: "备份缺少微博使用统计部分，未恢复。",
+        INVALID_USAGE_STATE: "备份中的微博使用统计无效，未恢复。",
+        MISSING_PROFILE_VISITS: "备份缺少主页访问记录部分，未恢复。",
+        INVALID_PROFILE_VISITS: "备份中的主页访问记录无效，未恢复。",
+        V4_PREVIEW_TOKENS_MISSING: "恢复前的附加域预览摘要缺失，未恢复。",
         FRIEND_NOTES_CHANGED_SINCE_PREVIEW:
           "友人档案在预览之后已被修改，本次恢复没有写入任何数据。请重新选择备份文件并核对预览。",
         FRIEND_NOTES_RESTORE_FAILED_ROLLED_BACK:
           "友人档案未能恢复，本次恢复已取消，关系雷达与粉丝数据已回退到恢复前的状态。",
         FRIEND_NOTES_RESTORE_FAILED_PARTIAL:
           "恢复未能完整完成：友人档案未恢复，其他数据也未能全部回退。",
+        V4_DOMAIN_RESTORE_FAILED_ROLLED_BACK:
+          "附加配置或统计数据未能恢复，本次恢复已取消，此前写入的数据已回退到恢复前的状态。",
+        V4_DOMAIN_RESTORE_FAILED_PARTIAL:
+          "恢复未能完整完成：附加配置或统计数据未恢复，其他数据也未能全部回退。",
         FOLLOWER_RESTORE_FAILED_ROLLED_BACK:
           "粉丝快照未能恢复，本次恢复已取消，关系雷达数据已回退到恢复前的状态。",
         // Reached both when a rollback could not be confirmed and when a
@@ -578,50 +605,9 @@
     );
   }
 
-  function showFailure(title, result, withBack = true) {
-    const body = showPanel(title, withBack);
+  function appendRadarScanFailureDetails(body, result) {
     body.append(createElement("p", failureText(result), "wfr-error"));
     appendFailureCode(body, result);
-    if (result.failureKind === "BACKUP_EXPORT_ERROR") {
-      body.append(
-        createElement(
-          "p",
-          "备份未能完成。关系雷达本地数据未被修改。",
-          "wfr-muted"
-        )
-      );
-      addLine(body, "失败阶段", result.backupStage);
-      addLine(body, "错误类型", result.errorName);
-      if (["CREATE_WRITABLE", "WRITE_FILE", "CLOSE_FILE"].includes(result.backupStage)) {
-        body.append(
-          createElement(
-            "p",
-            "目标位置可能存在未完成的备份文件。",
-            "wfr-muted"
-          )
-        );
-      }
-      return;
-    }
-    if (result.failureKind === "EVENT_EXPORT_ERROR") {
-      body.append(
-        createElement(
-          "p",
-          "导出未能完成。关系雷达本地数据未被修改。",
-          "wfr-muted"
-        )
-      );
-      addLine(body, "失败阶段", result.exportStage);
-      addLine(body, "错误类型", result.errorName);
-      return;
-    }
-    if (result.failureKind === "BACKUP_RESTORE_ERROR") {
-      const restoreState = restoreStateMessage(result.reason);
-      body.append(
-        createElement("p", restoreState.text, restoreState.className)
-      );
-      return;
-    }
     if (result.failureKind === "CONCURRENT_MODIFICATION") return;
     if (
       result.failureKind === "PAGINATION_FAILURE" &&
@@ -673,14 +659,70 @@
     );
   }
 
+  function showFailure(title, result, withBack = true) {
+    const body = showPanel(title, withBack);
+    if (
+      [
+        "BACKUP_EXPORT_ERROR",
+        "EVENT_EXPORT_ERROR",
+        "BACKUP_RESTORE_ERROR",
+      ].includes(result.failureKind)
+    ) {
+      body.append(createElement("p", failureText(result), "wfr-error"));
+      appendFailureCode(body, result);
+      if (result.failureKind === "BACKUP_EXPORT_ERROR") {
+        body.append(
+          createElement(
+            "p",
+            "备份未能完成。关系雷达本地数据未被修改。",
+            "wfr-muted"
+          )
+        );
+        addLine(body, "失败阶段", result.backupStage);
+        addLine(body, "错误类型", result.errorName);
+        if (
+          ["CREATE_WRITABLE", "WRITE_FILE", "CLOSE_FILE"].includes(
+            result.backupStage
+          )
+        ) {
+          body.append(
+            createElement(
+              "p",
+              "目标位置可能存在未完成的备份文件。",
+              "wfr-muted"
+            )
+          );
+        }
+        return;
+      }
+      if (result.failureKind === "EVENT_EXPORT_ERROR") {
+        body.append(
+          createElement(
+            "p",
+            "导出未能完成。关系雷达本地数据未被修改。",
+            "wfr-muted"
+          )
+        );
+        addLine(body, "失败阶段", result.exportStage);
+        addLine(body, "错误类型", result.errorName);
+        return;
+      }
+      const restoreState = restoreStateMessage(result.reason);
+      body.append(
+        createElement("p", restoreState.text, restoreState.className)
+      );
+      return;
+    }
+    appendRadarScanFailureDetails(body, result);
+  }
+
   function countEventTypes(events) {
     const counts = {};
     for (const event of events) counts[event.type] = (counts[event.type] || 0) + 1;
     return counts;
   }
 
-  function showUpdateSuccess(result) {
-    const body = showPanel("关系雷达更新", true);
+  function appendRadarSuccessDetails(body, result) {
     const message = result.baselineCreated
       ? "首次关注快照已保存，从下次更新开始记录变化。"
       : `更新完成，发现 ${result.newEvents.length} 个新事件。`;
@@ -699,6 +741,34 @@
     for (const type of Object.values(EVENT)) {
       addLine(body, EVENT_LABELS[type], counts[type] || 0);
     }
+    if (result.reportedTotalChanged) {
+      body.append(
+        createElement(
+          "p",
+          "提示：扫描期间接口报告的总数发生轻微波动，已按有效分页结果汇总。",
+          "wfr-muted"
+        )
+      );
+    }
+  }
+
+  function appendRadarCancelledDetails(body, result) {
+    body.append(
+      createElement("p", "读取已取消。", "wfr-muted"),
+      createElement(
+        "p",
+        "已保留上一次成功快照，未生成关系变化事件。",
+        "wfr-muted"
+      )
+    );
+    if (typeof result.requestsMade === "number") {
+      addLine(body, "已发请求", result.requestsMade);
+    }
+  }
+
+  function showUpdateSuccess(result) {
+    const body = showPanel("关系雷达更新", true);
+    appendRadarSuccessDetails(body, result);
   }
 
   const PROGRESS_FIELDS = Object.freeze([
@@ -708,22 +778,46 @@
     ["reportedTotal", "接口报告总数"],
   ]);
 
-  function showScanProgress(onCancel) {
-    const body = showPanel("关系雷达更新");
-    body.append(
-      createElement("p", "正在读取可见关注，请保持页面打开。"),
-      createElement("div", null, "wfr-progress")
-    );
+  function populateProgressRows(rows, fields) {
+    rows.textContent = "";
     const values = new Map();
-    const rows = createElement("div", null, "wfr-kv-group");
-    body.append(rows);
-    for (const [key, label] of PROGRESS_FIELDS) {
+    for (const [key, label] of fields) {
       const row = createElement("p", null, "wfr-row wfr-kv");
       const value = createElement("span", "—", "wfr-value");
       row.append(createElement("strong", label), value);
       values.set(key, value);
       rows.append(row);
     }
+    return values;
+  }
+
+  function appendProgressRows(body, fields) {
+    const rows = createElement("div", null, "wfr-kv-group");
+    body.append(rows);
+    let activeFields = fields;
+    let values = populateProgressRows(rows, fields);
+    return {
+      setFields(nextFields) {
+        activeFields = nextFields;
+        values = populateProgressRows(rows, nextFields);
+      },
+      report(progress) {
+        for (const [key] of activeFields) {
+          const reported = progress[key];
+          values.get(key).textContent =
+            typeof reported === "number" ? String(reported) : "—";
+        }
+      },
+    };
+  }
+
+  function showScanProgress(onCancel) {
+    const body = showPanel("关系雷达更新");
+    body.append(
+      createElement("p", "正在读取可见关注，请保持页面打开。"),
+      createElement("div", null, "wfr-progress")
+    );
+    const tracker = appendProgressRows(body, PROGRESS_FIELDS);
     if (typeof onCancel === "function") {
       const cancelButton = createElement("button", "取消", "wfr-button");
       cancelButton.type = "button";
@@ -741,14 +835,7 @@
       actions.append(cancelButton);
       body.append(actions);
     }
-    return function reportProgress(progress) {
-      for (const [key] of PROGRESS_FIELDS) {
-        const value = values.get(key);
-        const reported = progress[key];
-        value.textContent =
-          typeof reported === "number" ? String(reported) : "—";
-      }
-    };
+    return tracker.report;
   }
 
   function showRadarUpdateResult(result) {
@@ -758,17 +845,7 @@
     }
     if (result.failureKind === "RADAR_SCAN_CANCELLED") {
       const body = showPanel("关系雷达已取消", true);
-      body.append(
-        createElement("p", "读取已取消。", "wfr-muted"),
-        createElement(
-          "p",
-          "已保留上一次成功快照，未生成关系变化事件。",
-          "wfr-muted"
-        )
-      );
-      if (typeof result.requestsMade === "number") {
-        addLine(body, "已发请求", result.requestsMade);
-      }
+      appendRadarCancelledDetails(body, result);
       return;
     }
     showFailure("关系雷达更新失败", result);
@@ -806,6 +883,13 @@
     return unseen.result;
   }
 
+  function takeUnseenAllResult(ownerUid) {
+    const unseen = unseenManualAllResult;
+    if (!unseenResultBelongsToCurrentAccount(unseen, ownerUid)) return null;
+    unseenManualAllResult = null;
+    return unseen.result;
+  }
+
   async function updateNow() {
     const startOwner = determineCurrentUid();
     if (manualRadarRun !== null) {
@@ -817,7 +901,7 @@
       }
       return;
     }
-    if (updateRunning || followerUpdateRunning || followerRemovalInFlight) {
+    if (anyRelationshipTaskBusy()) {
       showFailure("关系雷达更新", {
         failureKind: "UPDATE_ALREADY_RUNNING",
       });
@@ -834,6 +918,7 @@
     };
     manualRadarRun = run;
     unseenManualRadarResult = null;
+    unseenManualAllResult = null;
     attachRadarProgress(run);
     updateRunning = true;
     let result;
@@ -919,12 +1004,8 @@
     return labels[result.failureKind] || labels.UNKNOWN_FAILURE;
   }
 
-  function showFollowerFailure(result) {
+  function appendFollowerFailureDetails(body, result) {
     const cancelled = result.failureKind === "FOLLOWER_SCAN_CANCELLED";
-    const body = showPanel(
-      cancelled ? "粉丝快照已取消" : "粉丝快照更新失败",
-      true
-    );
     body.append(
       createElement(
         "p",
@@ -933,6 +1014,13 @@
       )
     );
     appendFailureCode(body, result);
+    if (
+      result.failureKind === "PAGINATION_FAILURE" &&
+      result.reason === "FOLLOWER_SAFETY_CEILING_REACHED" &&
+      typeof result.visibleRecordsCollected === "number"
+    ) {
+      addLine(body, "已读取", result.visibleRecordsCollected);
+    }
     if (typeof result.failedPage === "number") {
       addLine(body, "停止页", result.failedPage);
     }
@@ -985,6 +1073,15 @@
     }
   }
 
+  function showFollowerFailure(result) {
+    const cancelled = result.failureKind === "FOLLOWER_SCAN_CANCELLED";
+    const body = showPanel(
+      cancelled ? "粉丝快照已取消" : "粉丝快照更新失败",
+      true
+    );
+    appendFollowerFailureDetails(body, result);
+  }
+
   function appendFollowerVisibilityNote(body, snapshot) {
     if (!snapshot || !snapshot.filteredVisibilityObserved) return;
     body.append(
@@ -996,8 +1093,7 @@
     );
   }
 
-  function showFollowerUpdateSuccess(result) {
-    const body = showPanel("粉丝快照更新", true);
+  function appendFollowerSuccessDetails(body, result) {
     if (result.baselineCreated) {
       body.append(
         createElement(
@@ -1035,6 +1131,11 @@
     appendFollowerVisibilityNote(body, result.snapshot);
   }
 
+  function showFollowerUpdateSuccess(result) {
+    const body = showPanel("粉丝快照更新", true);
+    appendFollowerSuccessDetails(body, result);
+  }
+
   const FOLLOWER_PROGRESS_FIELDS = Object.freeze([
     ["page", "当前页"],
     ["requestsMade", "已请求"],
@@ -1049,16 +1150,7 @@
       createElement("p", "正在读取 API 可见粉丝，请保持页面打开。"),
       createElement("div", null, "wfr-progress")
     );
-    const values = new Map();
-    const rows = createElement("div", null, "wfr-kv-group");
-    body.append(rows);
-    for (const [key, label] of FOLLOWER_PROGRESS_FIELDS) {
-      const row = createElement("p", null, "wfr-row wfr-kv");
-      const value = createElement("span", "—", "wfr-value");
-      row.append(createElement("strong", label), value);
-      values.set(key, value);
-      rows.append(row);
-    }
+    const tracker = appendProgressRows(body, FOLLOWER_PROGRESS_FIELDS);
     const cancelButton = createElement("button", "取消", "wfr-button");
     cancelButton.type = "button";
     // A reopened panel shows a cancellation that was already requested.
@@ -1075,13 +1167,7 @@
     const actions = createElement("div", null, "wfr-actions");
     actions.append(cancelButton);
     body.append(actions);
-    return function reportProgress(progress) {
-      for (const [key] of FOLLOWER_PROGRESS_FIELDS) {
-        const reported = progress[key];
-        values.get(key).textContent =
-          typeof reported === "number" ? String(reported) : "—";
-      }
-    };
+    return tracker.report;
   }
 
   function showFollowerUpdateResult(result) {
@@ -1105,7 +1191,7 @@
       }
       return;
     }
-    if (followerUpdateRunning || updateRunning || followerRemovalInFlight) {
+    if (anyRelationshipTaskBusy()) {
       showFollowerFailure({ failureKind: "UPDATE_ALREADY_RUNNING" });
       return;
     }
@@ -1121,6 +1207,7 @@
     };
     manualFollowerRun = run;
     unseenManualFollowerResult = null;
+    unseenManualAllResult = null;
     attachFollowerProgress(run);
     followerUpdateRunning = true;
     let result;
@@ -1161,6 +1248,310 @@
       return;
     }
     showFollowerUpdateResult(result);
+  }
+
+  function showAllUpdateProgress(run) {
+    const body = showPanel("一键全部更新");
+    const stageDesc = createElement(
+      "p",
+      "第 1 / 2 步：正在读取可见关注（关系雷达），请保持页面打开。"
+    );
+    const stage1Note = createElement("p", "", "wfr-muted");
+    stage1Note.hidden = true;
+    body.append(stageDesc, createElement("div", null, "wfr-progress"), stage1Note);
+    const tracker = appendProgressRows(body, PROGRESS_FIELDS);
+    const cancelButton = createElement("button", "取消", "wfr-button");
+    cancelButton.type = "button";
+    if (allCancelRequested) {
+      cancelButton.disabled = true;
+      cancelButton.textContent = "正在取消…";
+    }
+    cancelButton.addEventListener("click", () => {
+      allCancelRequested = true;
+      cancelButton.disabled = true;
+      cancelButton.textContent = "正在取消…";
+      run.cancel();
+    });
+    const actions = createElement("div", null, "wfr-actions");
+    actions.append(cancelButton);
+    body.append(actions);
+    return {
+      setStage(stage, radarResult) {
+        if (stage === 2) {
+          stageDesc.textContent =
+            "第 2 / 2 步：正在读取 API 可见粉丝（粉丝快照），请保持页面打开。";
+          if (radarResult && radarResult.ok) {
+            stage1Note.textContent = radarResult.baselineCreated
+              ? "第 1 步已完成：关系雷达首次基线已保存。"
+              : `第 1 步已完成：关系雷达发现 ${radarResult.newEvents.length} 个新事件。`;
+            stage1Note.hidden = false;
+          }
+          tracker.setFields(FOLLOWER_PROGRESS_FIELDS);
+        } else {
+          stageDesc.textContent =
+            "第 1 / 2 步：正在读取可见关注（关系雷达），请保持页面打开。";
+          stage1Note.hidden = true;
+          tracker.setFields(PROGRESS_FIELDS);
+        }
+      },
+      reportProgress(progress) {
+        tracker.report(progress);
+      },
+    };
+  }
+
+  function attachAllProgress(run) {
+    run.ui = showAllUpdateProgress(run);
+    run.root = panelRoot;
+    if (run.stage === 2) {
+      run.ui.setStage(2, run.radarResult);
+    }
+    if (run.latest !== null) {
+      run.ui.reportProgress(run.latest);
+    }
+  }
+
+  function showAllUpdateResult(combined) {
+    const radarOk = Boolean(combined.radarResult && combined.radarResult.ok);
+    const followerOk = Boolean(
+      combined.followerResult && combined.followerResult.ok
+    );
+    const radarCancelled =
+      combined.radarResult &&
+      combined.radarResult.failureKind === "RADAR_SCAN_CANCELLED";
+    const followerCancelled =
+      (combined.followerResult &&
+        combined.followerResult.failureKind === "FOLLOWER_SCAN_CANCELLED") ||
+      (radarOk && combined.followerSkippedReason === "CANCELLED");
+
+    let title;
+    let summaryText;
+    let summaryClass;
+    if (radarOk && followerOk) {
+      title = "一键全部更新完成";
+      summaryText = "关系雷达与粉丝快照均已按顺序更新完成。";
+      summaryClass = "wfr-success";
+    } else if (radarCancelled) {
+      title = "一键全部更新已取消";
+      summaryText = "第 1 步关系雷达已取消，未开始粉丝快照更新。";
+      summaryClass = "wfr-muted";
+    } else if (radarOk && followerCancelled) {
+      title = "一键全部更新部分完成";
+      summaryText =
+        "第 1 步关系雷达已完成并保存，第 2 步粉丝快照已取消，原有粉丝快照保持不变。";
+      summaryClass = "wfr-muted";
+    } else if (radarOk) {
+      title = "一键全部更新部分完成";
+      summaryText =
+        "第 1 步关系雷达已完成并保存，但第 2 步粉丝快照更新失败。";
+      summaryClass = "wfr-error";
+    } else {
+      title = "一键全部更新失败";
+      summaryText =
+        "第 1 步关系雷达更新失败，已停止后续粉丝快照更新。";
+      summaryClass = "wfr-error";
+    }
+
+    const body = showPanel(title, true);
+    body.append(createElement("p", summaryText, summaryClass));
+
+    body.append(createElement("h3", "1. 关系雷达"));
+    if (radarOk) {
+      appendRadarSuccessDetails(body, combined.radarResult);
+    } else if (radarCancelled) {
+      appendRadarCancelledDetails(body, combined.radarResult);
+    } else {
+      appendRadarScanFailureDetails(body, combined.radarResult);
+    }
+
+    body.append(createElement("h3", "2. 粉丝快照"));
+    if (followerOk) {
+      appendFollowerSuccessDetails(body, combined.followerResult);
+    } else if (combined.followerResult !== null) {
+      appendFollowerFailureDetails(body, combined.followerResult);
+    } else {
+      const skippedText =
+        combined.followerSkippedReason === "CANCELLED"
+          ? "由于更新已取消，未启动粉丝快照读取，已保留上一次成功快照。"
+          : "由于第 1 步关系雷达未成功完成，未启动粉丝快照更新，已保留上一次成功快照。";
+      body.append(createElement("p", skippedText, "wfr-muted"));
+    }
+
+    const actions = createElement("div", null, "wfr-actions");
+    const eventsButton = createElement("button", "查看事件", "wfr-button");
+    eventsButton.type = "button";
+    eventsButton.addEventListener("click", viewEvents);
+    const followerEventsButton = createElement(
+      "button",
+      "查看粉丝变化",
+      "wfr-button"
+    );
+    followerEventsButton.type = "button";
+    followerEventsButton.addEventListener("click", viewFollowerEvents);
+    actions.append(eventsButton, followerEventsButton);
+    body.append(actions);
+  }
+
+  async function updateAllNow() {
+    const startOwner = determineCurrentUid();
+    if (manualAllRun !== null) {
+      if (startOwner.ok && startOwner.uid === manualAllRun.ownerUid) {
+        attachAllProgress(manualAllRun);
+      } else {
+        showFailure("一键全部更新", {
+          failureKind: "UPDATE_ALREADY_RUNNING",
+        });
+      }
+      return;
+    }
+    if (anyRelationshipTaskBusy()) {
+      showFailure("一键全部更新", {
+        failureKind: "UPDATE_ALREADY_RUNNING",
+      });
+      return;
+    }
+    allCancelRequested = false;
+    let activeController = new AbortController();
+    const run = {
+      ownerUid: startOwner.ok ? startOwner.uid : null,
+      stage: 1,
+      latest: null,
+      radarResult: null,
+      ui: null,
+      root: null,
+      cancel: () => activeController.abort(),
+    };
+    manualAllRun = run;
+    unseenManualAllResult = null;
+    unseenManualRadarResult = null;
+    unseenManualFollowerResult = null;
+    attachAllProgress(run);
+
+    let radarResult;
+    let followerResult = null;
+    let followerSkippedReason = null;
+    let cancelledFlag = false;
+
+    updateRunning = true;
+    try {
+      try {
+        radarResult = await performUpdate(
+          (progress) => {
+            if (run.stage !== 1) return;
+            run.latest = progress;
+            run.ui.reportProgress(progress);
+          },
+          null,
+          () => allCancelRequested,
+          { cancelSignal: activeController.signal }
+        );
+      } catch (error) {
+        radarResult = {
+          ok: false,
+          failureKind: "UNKNOWN_FAILURE",
+          errorName: error && error.name ? String(error.name) : "Error",
+        };
+      } finally {
+        updateRunning = false;
+      }
+
+      run.radarResult = radarResult;
+      refreshUnreadBadge();
+      cancelledFlag = allCancelRequested;
+
+      if (cancelledFlag || radarResult.failureKind === "RADAR_SCAN_CANCELLED") {
+        followerSkippedReason = "CANCELLED";
+      } else if (!radarResult.ok) {
+        followerSkippedReason = "RADAR_FAILED";
+      } else {
+        const ownerBetweenStages = determineCurrentUid();
+        if (
+          !ownerBetweenStages.ok ||
+          ownerBetweenStages.uid !== run.ownerUid
+        ) {
+          followerResult = {
+            ok: false,
+            failureKind: ownerBetweenStages.ok
+              ? "ACCOUNT_CHANGED_DURING_SCAN"
+              : ownerBetweenStages.failureKind,
+          };
+        } else {
+          // Enter Stage 2 synchronously before awaiting so no task slips in.
+          followerUpdateRunning = true;
+          run.stage = 2;
+          run.latest = null;
+          activeController = new AbortController();
+          if (allCancelRequested) activeController.abort();
+          if (run.ui !== null) run.ui.setStage(2, radarResult);
+          try {
+            followerResult = await performFollowerUpdate(
+              (progress) => {
+                if (run.stage !== 2) return;
+                run.latest = progress;
+                run.ui.reportProgress(progress);
+              },
+              () => allCancelRequested,
+              { cancelSignal: activeController.signal }
+            );
+          } catch (error) {
+            followerResult = {
+              ok: false,
+              failureKind: "UNKNOWN_FAILURE",
+              errorName: error && error.name ? String(error.name) : "Error",
+            };
+          } finally {
+            followerUpdateRunning = false;
+          }
+          cancelledFlag = cancelledFlag || allCancelRequested;
+        }
+      }
+    } finally {
+      updateRunning = false;
+      followerUpdateRunning = false;
+      allCancelRequested = false;
+      manualAllRun = null;
+    }
+
+    const combined = {
+      ok: Boolean(
+        radarResult &&
+          radarResult.ok &&
+          followerResult &&
+          followerResult.ok
+      ),
+      radarResult,
+      followerResult,
+      followerSkippedReason,
+    };
+    const radarCancelled =
+      radarResult && radarResult.failureKind === "RADAR_SCAN_CANCELLED";
+    const followerCancelled =
+      (followerResult &&
+        followerResult.failureKind === "FOLLOWER_SCAN_CANCELLED") ||
+      (radarResult && radarResult.ok && followerSkippedReason === "CANCELLED");
+    const cancelled = Boolean(radarCancelled || followerCancelled || cancelledFlag);
+
+    if (panelRoot !== run.root) {
+      if (!cancelled) {
+        unseenManualAllResult = { ownerUid: run.ownerUid, result: combined };
+      }
+      let launcherText;
+      if (combined.ok) {
+        launcherText = "一键全部更新完成";
+      } else if (radarCancelled) {
+        launcherText = "一键全部更新已取消";
+      } else if (cancelled) {
+        launcherText = "关系雷达完成，粉丝快照已取消";
+      } else if (radarResult && radarResult.ok) {
+        launcherText = "关系雷达完成，粉丝快照失败";
+      } else {
+        launcherText = "一键全部更新失败";
+      }
+      setLauncherStatus(launcherText, AUTO_STATUS_DURATION_MS);
+      refreshOpenToolkitHome();
+      return;
+    }
+    showAllUpdateResult(combined);
   }
 
   // Local notification housekeeping only, run inside the follower state lock. The
@@ -1208,39 +1599,92 @@
     );
   }
 
-  function matchesFollowerEventQuery(event, query) {
+  const FOLLOWER_EVENT_EXPORT_COLUMNS = Object.freeze([
+    "观察时间",
+    "事件类型",
+    "事件说明",
+    "UID",
+    "记录昵称",
+  ]);
+
+  function buildFollowerEventExportRows(events) {
+    return events.map((event) => [
+      event.observedAt,
+      event.type,
+      FOLLOWER_EVENT_LABELS[event.type] || event.type,
+      event.uid,
+      event.displayName || "",
+    ]);
+  }
+
+  function buildFollowerEventExportMarkdown(ownerUid, events, exportedAt) {
+    const lines = [
+      "# Weibo Toolkit 粉丝变化事件导出",
+      "",
+      `- 账号 UID：${ownerUid}`,
+      `- 导出时间：${exportedAt.toISOString()}`,
+      `- 导出事件数：${events.length}`,
+      `- Weibo Toolkit 版本：${APP_VERSION}`,
+      "",
+      "> 本文件仅包含粉丝快照实际读取到的 API 可见粉丝变化记录，不代表微博全量粉丝变化，也无法判断减少或消失的具体原因。",
+      "",
+    ];
+    if (events.length === 0) {
+      lines.push("暂无匹配的粉丝变化事件。", "");
+      return lines.join("\n");
+    }
+    lines.push(
+      ...buildExportMarkdownTable(
+        FOLLOWER_EVENT_EXPORT_COLUMNS,
+        buildFollowerEventExportRows(events)
+      ),
+      ""
+    );
+    return lines.join("\n");
+  }
+
+  function matchesFollowerEventQuery(event, query, notesByUid = null) {
     const needle = String(query || "").trim().toLowerCase();
     if (needle === "") return true;
+    if (
+      notesByUid !== null &&
+      hasOwn(notesByUid, event.uid) &&
+      friendNoteMatchesSearchText(notesByUid[event.uid], needle)
+    ) {
+      return true;
+    }
     return [event.displayName, event.uid].some(
       (value) => typeof value === "string" && value.toLowerCase().includes(needle)
     );
   }
 
   function renderFollowerEvents(ownerUid, state, initialQueryOrView = "") {
+    const rawView = isPlainObject(initialQueryOrView) ? initialQueryOrView : {};
     const view =
       typeof initialQueryOrView === "string"
         ? {
             query: initialQueryOrView,
+            type: "ALL",
             shown: FRIEND_NOTES_PAGE_SIZE,
             scrollTop: 0,
           }
         : {
-            query:
-              initialQueryOrView && typeof initialQueryOrView.query === "string"
-                ? initialQueryOrView.query
-                : "",
+            query: typeof rawView.query === "string" ? rawView.query : "",
+            type:
+              typeof rawView.type === "string" &&
+              hasOwn(FOLLOWER_EVENT_LABELS, rawView.type)
+                ? rawView.type
+                : "ALL",
             shown:
-              initialQueryOrView &&
-              typeof initialQueryOrView.shown === "number" &&
-              Number.isFinite(initialQueryOrView.shown) &&
-              initialQueryOrView.shown >= FRIEND_NOTES_PAGE_SIZE
-                ? initialQueryOrView.shown
+              typeof rawView.shown === "number" &&
+              Number.isFinite(rawView.shown) &&
+              rawView.shown >= FRIEND_NOTES_PAGE_SIZE
+                ? rawView.shown
                 : FRIEND_NOTES_PAGE_SIZE,
             scrollTop:
-              initialQueryOrView &&
-              typeof initialQueryOrView.scrollTop === "number" &&
-              Number.isFinite(initialQueryOrView.scrollTop)
-                ? initialQueryOrView.scrollTop
+              typeof rawView.scrollTop === "number" &&
+              Number.isFinite(rawView.scrollTop)
+                ? rawView.scrollTop
                 : 0,
           };
     const body = showPanel("粉丝变化", true);
@@ -1264,13 +1708,34 @@
       "wfr-button"
     );
     clearAllButton.type = "button";
-    clearAllActions.append(clearAllButton);
+    const exportCsvButton = createElement("button", "导出 CSV", "wfr-button");
+    const exportMdButton = createElement(
+      "button",
+      "导出 Markdown",
+      "wfr-button"
+    );
+    exportCsvButton.type = "button";
+    exportMdButton.type = "button";
+    clearAllActions.append(clearAllButton, exportCsvButton, exportMdButton);
     const clearAllPanel = createElement("div", null, "wfr-batch-panel");
     const search = createElement("input", null, "wfr-search");
     search.type = "search";
-    search.placeholder = "搜索昵称或 UID";
-    search.setAttribute("aria-label", "搜索昵称或 UID");
+    search.placeholder = "搜索昵称、UID 或友人备注/标签";
+    search.setAttribute("aria-label", "搜索昵称、UID 或友人备注/标签");
     search.value = view.query;
+    const filterRow = createElement("div", null, "wfr-filter-row");
+    const typeSelect = createElement("select", null, "wfr-select");
+    typeSelect.setAttribute("aria-label", "按粉丝变化类型筛选");
+    for (const [value, label] of [
+      ["ALL", "全部变化类型"],
+      ...Object.entries(FOLLOWER_EVENT_LABELS),
+    ]) {
+      const option = createElement("option", label);
+      option.value = value;
+      typeSelect.append(option);
+    }
+    typeSelect.value = view.type;
+    filterRow.append(typeSelect);
     const summary = createElement("p", "", "wfr-muted");
     summary.setAttribute("role", "status");
     summary.setAttribute("aria-live", "polite");
@@ -1287,6 +1752,7 @@
       clearAllActions,
       clearAllPanel,
       search,
+      filterRow,
       summary,
       status,
       emptyNote,
@@ -1296,14 +1762,21 @@
 
     const renderedCards = new Map();
 
+    function currentDesiredEvents() {
+      const allSorted = sortFollowerEventsNewestFirst(events);
+      const selectedType = typeSelect.value;
+      return allSorted.filter(
+        (event) =>
+          (selectedType === "ALL" || event.type === selectedType) &&
+          matchesFollowerEventQuery(event, search.value || "", notedUids)
+      );
+    }
+
     // Reconciles the rendered cards with the freshly persisted event list. Cards
     // that survived keep their nodes; events another tab added since this view
     // opened appear instead of being silently dropped from the count.
     function syncList(preserveExistingOrder = false) {
-      const allSorted = sortFollowerEventsNewestFirst(events);
-      const desired = allSorted.filter((event) =>
-        matchesFollowerEventQuery(event, search.value || "")
-      );
+      const desired = currentDesiredEvents();
       const visibleDesired = desired.slice(0, shownLimit);
       const visibleIds = new Set(visibleDesired.map((event) => event.id));
       for (const [id, node] of [...renderedCards]) {
@@ -1328,7 +1801,10 @@
       const noEvents = events.length === 0;
       const noMatches = matchingCount === 0;
       search.hidden = noEvents;
+      filterRow.hidden = noEvents;
       summary.hidden = noEvents;
+      exportCsvButton.disabled = noMatches;
+      exportMdButton.disabled = noMatches;
       summary.textContent = noEvents
         ? ""
         : matchingCount === events.length
@@ -1378,6 +1854,9 @@
           )
         );
       }
+      if (notedUids !== null && hasOwn(notedUids, event.uid)) {
+        appendFriendNoteInlineSummary(item, notedUids[event.uid]);
+      }
       const actions = createElement("div", null, "wfr-actions");
       const clearButton = createElement("button", "清除这条", "wfr-button");
       clearButton.type = "button";
@@ -1404,6 +1883,7 @@
         noteButton.addEventListener("click", () => {
           const savedView = {
             query: String(search.value || ""),
+            type: typeSelect.value,
             shown: Math.max(FRIEND_NOTES_PAGE_SIZE, renderedCards.size),
             scrollTop: Number(body.scrollTop) || 0,
           };
@@ -1422,6 +1902,62 @@
       return item;
     }
 
+    function exportFilteredFollowerEvents(format) {
+      const exported = currentDesiredEvents();
+      const exportedAt = new Date();
+      const isCsv = format === "csv";
+      const extension = isCsv ? "csv" : "md";
+      const filename = namedExportFilename(
+        "weibo-toolkit-follower-events",
+        ownerUid,
+        exportedAt,
+        extension
+      );
+      const savedView = {
+        query: String(search.value || ""),
+        type: typeSelect.value,
+        shown: Math.max(FRIEND_NOTES_PAGE_SIZE, renderedCards.size),
+        scrollTop: Number(body.scrollTop) || 0,
+      };
+      deliverTableExport({
+        panelTitle: "已请求浏览器下载粉丝变化",
+        failureTitle: "导出粉丝变化",
+        successText:
+          "粉丝变化文件已交给浏览器下载，保存位置及最终文件名由浏览器下载设置决定。",
+        formatLabel: isCsv ? "CSV" : "Markdown",
+        filename,
+        mimeType: isCsv
+          ? "text/csv;charset=utf-8"
+          : "text/markdown;charset=utf-8",
+        content: isCsv
+          ? buildExportCsv(
+              FOLLOWER_EVENT_EXPORT_COLUMNS,
+              buildFollowerEventExportRows(exported)
+            )
+          : buildFollowerEventExportMarkdown(ownerUid, exported, exportedAt),
+        countLabel: "已导出事件数",
+        count: exported.length,
+        onBack: () => {
+          const fresh = loadFollowerState(ownerUid);
+          renderFollowerEvents(
+            ownerUid,
+            fresh.ok ? fresh.state : { ...state, events },
+            savedView
+          );
+        },
+      });
+    }
+
+    exportCsvButton.addEventListener("click", () =>
+      exportFilteredFollowerEvents("csv")
+    );
+    exportMdButton.addEventListener("click", () =>
+      exportFilteredFollowerEvents("markdown")
+    );
+    typeSelect.addEventListener("change", () => {
+      shownLimit = FRIEND_NOTES_PAGE_SIZE;
+      syncList(false);
+    });
     search.addEventListener("input", () => {
       shownLimit = FRIEND_NOTES_PAGE_SIZE;
       syncList(false);

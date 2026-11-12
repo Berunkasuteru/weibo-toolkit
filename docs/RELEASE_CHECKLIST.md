@@ -2,50 +2,48 @@
 
 Automated tests and synthetic DOM fixtures do not replace live Weibo pages. Before publishing a release, walk through this checklist (~10 minutes) in a logged-in desktop browser. No real follower-removal request needs to be sent (stop at the confirmation dialog in Section 5).
 
-## 1. Startup & Home
+## 1. Startup, Home & Unified Updates
 
 - [ ] Open `https://weibo.com/`; the bottom-right **Weibo Toolkit** launcher button appears.
-- [ ] Open the Home panel; all four module cards and **备份与设置** render without horizontal scrolling.
+- [ ] Open Home; the **Update All** card, four module cards, and **Backup & Settings** section render without horizontal scrolling.
 - [ ] Press `Escape` to close the panel; focus returns to the launcher button.
 - [ ] Narrow the window to half width; no panel content is clipped.
+- [ ] Start **Update All**; confirm Step 1 (Friend Radar) transitions cleanly into Step 2 (Follower Snapshot), single-module update buttons remain disabled mid-run, cancelling mid-Step 1 preserves both baselines, and cancelling mid-Step 2 preserves the saved Friend Radar snapshot.
+- [ ] Close the progress panel mid-scan and reopen Home; the active card displays **View Progress**, and background completion enables **View Result**.
 
-## 2. Friend Radar & Follower Snapshot
+## 2. Friend Radar, Events & Overview
 
-- [ ] Click **立即更新**; progress counters update and the animation runs.
-- [ ] Close the panel while scanning and reopen Home; the button shows **查看进度** and reopens the progress view.
-- [ ] Click **立即更新** or **更新粉丝快照**, then click **取消** mid-scan; the scan aborts cleanly within a few seconds without modifying the stored snapshot.
-- [ ] Open **查看事件**; each account is grouped into a single card, and returns from detail/timeline/note views restore your search and scroll position.
+- [ ] Filter Relationship Events by type and unread-only status, search by nickname/UID/Friend Note, and test card/detail quick mark-as-read; verify search/filter/scroll state restores on return.
+- [ ] Filter Follower Events by type and search by Friend Note, then export filtered Follower Events as CSV and Markdown.
+- [ ] Search Relationship Overview by Friend Note content/tag and export the filtered following list as CSV and Markdown.
 
-## 3. Friend Notes
+## 3. Friend Notes & Feed Bookmarks
 
-- [ ] Open another user's `/u/<UID>` profile and save a note via **友人档案**.
-- [ ] Start editing a note and click **关闭** without saving; the unsaved-changes confirmation appears.
-- [ ] Enable **在主页显示友人档案**; the note panel renders cleanly on the profile page.
-- [ ] Enable **在信息流显示友人档案**; bookmarks appear beside authors on the home and latest feeds (solid when noted, hollow otherwise, with a dot indicator when previous local nicknames exist).
-- [ ] Click a feed bookmark; the floating card stays within the viewport and remains legible in dark mode.
+- [ ] Open another user's `/u/<UID>` profile and save a note via **Friend Notes**.
+- [ ] In the Friend Notes manager, use **Create / View by UID** to jump to a UID, verify invalid input errors, and export current filtered notes as CSV and Markdown.
+- [ ] Start editing a note and click **Close** without saving; verify the unsaved-changes confirmation appears.
+- [ ] Enable **Show Friend Notes on feed**; confirm compact icon-only bookmarks appear beside authors (solid when noted, dot badge for local historical nicknames) without layout jitter, and clicking opens a viewport-safe card in light/dark themes.
 
-## 4. Browsing Experience
+## 4. Browsing Experience & Stepmeter
 
-- [ ] Toggle each switch under the **净化** tab; the corresponding page element hides and restores immediately.
-- [ ] Enable **隐藏信息流中的推广内容** and scroll several screens; no layout jumps or blank gaps remain.
-- [ ] Enable **显示主页小档案** and visit another user's profile; local facts and visit counts render as expected.
+- [ ] Toggle each switch under the **Cleanup** tab; the corresponding page element hides and restores immediately.
+- [ ] Enable **Hide promoted feed posts** and scroll several screens; no layout jumps or blank gaps remain.
+- [ ] Enable **Show profile mini-facts** and visit another user's profile; local facts and visit counts render as expected.
 
-## 5. Follower Hygiene
+## 5. Follower Hygiene & Removal Log
 
-- [ ] Set filter criteria, save a preset, reset filters via **重置筛选**, and re-apply the preset.
-- [ ] Click **选择当前页**, navigate to another page and back; selections persist.
-- [ ] Click **按顺序选满**; the status line reports how many selected accounts are off-page.
-- [ ] Mutual followings and accounts with Friend Notes display the skip notice and are skipped by bulk selection.
-- [ ] Change **排序**; the list reorders and clears prior selections.
-- [ ] Open **移除记录**, verify search and empty/populated states, then return to Hygiene; filters, page, and scroll position are restored.
-- [ ] Click **移除所选粉丝**; the confirmation lists all selected accounts with the exact count on the confirm button. **Click 取消 (do not confirm).**
+- [ ] Filter by Friend Note status (`has note` / `no note`), Friend Note tag, minimum follower/post counts, and registration cutoff; verify sorting by follower/post counts descending keeps missing values last.
+- [ ] Save a preset, reset filters, and re-apply the preset.
+- [ ] Use **Select Page** and **Select in Order** across pages; confirm mutuals and noted accounts display skip notices and are excluded from bulk selection.
+- [ ] Open **Removal Log**, check search and CSV export, then return to Hygiene; filters, page, and scroll position are restored.
+- [ ] Click **Remove Selected Followers**; verify the confirmation list and exact count, then **Cancel (do not confirm)**.
 
 ## 6. Private Message Export
 
-- [ ] Open a 1-on-1 conversation at `https://api.weibo.com/chat*`; the **导出 Markdown** control renders at the top without overlapping native buttons and respects the active Toolkit theme.
-- [ ] Export a short conversation; the generated `.md` file matches the conversation history.
+- [ ] Open a 1-on-1 conversation at `https://api.weibo.com/chat*`; the export controls render without overlapping native buttons and follow the active Toolkit theme.
+- [ ] Export a short conversation; verify the downloaded `.md` filename includes the participant name/UID and matches the conversation history.
 
-## 7. Backup & Restore
+## 7. Backup & Restore (`Backup v4`)
 
-- [ ] Click **导出备份** to download a JSON backup file.
-- [ ] Click **恢复备份**, choose the exported file, and verify the preview counts match current state. **Click ← 返回 (do not confirm).**
+- [ ] Click **Export Backup** to download a `v4` JSON file.
+- [ ] Click **Restore Backup**, select the exported file, and verify preview counts across all seven domains match current state (including explicit `null` domain indicators), then **Back (do not confirm)**.

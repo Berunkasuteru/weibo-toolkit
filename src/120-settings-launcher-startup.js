@@ -471,6 +471,72 @@
     body.classList.add("wfr-home");
     const grid = createElement("div", null, "wfr-home-grid");
     body.append(grid);
+
+    const radarRunning =
+      manualRadarRun !== null && manualRadarRun.ownerUid === uidResult.uid;
+    const followerRunning =
+      manualFollowerRun !== null && manualFollowerRun.ownerUid === uidResult.uid;
+    const allRunning =
+      manualAllRun !== null && manualAllRun.ownerUid === uidResult.uid;
+    const manualAllActive = manualAllRun !== null;
+    const autoRadarRunning = updateRunning && !radarRunning && !manualAllActive;
+    const autoFollowerRunning =
+      followerUpdateRunning && !followerRunning && !manualAllActive;
+    const anyTaskBusy = anyRelationshipTaskBusy();
+
+    const allSection = createElement(
+      "section",
+      null,
+      "wfr-home-module wfr-home-shortcut wfr-home-all-update"
+    );
+    const allTitle = createElement("h3", null, "wfr-home-module-title");
+    allTitle.append(createElement("strong", "一键全部更新"));
+    const allActions = createElement("div", null, "wfr-actions");
+    const allUpdateButton = createElement(
+      "button",
+      allRunning ? "查看进度" : "一键全部更新",
+      "wfr-button wfr-primary"
+    );
+    allUpdateButton.type = "button";
+    if (!allRunning && anyTaskBusy) {
+      allUpdateButton.disabled = true;
+    }
+    allUpdateButton.addEventListener("click", () => {
+      if (allRunning && manualAllRun === null) {
+        const result = takeUnseenAllResult(uidResult.uid);
+        if (result !== null) showAllUpdateResult(result);
+        else showToolkitHome();
+        return;
+      }
+      void updateAllNow();
+    });
+    allActions.append(allUpdateButton);
+    allSection.append(
+      allTitle,
+      createElement(
+        "p",
+        allRunning
+          ? "正在按顺序更新关系雷达与粉丝快照…"
+          : "依次更新关系雷达（可见关注）与粉丝快照（可见粉丝）。",
+        "wfr-muted wfr-home-description"
+      ),
+      allActions
+    );
+    appendUnseenUpdateResult(
+      allSection,
+      allActions,
+      unseenManualAllResult !== null &&
+        unseenManualAllResult.ownerUid === uidResult.uid
+        ? unseenManualAllResult.result
+        : null,
+      () => {
+        const result = takeUnseenAllResult(uidResult.uid);
+        if (result !== null) showAllUpdateResult(result);
+        else showToolkitHome();
+      }
+    );
+    grid.append(allSection);
+
     const radarSection = createElement("section", null, "wfr-home-module");
     grid.append(radarSection);
     const moduleTitle = createElement("h3", null, "wfr-home-module-title");
@@ -506,14 +572,6 @@
       }
     }
 
-    const radarRunning =
-      manualRadarRun !== null && manualRadarRun.ownerUid === uidResult.uid;
-    const followerRunning =
-      manualFollowerRun !== null && manualFollowerRun.ownerUid === uidResult.uid;
-    const autoRadarRunning = updateRunning && !radarRunning;
-    const autoFollowerRunning = followerUpdateRunning && !followerRunning;
-    const anyTaskBusy =
-      updateRunning || followerUpdateRunning || followerRemovalInFlight;
     if (autoRadarRunning) {
       radarSection.append(
         createElement("p", "后台自动更新正在进行…", "wfr-muted wfr-home-hint")
@@ -864,6 +922,12 @@
       .wfr-muted { color: var(--wfr-muted); }
       .wfr-search { width: 100%; box-sizing: border-box; margin-top: 12px; padding: 9px 12px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; transition: border-color 120ms ease; }
       .wfr-search::placeholder { color: var(--wfr-muted); opacity: 1; }
+      .wfr-filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-top: 10px; }
+      .wfr-filter-row[hidden] { display: none; }
+      .wfr-card-note-summary { margin: 8px 0 0; padding: 6px 10px; border-left: 2px solid var(--wfr-accent); border-radius: var(--wfr-radius-s); background: var(--wfr-panel-bg); }
+      .wfr-card-note-summary .wfr-note-tags { margin: 0 0 4px; }
+      .wfr-card-note-summary .wfr-note-tags:last-child { margin-bottom: 0; }
+      .wfr-card-note-text { -webkit-line-clamp: 2; margin: 0; font-size: 13px; }
       .wfr-select { max-width: 100%; padding: 7px 10px; border: 1px solid var(--wfr-control-border); border-radius: var(--wfr-radius-m); background: var(--wfr-field-bg); color: var(--wfr-field-text); font: inherit; transition: border-color 120ms ease; }
       .wfr-toggle { display: flex; align-items: center; gap: 8px; }
       .wfr-browse-tabs { display: flex; flex-wrap: wrap; box-sizing: border-box; gap: 4px; width: fit-content; max-width: 100%; margin: 0 0 20px; padding: 4px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-m); background: var(--wfr-card-bg); }
@@ -952,6 +1016,7 @@
       .wfr-home .wfr-home-shortcut .wfr-home-module-title { margin: 0; }
       .wfr-home-shortcut > .wfr-home-description, .wfr-home-shortcut > .wfr-kv-group, .wfr-home-shortcut > .wfr-home-hint { grid-column: 1 / -1; margin: 0; }
       .wfr-home-shortcut > .wfr-actions { grid-column: 2; grid-row: 1; margin: 0; padding: 0; }
+      .wfr-home-all-update { grid-column: 1 / -1; }
       .wfr-home-tools { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--wfr-border); }
       .wfr-home-tools .wfr-actions { margin-top: 0; }
       .wfr-home .wfr-changelog-footer { display: flex; justify-content: flex-end; margin: 12px 0 0; }
@@ -1006,8 +1071,6 @@
       .wfr-feed-note-entry.wfr-feed-note-has.wfr-feed-note-has-hint { opacity: 1; }
       .wfr-feed-note-entry.wfr-feed-note-has-hint:hover, .wfr-feed-note-entry.wfr-feed-note-has-hint:focus-visible, .wfr-feed-note-entry.wfr-feed-note-has-hint[aria-expanded="true"] { opacity: 1; }
       .wfr-feed-note-entry.wfr-feed-note-has-hint::after { content: ""; position: absolute; top: 3px; right: 3px; width: 5px; height: 5px; border-radius: 999px; background: var(--wfr-accent); }
-      .wfr-feed-note-hint { display: none; }
-      .wfr-feed-note-hint[hidden] { display: none; }
       .wfr-feed-note-card { position: absolute; top: 0; left: 0; z-index: 2147482500; box-sizing: border-box; display: flex; flex-direction: column; width: min(360px, calc(100vw - 24px)); max-height: min(560px, calc(100vh - 24px)); overflow: hidden; padding: 14px 16px; border: 1px solid var(--wfr-border); border-radius: var(--wfr-radius-l); background: var(--wfr-panel-bg); color: var(--wfr-panel-text); box-shadow: var(--wfr-panel-shadow); font: 14px/1.55 var(--wfr-sans); font-weight: 400; overflow-wrap: anywhere; }
       .wfr-feed-note-card:focus { outline: none; }
       .wfr-feed-note-card:focus-visible { outline: 2px solid var(--wfr-accent); outline-offset: 1px; }

@@ -13,10 +13,17 @@
     )}.json`;
   }
 
+  function namedExportFilename(prefix, ownerUid, exportedAt, extension) {
+    return `${prefix}-${ownerUid}-${exportTimestamp(exportedAt)}.${extension}`;
+  }
+
   function eventExportFilename(ownerUid, exportedAt, extension) {
-    return `weibo-toolkit-friend-radar-events-${ownerUid}-${exportTimestamp(
-      exportedAt
-    )}.${extension}`;
+    return namedExportFilename(
+      "weibo-toolkit-friend-radar-events",
+      ownerUid,
+      exportedAt,
+      extension
+    );
   }
 
   // followerState is always present in v2: an object reproduces the durable
@@ -27,12 +34,16 @@
   // friendNotes follows the same rule from v3 on: the durable Friend Notes
   // state, or an explicit null when none was stored. The caller must say which;
   // an omitted argument is refused rather than exported as "no notes".
+  //
+  // From v4 on, extraDomains explicitly declares coverage (object or null) for
+  // followerRemovalLog, followerHygienePresets, usageState, and profileVisits.
   function createBackup(
     ownerUid,
     state,
     followerState,
     exportedAt,
-    friendNotesState
+    friendNotesState,
+    extraDomains
   ) {
     if (state.ownerUid !== ownerUid) {
       throw new Error("Backup owner UID mismatch");
@@ -46,6 +57,31 @@
     if (friendNotesState !== null && friendNotesState.ownerUid !== ownerUid) {
       throw new Error("Backup friend notes owner UID mismatch");
     }
+    if (!isPlainObject(extraDomains)) {
+      throw new Error("Backup v4 domain coverage not stated");
+    }
+    for (const key of [
+      "followerRemovalLog",
+      "followerHygienePresets",
+      "usageState",
+      "profileVisits",
+    ]) {
+      if (typeof extraDomains[key] === "undefined") {
+        throw new Error(`Backup ${key} coverage not stated`);
+      }
+    }
+    const {
+      followerRemovalLog,
+      followerHygienePresets,
+      usageState,
+      profileVisits,
+    } = extraDomains;
+    if (
+      followerRemovalLog !== null &&
+      followerRemovalLog.ownerUid !== ownerUid
+    ) {
+      throw new Error("Backup follower removal log owner UID mismatch");
+    }
     return {
       backupFormat: BACKUP_FORMAT,
       backupVersion: BACKUP_VERSION,
@@ -55,6 +91,10 @@
       state,
       followerState,
       friendNotes: friendNotesState,
+      followerRemovalLog,
+      followerHygienePresets,
+      usageState,
+      profileVisits,
     };
   }
 
@@ -106,14 +146,19 @@
     return `"${neutralizeSpreadsheetFormula(String(value)).replace(/"/g, '""')}"`;
   }
 
-  function buildEventCsv(events) {
-    const rows = [
-      EVENT_EXPORT_COLUMNS,
-      ...sortEventsNewestFirst(events).map(eventExportRow),
-    ];
+  function buildExportCsv(columns, rows) {
     // The BOM stops Excel/WPS from guessing a legacy codepage; CRLF follows RFC 4180.
-    const body = rows.map((row) => row.map(csvField).join(",")).join("\r\n");
+    const body = [columns, ...rows]
+      .map((row) => row.map(csvField).join(","))
+      .join("\r\n");
     return `${UTF8_BOM}${body}\r\n`;
+  }
+
+  function buildEventCsv(events) {
+    return buildExportCsv(
+      EVENT_EXPORT_COLUMNS,
+      sortEventsNewestFirst(events).map(eventExportRow)
+    );
   }
 
   function markdownCell(value) {
@@ -121,6 +166,14 @@
       .replace(/\\/g, "\\\\")
       .replace(/\|/g, "\\|")
       .replace(/\r?\n/g, " ");
+  }
+
+  function buildExportMarkdownTable(columns, rows) {
+    return [
+      `| ${columns.join(" | ")} |`,
+      `| ${columns.map(() => "---").join(" | ")} |`,
+      ...rows.map((row) => `| ${row.map(markdownCell).join(" | ")} |`),
+    ];
   }
 
   function buildEventMarkdown(ownerUid, events, exportedAt) {
@@ -143,13 +196,12 @@
       return lines.join("\n");
     }
     lines.push(
-      `| ${EVENT_EXPORT_COLUMNS.join(" | ")} |`,
-      `| ${EVENT_EXPORT_COLUMNS.map(() => "---").join(" | ")} |`
+      ...buildExportMarkdownTable(
+        EVENT_EXPORT_COLUMNS,
+        ordered.map(eventExportRow)
+      ),
+      ""
     );
-    for (const event of ordered) {
-      lines.push(`| ${eventExportRow(event).map(markdownCell).join(" | ")} |`);
-    }
-    lines.push("");
     return lines.join("\n");
   }
 

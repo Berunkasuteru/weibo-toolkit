@@ -393,7 +393,11 @@
       let fileHandle;
       try {
         fileHandle = await picker.showSaveFilePicker.call(picker, {
-          suggestedName: privateMessageFilename(startedAt),
+          suggestedName: privateMessageFilename(
+            startedAt,
+            context.participantName,
+            context.participantUid
+          ),
           types: [
             {
               description: "Markdown",
@@ -475,7 +479,11 @@
           result.records,
           result.termination
         );
-        const filename = privateMessageFilename(session.startedAt);
+        const filename = privateMessageFilename(
+          session.startedAt,
+          session.participantName,
+          session.participantUid
+        );
         if (options.fileHandle) {
           await writeMarkdownToChosenFile(options.fileHandle, markdown);
         } else {

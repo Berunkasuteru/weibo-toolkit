@@ -23,7 +23,6 @@ const NAMES = [
   "reconcileCurrentPageFeed",
   "resolveFeedAuthorIdentity",
   "feedNicknameHintText",
-  "feedEntryLayout",
   "computeFeedFriendNoteCardPlacement",
   "showFriendNoteDetail",
   "loadPageCleanupPreferences",
@@ -181,13 +180,24 @@ function openFeed(preferences, storage = {}) {
         node.classList.contains("wfr-feed-note-entry")
       );
       assert(buttons.length <= 1, "a card must never carry two entries");
+      assert(
+        findAll(parts.card, (node) =>
+          node.classList.contains("wfr-feed-note-hint")
+        ).length === 0,
+        "icon-only feed entry must not render an inline hint span"
+      );
       return buttons[0] || null;
     },
+    hasNote: (parts) =>
+      Boolean(view.entry(parts)?.classList.contains("wfr-feed-note-has")),
+    hasHint: (parts) =>
+      Boolean(view.entry(parts)?.classList.contains("wfr-feed-note-has-hint")),
     hint(parts) {
-      const hints = findAll(parts.card, (node) =>
-        node.classList.contains("wfr-feed-note-hint")
-      );
-      return hints.length === 1 && !hints[0].hidden ? hints[0].textContent : "";
+      const entry = view.entry(parts);
+      if (!entry || !entry.classList.contains("wfr-feed-note-has-hint")) return "";
+      const label = entry.getAttribute("aria-label") || "";
+      const index = label.indexOf("；");
+      return index === -1 ? "" : label.slice(index + 1);
     },
     cards: () =>
       findAll(dom.document.body, (node) => node.id === "wfr-feed-note-card"),
@@ -262,14 +272,12 @@ async function switchesAndEntries() {
   );
 
   assert(
-    view.entry(lan).textContent === "有备注" &&
-      view.entry(lan).classList.contains("wfr-feed-note-has"),
-    "an author with a note is marked"
+    view.entry(lan).textContent === "" && view.hasNote(lan),
+    "an author with a note is marked on the icon entry"
   );
   assert(
-    view.entry(bo).textContent === "写备注" &&
-      !view.entry(bo).classList.contains("wfr-feed-note-has"),
-    "an author without a note gets the low-key entry"
+    view.entry(bo).textContent === "" && !view.hasNote(bo),
+    "an author without a note gets the low-key icon entry"
   );
   assert(
     view.entry(lan).getAttribute("aria-label").includes("阿岚Lan") &&
@@ -279,8 +287,7 @@ async function switchesAndEntries() {
   );
   // Identity is the UID: the same nickname on two accounts never shares a note.
   assert(
-    view.entry(twinNoted).textContent === "有备注" &&
-      view.entry(twinPlain).textContent === "写备注",
+    view.hasNote(twinNoted) && !view.hasNote(twinPlain),
     "accounts sharing a nickname must not share a note"
   );
   assert(view.entry(mine) === null, "the owner's own posts get no entry");
@@ -401,7 +408,7 @@ function authorIdentity() {
 
   view.install();
   assert(
-    view.entry(repost).textContent === "写备注" && view.wrappers(repost.card).length === 1,
+    !view.hasNote(repost) && view.wrappers(repost.card).length === 1,
     "the reposted author's note must not mark the reposter's card"
   );
   assert(
@@ -453,12 +460,24 @@ function authorIdentity() {
       view.wrappers(pureRepost.repost).length === 0,
     "a pure repost places its entry between the outer usercard name and repost label"
   );
-  assert(view.entry(noisy).textContent === "写备注", "mentions and commenters do not mark a card");
+  assert(!view.hasNote(noisy) && view.entry(noisy) !== null, "mentions and commenters do not mark a card");
   for (const skipped of [profileConflict, permalinkConflict, noPermalink]) {
     assert(view.entry(skipped) === null, "an unprovable author gets no entry");
   }
+  const subpathProfile = view.add({
+    uid: "4004",
+    name: "子标签作者",
+    profileHref: "/u/4004/weibo",
+    nameHref: "/u/4004/weibo",
+  });
+  view.reconcile();
   assert(
-    view.entry(customDomain).textContent === "写备注" && view.hint(customDomain) === "" &&
+    resolve(subpathProfile).uid === "4004" &&
+      resolve(subpathProfile).pageName === "子标签作者",
+    "a /u/<uid>/weibo profile link in the card header still identifies the author"
+  );
+  assert(
+    !view.hasNote(customDomain) && view.hint(customDomain) === "" &&
       customDomain.permalink.nextSibling.classList.contains("wfr-feed-note"),
     "a UID-only author uses the permalink fallback without guessing a name anchor"
   );
@@ -617,7 +636,7 @@ async function cardAndQuickEdit() {
   view.browser.locksAvailable = true;
   assert(
     !(BO in view.stored()) &&
-      view.entry(bo).textContent === "写备注" &&
+      !view.hasNote(bo) &&
       textarea(boCard).value === "写到一半" &&
       statusText(boCard).includes("未保存"),
     "a failed save shows nothing as saved and keeps the input"
@@ -630,7 +649,7 @@ async function cardAndQuickEdit() {
     "the note is saved under the author's own UID"
   );
   assert(
-    view.entry(bo).textContent === "有备注" && view.entry(lan).textContent === "有备注",
+    view.hasNote(bo) && view.hasNote(lan),
     "the mounted entry reflects the save"
   );
 
@@ -647,7 +666,7 @@ async function cardAndQuickEdit() {
   await findButton(view.card(), "确认删除").click();
   assert(
     !(BO in view.stored()) &&
-      view.entry(bo).textContent === "写备注" &&
+      !view.hasNote(bo) &&
       view.card().textContent.includes("还没有为此账号写下备注或标签"),
     "after a delete the entry and the card return to the no-note state"
   );
@@ -685,7 +704,7 @@ async function recycledNodes() {
   );
   const newEntry = view.entry(node);
   assert(
-    newEntry !== oldEntry && newEntry.textContent === "写备注",
+    newEntry !== oldEntry && !view.hasNote(node) && newEntry.textContent === "",
     "the recycled node gets a new entry for its new author"
   );
   assert(
@@ -725,7 +744,7 @@ async function recycledNodes() {
     "a recycled node must not discard a draft; the card says whose it is"
   );
   assert(
-    view.entry(node) !== draftEntry && view.entry(node).textContent === "有备注",
+    view.entry(node) !== draftEntry && view.hasNote(node),
     "the node itself already shows the new author's entry"
   );
   await findButton(draftCard, "保存").click();
@@ -755,7 +774,7 @@ async function recycledNodes() {
     "an in-flight save is bound to the UID captured when editing began"
   );
   assert(
-    view.entry(node).textContent === "写备注",
+    !view.hasNote(node),
     "the result does not mark the node's new author"
   );
   if (view.cards().length === 1) await findButton(view.card(), "关闭").click();
@@ -763,7 +782,7 @@ async function recycledNodes() {
   // Original <-> repost on the same node, and a node that stops being provable.
   const second = view.add({ uid: LAN, name: "阿岚Lan", index: 1 });
   view.reconcile();
-  assert(view.entry(second).textContent === "有备注", "original card");
+  assert(view.hasNote(second), "original card");
   const reArticle = view.document.createElement("article");
   const reHeader = view.document.createElement("header");
   const reLink = view.document.createElement("a");
@@ -777,7 +796,7 @@ async function recycledNodes() {
   recycle(second, BO, "老薄");
   view.reconcile();
   assert(
-    view.entry(second).textContent === "有备注" &&
+    view.hasNote(second) &&
       view.entry(second).getAttribute("aria-label").includes("老薄") &&
       view.wrappers(retweet).length === 0,
     "a node turned into a repost is bound to the reposter, not the original author"
@@ -832,7 +851,7 @@ async function lifecycle() {
   const fresh = view.add({ uid: LAN, name: "阿岚Lan", index: 0 });
   view.install();
   assert(
-    runtime().entries.size === 1 && view.entry(fresh).textContent === "有备注",
+    runtime().entries.size === 1 && view.hasNote(fresh),
     "after the root is replaced only cards of the new root carry entries"
   );
   assert(view.observers().length === 1, "the observer follows the new root");
@@ -841,14 +860,14 @@ async function lifecycle() {
   const mine = view.add({ uid: OTHER_OWNER, name: "切换后的自己", index: 1 });
   const boAgain = view.add({ uid: BO, name: "老薄", index: 2 });
   view.reconcile();
-  assert(view.entry(boAgain).textContent === "写备注", "owner A has no note for 老薄");
+  assert(!view.hasNote(boAgain), "owner A has no note for 老薄");
   await view.entry(fresh).click();
   view.tab.ownerUid = OTHER_OWNER;
   view.reconcile();
   assert(view.cards().length === 0, "an owner change closes the open card");
   assert(
-    view.entry(fresh).textContent === "写备注" &&
-      view.entry(boAgain).textContent === "有备注" &&
+    !view.hasNote(fresh) &&
+      view.hasNote(boAgain) &&
       view.entry(mine) === null &&
       runtime().ownerUid === OTHER_OWNER,
     "entries follow the new owner's own notes"
@@ -861,7 +880,7 @@ async function lifecycle() {
   );
   view.tab.ownerUid = OWNER;
   view.reconcile();
-  assert(view.entry(fresh).textContent === "有备注", "the owner's entries return");
+  assert(view.hasNote(fresh), "the owner's entries return");
 
   // Leaving the feed route removes every Toolkit node and the observer.
   await view.entry(fresh).click();
@@ -879,7 +898,7 @@ async function lifecycle() {
   view.tab.location.pathname = "/";
   view.tab.location.href = "https://weibo.com/";
   view.install();
-  assert(view.entry(fresh).textContent === "有备注", "returning to the feed restores entries");
+  assert(view.hasNote(fresh), "returning to the feed restores entries");
 
   // Turning the option off restores the page.
   await view.entry(fresh).click();
@@ -960,14 +979,12 @@ async function sameTabSync() {
   await findButton(overlay(), "添加备注与标签").click();
   textarea(overlay()).value = "工具箱里给老薄写的";
   await findButton(overlay(), "保存").click();
-  assert(view.entry(bo).textContent === "有备注", "a note created elsewhere marks the entry");
+  assert(view.hasNote(bo), "a note created elsewhere marks the entry");
   detail(LAN);
   await findButton(overlay(), "删除档案").click();
   await findButton(overlay(), "确认删除").click();
   assert(
-    view.entry(lanA).textContent === "写备注" &&
-      view.entry(lanB).textContent === "写备注" &&
-      view.entry(bo).textContent === "有备注",
+    !view.hasNote(lanA) && !view.hasNote(lanB) && view.hasNote(bo),
     "a delete elsewhere clears exactly that author's entries"
   );
 
@@ -980,7 +997,7 @@ async function sameTabSync() {
   textarea(overlay()).value = "节点移除后再保存";
   await findButton(overlay(), "保存").click();
   assert(
-    view.entry(lanA).textContent === "有备注" && removedEntry.textContent === "写备注",
+    view.hasNote(lanA) && !removedEntry.classList.contains("wfr-feed-note-has"),
     "an entry whose node was removed is no longer updated"
   );
 
@@ -1024,7 +1041,7 @@ async function otherFeedFeatures() {
   );
   assert(
     !plain.card.classList.contains("wfr-latest-recommended-hidden") &&
-      view.entry(plain).textContent === "有备注",
+      view.hasNote(plain),
     "an ordinary card is kept and marked"
   );
   assert(
@@ -1049,7 +1066,7 @@ async function otherFeedFeatures() {
   view.install();
   assert(
     !promoted.card.classList.contains("wfr-latest-recommended-hidden") &&
-      view.entry(promoted).textContent === "有备注",
+      view.hasNote(promoted),
     "with the promotion filter off the card returns and gets its entry"
   );
   view.setPreferences({ ...ALL_OFF, hideLatestRecommended: true });
@@ -1084,7 +1101,7 @@ async function clickBeforeReconcile() {
   );
   assert(
     view.entry(node) !== oldEntry &&
-      view.entry(node).textContent === "写备注" &&
+      !view.hasNote(node) &&
       !node.card.contains(oldEntry),
     "the click itself brings the node's entry up to date, without waiting for a frame"
   );
@@ -1378,7 +1395,7 @@ async function detachedDraft() {
       `${how}: the draft is saved to its own subject, never to the node's new author`
     );
     if (how === "recycled") {
-      assert(view.entry(node).textContent === "写备注", "the node's new author is not marked");
+      assert(!view.hasNote(node), "the node's new author is not marked");
     }
 
     // Saved: nothing left to protect, so it can be closed and others opened.
@@ -1416,49 +1433,38 @@ async function detachedDraft() {
   assert(view.cards().length === 0, "after cancelling, the docked card can be closed");
 }
 
-// Simulated geometry again: the test supplies the header's right edge, where
-// the entry starts and how much native content follows it. It checks the
-// decisions the product takes from those numbers, not real text rendering.
-async function entryWidth() {
+// Icon-only entry: renders no inline hint span, performs no getBoundingClientRect
+// layout measurement, and exposes recorded-name hints via class/title/aria-label
+// without touching Weibo's native author row nodes or writing on unchanged passes.
+async function iconOnlyEntryAndNoInlineLayout() {
   const view = openFeed(FEED_ONLY, { [radarKey(OWNER)]: RADAR_RAW });
-  const layout = view.tab.product.feedEntryLayout;
-  const same = (actual, expected) => JSON.stringify(actual) === JSON.stringify(expected);
-  assert(same(layout(600, 48, true), { compact: false, hintWidth: 216 }), "desktop: normal cap");
-  assert(same(layout(134, 48, true), { compact: false, hintWidth: 80 }), "narrow: what is left");
-  assert(same(layout(90, 48, true), { compact: false, hintWidth: 0 }), "too little: no inline hint");
-  assert(same(layout(600, 48, false), { compact: false, hintWidth: 0 }), "no hint, nothing to size");
-  assert(same(layout(30, 48, true), { compact: true, hintWidth: 0 }), "no room for the button: compact");
-  assert(same(layout(-200, 48, false), { compact: true, hintWidth: 0 }), "already overflowing: compact");
-
   const node = view.add({ uid: LAN, name: "一个特别特别特别特别特别长的昵称" });
   const sourceText = view.document.createElement("span");
   sourceText.textContent = "来自 微博网页版";
   node.name.parentNode.append(sourceText);
-  let headerRight = 284;
-  let wrapperLeft = 86;
-  let trailing = 64;
-  view.window.innerWidth = 300;
-  view.window.innerHeight = 700;
-  view.document.rectFor = (element) => {
-    if (element.tagName === "HEADER") return { left: 16, right: headerRight, width: headerRight - 16 };
-    if (element.classList.contains("wfr-feed-note")) return { left: wrapperLeft, right: wrapperLeft + 120 };
-    if (element.classList.contains("wfr-feed-note-entry")) return { width: 48 };
-    if (element === sourceText) return { right: wrapperLeft + 120 + trailing };
-    return null;
+  let rectCalls = 0;
+  view.document.rectFor = () => {
+    rectCalls += 1;
+    return { left: 0, right: 300, width: 300 };
   };
   view.install();
   const entry = view.entry(node);
-  const hintNode = findAll(node.card, (candidate) =>
-    candidate.classList.contains("wfr-feed-note-hint")
-  )[0];
-  // 284 - 86 - 64 (native text after the entry) = 134 of room.
   assert(
-    entry.textContent === "有备注" || entry.textContent === "写备注",
-    "with room the entry keeps its full label"
+    entry.textContent === "" &&
+      findAll(node.card, (candidate) =>
+        candidate.classList.contains("wfr-feed-note-hint")
+      ).length === 0,
+    "the entry renders as a pure icon button without an inline hint span"
   );
   assert(
-    !hintNode.hidden && hintNode.style.maxWidth === "80px",
-    `the hint is limited so that the native text after it still fits: ${JSON.stringify(hintNode.style)}`
+    rectCalls === 0,
+    "installing icon-only feed entries must not measure entry geometry"
+  );
+  assert(
+    view.hasHint(node) &&
+      entry.getAttribute("aria-label").includes("本地曾记录为：阿岚Lan") &&
+      entry.getAttribute("title").includes("本地曾记录为：阿岚Lan"),
+    "recorded-name hint is exposed on the entry dot class, title, and spoken label"
   );
   assert(
     node.nameText.textContent === "一个特别特别特别特别特别长的昵称" &&
@@ -1468,115 +1474,35 @@ async function entryWidth() {
     "Weibo's own nickname, time and source are neither edited nor moved"
   );
 
-  // A long time text pushes the entry right: the hint yields first.
-  wrapperLeft = 150;
+  // Window resize and unchanged reconcile passes trigger zero DOM writes.
+  const writes = view.document.writes;
   view.fireWindow("resize");
+  for (let pass = 0; pass < 3; pass += 1) view.reconcile();
   assert(
-    hintNode.hidden && entry.textContent.length === 3,
-    "with too little room the inline hint is hidden and the entry stays whole"
-  );
-  assert(
-    entry.getAttribute("aria-label").includes("本地曾记录为：阿岚Lan"),
-    "the entry still announces the recorded name"
+    view.document.writes === writes && rectCalls === 0,
+    "resize and unchanged passes neither measure layout nor rewrite the entry"
   );
 
-  // Even the button does not fit: it shrinks to one character, keeps its
-  // label, and still opens the card with everything in it.
-  wrapperLeft = 200;
-  view.fireWindow("resize");
-  assert(
-    entry.textContent === "写" && hintNode.hidden && entry.getAttribute("aria-label").includes("写备注"),
-    `with no room for the button the entry is compact: ${entry.textContent}`
-  );
   await entry.click();
   assert(
     view.card().textContent.includes("阿岚Lan") && view.card().textContent.includes("阿岚在路上"),
     "every recorded name is available in the card"
   );
   await findButton(view.card(), "添加备注与标签").click();
-  textarea(view.card()).value = "窄栏里写的备注";
+  textarea(view.card()).value = "图标入口写的备注";
   await findButton(view.card(), "保存").click();
-  assert(entry.textContent === "备", "a compact entry reflects a save in its compact form");
+  assert(
+    view.hasNote(node) && entry.textContent === "",
+    "saving updates the has-note icon state while keeping text empty"
+  );
   await findButton(view.card(), "关闭").click();
-
-  // Back at desktop width everything returns.
-  headerRight = 900;
-  wrapperLeft = 200;
-  view.window.innerWidth = 1280;
-  view.fireWindow("resize");
-  assert(
-    entry.textContent === "有备注" && !hintNode.hidden && hintNode.style.maxWidth === "216px",
-    "widening the window restores the full entry and the hint"
-  );
-
-  // Weibo's own text in the author row changes with
-  // no window resize: an ordinary feed pass must re-fit the entry, and restore
-  // it once the room is back. Only native nodes are edited here, by the test.
-  headerRight = 284;
-  wrapperLeft = 86;
-  view.fireWindow("resize");
-  assert(
-    entry.textContent === "有备注" && hintNode.style.maxWidth === "80px",
-    "narrow column, short native author information: full entry and an 80px hint"
-  );
-  sourceText.textContent = "认证标记和额外作者信息变长";
-  wrapperLeft = 200;
-  view.reconcile();
-  assert(
-    entry.textContent === "备" && hintNode.hidden,
-    `longer native author information re-fits the entry without a resize: ${entry.textContent}`
-  );
-  sourceText.textContent = "来自 微博网页版";
-  wrapperLeft = 86;
-  view.reconcile();
-  assert(
-    entry.textContent === "有备注" && !hintNode.hidden && hintNode.style.maxWidth === "80px",
-    "when native author information is short again the full entry and hint return"
-  );
-  sourceText.textContent = "来自 一个名字非常非常长的第三方客户端";
-  trailing = 180;
-  view.reconcile();
-  assert(
-    entry.textContent === "备" && hintNode.hidden,
-    "a longer native source text re-fits the entry the same way"
-  );
-  sourceText.textContent = "来自 微博网页版";
-  trailing = 64;
-  view.reconcile();
-  assert(
-    entry.textContent === "有备注" && hintNode.style.maxWidth === "80px",
-    "and restores it when the source text is short again"
-  );
-  headerRight = 900;
-  wrapperLeft = 200;
-  view.fireWindow("resize");
-  assert(
-    entry.textContent === "有备注" && hintNode.style.maxWidth === "216px" &&
-      node.permalink.textContent === "10分钟前" &&
-      node.permalink.parentNode.childNodes.length === 2,
-    "native nodes are exactly as the page left them"
-  );
-
-  // Fitting happens on change and on resize only, never on an idle pass. The
-  // entry's own re-fits above changed its text and style, and that must not
-  // have queued another measurement.
-  const writes = view.document.writes;
-  const before = JSON.stringify(hintNode.style);
-  headerRight = 284;
-  for (let pass = 0; pass < 3; pass += 1) view.reconcile();
-  assert(
-    view.document.writes === writes &&
-      JSON.stringify(hintNode.style) === before &&
-      entry.textContent === "有备注",
-    "an unchanged pass neither re-measures nor rewrites the entry"
-  );
 }
 (async () => {
   await switchesAndEntries();
   await clickBeforeReconcile();
   await cardPlacement();
   await detachedDraft();
-  await entryWidth();
+  await iconOnlyEntryAndNoInlineLayout();
   authorIdentity();
   await nicknameMemory();
   await cardAndQuickEdit();

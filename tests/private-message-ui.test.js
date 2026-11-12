@@ -8,7 +8,7 @@ const { assert, createFakeDocument } = require("./friend-notes-fixture");
 const source = fs.readFileSync(path.resolve(__dirname, "..", "weibo-toolkit.user.js"), "utf8");
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
-function openPrivateMessagePage() {
+function openPrivateMessagePage(participantNameText = "测试会话") {
   const { document, MutationObserver } = createFakeDocument();
   const createElement = document.createElement.bind(document);
   document.createElement = (tag) => {
@@ -22,7 +22,7 @@ function openPrivateMessagePage() {
   const participant = document.createElement("span");
   participant.textContent = "2001";
   const name = document.createElement("span");
-  name.textContent = "测试会话";
+  name.textContent = participantNameText;
   const session = document.createElement("div");
   const avatar = document.createElement("img");
   session.querySelector = (selector) => ({
@@ -43,6 +43,7 @@ function openPrivateMessagePage() {
   const written = [];
   let closed = false;
   let pending;
+  let lastSuggestedName = null;
   // Execute the unmodified entry point: the usual test loader skips startup.
   vm.runInNewContext(source, {
     document, MutationObserver, URL, URLSearchParams, Blob, BigInt, AbortController,
@@ -52,7 +53,8 @@ function openPrivateMessagePage() {
       removeEventListener: (type) => listeners.delete(type),
     },
     unsafeWindow: {
-      async showSaveFilePicker() {
+      async showSaveFilePicker(options = {}) {
+        lastSuggestedName = options.suggestedName || null;
         return { async createWritable() {
           return {
             async write(markdown) { written.push(markdown); },
@@ -84,7 +86,15 @@ function openPrivateMessagePage() {
   const root = document.getElementById("wfr-pm-export-root");
   assert(root && root.classList.contains("wfr-theme-dark"), "chat loads its saved theme and mounts export controls");
   assert(reads.length === 1 && reads[0] === "weiboToolkit.theme.v1", "chat reads no unrelated preferences");
-  return { document, root, listeners, written, pending: () => pending, closed: () => closed };
+  return {
+    document,
+    root,
+    listeners,
+    written,
+    pending: () => pending,
+    closed: () => closed,
+    lastSuggestedName: () => lastSuggestedName,
+  };
 }
 
 (async () => {
@@ -116,8 +126,26 @@ function openPrivateMessagePage() {
     const status = view.root.querySelector("span").textContent;
     assert(status.includes(outcome === "success" ? "已导出" : outcome === "cancel" ? "已取消" : "导出失败"),
       `${outcome} is reported in the private-message status`);
+    assert(
+      /^微博私信_测试会话_\d{8}-\d{6}\.md$/.test(view.lastSuggestedName() || ""),
+      `filename includes sanitized participant label: ${view.lastSuggestedName()}`
+    );
     assert(!view.document.getElementById("wfr-toolkit-launcher"), "chat does not install the normal-page launcher");
   }
+  const unsafeNameView = openPrivateMessagePage('a/b:c*?"<>|  d');
+  await unsafeNameView.root.querySelector("button").click();
+  assert(
+    /^微博私信_a_b_c_ d_\d{8}-\d{6}\.md$/.test(unsafeNameView.lastSuggestedName() || ""),
+    `unsafe characters in participant name are sanitized: ${unsafeNameView.lastSuggestedName()}`
+  );
+  await unsafeNameView.root.querySelector("button").click();
+  const symbolsOnlyView = openPrivateMessagePage("///:::***");
+  await symbolsOnlyView.root.querySelector("button").click();
+  assert(
+    /^微博私信_2001_\d{8}-\d{6}\.md$/.test(symbolsOnlyView.lastSuggestedName() || ""),
+    `when participant name sanitizes to empty, filename falls back to UID: ${symbolsOnlyView.lastSuggestedName()}`
+  );
+  await symbolsOnlyView.root.querySelector("button").click();
   console.log("private message startup and export UI invariants passed");
 })().catch((error) => {
   console.error(error);
